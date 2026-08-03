@@ -35,6 +35,9 @@ To use OpenAI instead, set these environment variables before running:
 | `ARBE_MODEL` | no | defaults to `gpt-5-mini` when provider is `openai` |
 | `ARBE_BASE_URL` | no | override the API base URL, e.g. to point at an OpenAI-compatible gateway |
 | `ARBE_TEMPERATURE` | no | defaults to `1.0` for `openai` (its reasoning-family models reject any other value), `0.2` otherwise |
+| `ARBE_HOME` | no | overrides where all persistent state (`sessions/`, `skills/`, `memory/`, `mcp/`, `logs/`) is read/written; defaults to `~/.arbe/` (`%USERPROFILE%\.arbe\` on Windows) |
+
+`--home <path>` (or `--home=<path>`) is equivalent to `ARBE_HOME` but doesn't require exporting an env var first — handy for quick isolated test runs, e.g. `cargo run -- --home ./scratch-arbe-home` starts a fresh session under `./scratch-arbe-home/sessions/` instead of touching your real `~/.arbe/`.
 
 PowerShell:
 
