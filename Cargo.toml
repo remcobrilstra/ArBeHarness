@@ -1,6 +1,42 @@
-[package]
-name = "arbeharness"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/remcobrilstra/ArBeHarness"
+
+[workspace.dependencies]
+arbe-core = { path = "crates/arbe-core" }
+arbe-storage = { path = "crates/arbe-storage" }
+arbe-providers = { path = "crates/arbe-providers" }
+arbe-memory = { path = "crates/arbe-memory" }
+arbe-tools = { path = "crates/arbe-tools" }
+arbe-skills = { path = "crates/arbe-skills" }
+arbe-hooks = { path = "crates/arbe-hooks" }
+arbe-mcp = { path = "crates/arbe-mcp" }
+arbe-runtime = { path = "crates/arbe-runtime" }
+arbe-tui = { path = "crates/arbe-tui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+async-trait = "0.1"
+tracing = "0.1"
+futures-core = "0.3"
+
+[package]
+name = "arbeharness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+arbe-runtime = { workspace = true }
+arbe-tui = { workspace = true }
+tokio = { workspace = true }

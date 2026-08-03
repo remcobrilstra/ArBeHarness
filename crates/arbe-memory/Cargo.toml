@@ -1,0 +1,9 @@
+[package]
+name = "arbe-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arbe-core = { workspace = true }
+serde = { workspace = true }

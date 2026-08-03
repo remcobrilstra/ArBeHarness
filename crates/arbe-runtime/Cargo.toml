@@ -1,0 +1,17 @@
+[package]
+name = "arbe-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arbe-core = { workspace = true }
+arbe-storage = { workspace = true }
+arbe-providers = { workspace = true }
+arbe-memory = { workspace = true }
+arbe-tools = { workspace = true }
+arbe-skills = { workspace = true }
+arbe-hooks = { workspace = true }
+arbe-mcp = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

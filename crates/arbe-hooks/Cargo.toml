@@ -1,0 +1,10 @@
+[package]
+name = "arbe-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arbe-core = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
