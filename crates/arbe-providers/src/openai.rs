@@ -53,7 +53,12 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
-    max_tokens: u64,
+    /// Newer models (o1/o3/gpt-5 family) reject the legacy `max_tokens`
+    /// field with a 400 ("Unsupported parameter") and require
+    /// `max_completion_tokens` instead; OpenAI's Chat Completions API
+    /// accepts `max_completion_tokens` across current models, so it's used
+    /// unconditionally rather than branching on model name.
+    max_completion_tokens: u64,
     stream: bool,
 }
 
@@ -69,7 +74,7 @@ fn build_request_body(req: &ModelRequest, stream: bool) -> ChatRequest {
             })
             .collect(),
         temperature: req.temperature,
-        max_tokens: req.max_tokens,
+        max_completion_tokens: req.max_tokens,
         stream,
     }
 }
