@@ -1,6 +1,8 @@
 //! Lifecycle hook system (harness spec FR-7, overall design §4.5).
-//! Registration and timeout/isolation execution land in Phase 5; this
-//! crate currently defines only the shared contract.
+
+pub mod registry;
+
+pub use registry::HookRegistry;
 
 use arbe_core::HookError;
 use async_trait::async_trait;

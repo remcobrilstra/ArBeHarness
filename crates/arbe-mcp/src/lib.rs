@@ -1,6 +1,15 @@
-//! MCP server discovery and tool-registry bridging (harness spec FR-8,
-//! overall design §4.4). Handshake/negotiation and the bridge land in
-//! Phase 5; this crate currently defines only the config shape.
+//! MCP server discovery, stdio JSON-RPC client, and tool-registry
+//! bridging (harness spec FR-8, overall design §4.4).
+
+pub mod bridge;
+pub mod client;
+pub mod config;
+pub mod protocol;
+
+pub use bridge::{McpToolExecutor, qualified_tool_name, register_server_tools};
+pub use client::{McpClient, McpToolInfo};
+pub use config::{enabled_servers, load_servers_file};
+pub use protocol::McpError;
 
 use serde::{Deserialize, Serialize};
 

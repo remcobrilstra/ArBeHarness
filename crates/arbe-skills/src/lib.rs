@@ -1,6 +1,15 @@
 //! Skill manifest loading and scope resolution (harness spec FR-6, overall
-//! design §4.3). Manifest parsing and merge policy land in Phase 5; this
-//! crate currently defines only the shared contract.
+//! design §4.3).
+
+pub mod error;
+pub mod loader;
+pub mod manifest;
+pub mod merge;
+
+pub use error::SkillError;
+pub use loader::load_dir;
+pub use manifest::parse_manifest;
+pub use merge::merge_skills;
 
 use serde::{Deserialize, Serialize};
 
