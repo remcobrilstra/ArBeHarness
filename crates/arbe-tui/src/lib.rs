@@ -44,6 +44,7 @@ pub fn run(agent: Agent, handle: Handle) -> io::Result<()> {
     let profile = agent.profile().to_string();
     let provider_name = agent.provider_name().to_string();
     let model = agent.model().to_string();
+    let project_dir = agent.project_dir().display().to_string();
     let session_id = agent.session_id();
 
     let agent = Arc::new(AsyncMutex::new(agent));
@@ -54,7 +55,7 @@ pub fn run(agent: Agent, handle: Handle) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(session_id, profile, provider_name, model);
+    let mut app = App::new(session_id, profile, provider_name, model, project_dir);
     let (outcome_tx, outcome_rx) = channel::<AgentOutcome>();
 
     let result = event_loop(

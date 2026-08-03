@@ -15,7 +15,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(3),
             Constraint::Length(3),
         ])
@@ -32,11 +32,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let phase = if app.working { "working" } else { "idle" };
-    let text = format!(
-        " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  ~tokens: {} ",
-        app.profile, app.provider_name, app.model, app.session_id, phase, app.last_estimated_tokens
-    );
-    let paragraph = Paragraph::new(text)
+    let lines = vec![
+        Line::from(format!(" workdir: {} ", app.project_dir)),
+        Line::from(format!(
+            " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  ~tokens: {} ",
+            app.profile,
+            app.provider_name,
+            app.model,
+            app.session_id,
+            phase,
+            app.last_estimated_tokens
+        )),
+    ];
+    let paragraph = Paragraph::new(lines)
         .style(Style::default().add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL).title("ArBeHarness"));
     frame.render_widget(paragraph, area);

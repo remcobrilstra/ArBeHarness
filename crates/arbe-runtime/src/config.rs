@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use arbe_core::ApprovalPolicyMode;
 
 /// Runtime configuration for one `Agent` (overall design §7 config schema
@@ -21,14 +23,25 @@ pub struct RuntimeConfig {
     pub denylist: Vec<String>,
     pub hook_timeout_ms: u64,
     pub system_instructions: Vec<String>,
+    /// The directory the agent operates *in* — usually the repo it's
+    /// working on. This is distinct from `ARBE_HOME`/`~/.arbe/`, which is
+    /// where the harness's own persistent state (sessions, skills, memory)
+    /// lives, not the target of the agent's work. File/execute tools will
+    /// use this as their sandbox root once implemented; project-local
+    /// skills/memory will key off it too.
+    pub project_dir: PathBuf,
 }
 
 impl RuntimeConfig {
     /// Reasonable defaults, overridable via env vars so the TUI is usable
     /// without editing code: `ARBE_PROVIDER` (default `ollama`),
-    /// `ARBE_MODEL` (default `llama3`), `ARBE_BASE_URL`, and `OPENAI_API_KEY`
+    /// `ARBE_MODEL` (default `llama3`), `ARBE_BASE_URL`, `OPENAI_API_KEY`
     /// (only consulted when `ARBE_PROVIDER=openai` — NFR-4: keys come from
-    /// env, never a literal in code).
+    /// env, never a literal in code), and `ARBE_WORKDIR` (default: the
+    /// process's current directory) for the project the agent works on.
+    /// Note this is separate from `ARBE_HOME`, which relocates the
+    /// harness's *own* storage root (`~/.arbe/`) and is a dev/test-only
+    /// knob — see `arbe_storage::paths`.
     pub fn from_env() -> Self {
         let provider_name = std::env::var("ARBE_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
         let is_openai = provider_name == "openai";
@@ -59,6 +72,9 @@ impl RuntimeConfig {
                 "You are ArBeHarness, a terse and helpful coding assistant.".to_string(),
             ],
             provider_name,
+            project_dir: std::env::var("ARBE_WORKDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }
     }
 }

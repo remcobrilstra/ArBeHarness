@@ -23,6 +23,9 @@ pub struct App {
     pub profile: String,
     pub provider_name: String,
     pub model: String,
+    /// The repo/project directory the agent is working on (distinct from
+    /// `~/.arbe/`, which is the harness's own storage root).
+    pub project_dir: String,
     pub transcript: Vec<TranscriptLine>,
     pub input: String,
     pub status_message: Option<String>,
@@ -39,12 +42,14 @@ impl App {
         profile: String,
         provider_name: String,
         model: String,
+        project_dir: String,
     ) -> Self {
         Self {
             session_id,
             profile,
             provider_name,
             model,
+            project_dir,
             transcript: Vec::new(),
             input: String::new(),
             status_message: None,

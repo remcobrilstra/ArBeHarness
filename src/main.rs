@@ -21,17 +21,15 @@ impl ToolExecutor for EchoTool {
     }
 }
 
-/// Reads `--home <path>` / `--home=<path>` from argv, if present. Lets a
-/// test run point at a scratch directory instead of the real `~/.arbe/`
-/// without having to export an env var first — sets `ARBE_HOME` itself
-/// under the hood, so it's equivalent to (and overrides) that env var.
-fn parse_home_arg() -> Option<String> {
+/// Reads `<flag> <value>` / `<flag>=<value>` from argv, if present.
+fn parse_arg(flag: &str) -> Option<String> {
     let mut args = std::env::args().skip(1);
+    let with_eq = format!("{flag}=");
     while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--home=") {
+        if let Some(value) = arg.strip_prefix(&with_eq) {
             return Some(value.to_string());
         }
-        if arg == "--home" {
+        if arg == flag {
             return args.next();
         }
     }
@@ -39,12 +37,24 @@ fn parse_home_arg() -> Option<String> {
 }
 
 fn main() {
-    // Set ARBE_HOME (if overridden via --home) before the tokio runtime —
-    // and the worker threads that come with it — is created, so this
-    // mutation can never race with another thread reading/writing the env.
-    if let Some(home) = parse_home_arg() {
+    // Set ARBE_HOME/ARBE_WORKDIR (if overridden via CLI flags) before the
+    // tokio runtime — and the worker threads that come with it — is
+    // created, so these mutations can never race with another thread
+    // reading/writing the env.
+    //
+    // --dev-home: **development/testing only.** Relocates the harness's
+    // own storage root (~/.arbe/ - sessions, skills, memory, mcp config,
+    // logs) to a scratch directory. Not something a normal run needs.
+    if let Some(dev_home) = parse_arg("--dev-home") {
         unsafe {
-            std::env::set_var("ARBE_HOME", home);
+            std::env::set_var("ARBE_HOME", dev_home);
+        }
+    }
+    // --workdir: the project/repo directory the agent actually works on.
+    // Defaults to the current directory if not given.
+    if let Some(workdir) = parse_arg("--workdir") {
+        unsafe {
+            std::env::set_var("ARBE_WORKDIR", workdir);
         }
     }
 

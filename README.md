@@ -35,9 +35,20 @@ To use OpenAI instead, set these environment variables before running:
 | `ARBE_MODEL` | no | defaults to `gpt-5-mini` when provider is `openai` |
 | `ARBE_BASE_URL` | no | override the API base URL, e.g. to point at an OpenAI-compatible gateway |
 | `ARBE_TEMPERATURE` | no | defaults to `1.0` for `openai` (its reasoning-family models reject any other value), `0.2` otherwise |
-| `ARBE_HOME` | no | overrides where all persistent state (`sessions/`, `skills/`, `memory/`, `mcp/`, `logs/`) is read/written; defaults to `~/.arbe/` (`%USERPROFILE%\.arbe\` on Windows) |
+| `ARBE_WORKDIR` | no | the project/repo directory the agent works on; defaults to the current directory |
 
-`--home <path>` (or `--home=<path>`) is equivalent to `ARBE_HOME` but doesn't require exporting an env var first — handy for quick isolated test runs, e.g. `cargo run -- --home ./scratch-arbe-home` starts a fresh session under `./scratch-arbe-home/sessions/` instead of touching your real `~/.arbe/`.
+There's also `ARBE_HOME` / `--dev-home <path>`, but that's a different, **development/testing-only** knob — see below.
+
+### Working directory vs. harness home — two different roots
+
+These are easy to conflate but control different things:
+
+- **`ARBE_WORKDIR` / `--workdir <path>`** — the repo/project the agent is actually working *on* (usually your current directory; where file/execute tools will operate once they exist). Shown in the TUI header as `workdir: ...`.
+- **`ARBE_HOME` / `--dev-home <path>`** — where the harness's *own* state lives: `sessions/`, `skills/`, `memory/`, `mcp/`, `logs/`. Defaults to `~/.arbe/` (`%USERPROFILE%\.arbe\` on Windows). **This is a development/testing knob, not something a normal run needs to touch** — it exists so tests and quick manual runs don't pollute your real `~/.arbe/` with scratch sessions. `--dev-home <path>` is equivalent to `ARBE_HOME` but doesn't require exporting an env var first, e.g.:
+
+  ```bash
+  cargo run -- --dev-home ./scratch-arbe-home --workdir ../some-other-repo
+  ```
 
 PowerShell:
 

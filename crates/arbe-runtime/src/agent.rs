@@ -73,6 +73,11 @@ pub struct Agent {
     next_turn_index: u64,
     pending_tool_calls: HashMap<ToolCallId, ToolInvocation>,
     last_estimated_tokens: u64,
+    /// The repo/project this agent works on — see `RuntimeConfig::project_dir`.
+    /// Not yet consumed by anything (no file/execute tools exist yet), but
+    /// plumbed through now so those tools have a sandbox root to read from
+    /// the moment they're added.
+    project_dir: std::path::PathBuf,
 }
 
 impl Agent {
@@ -115,6 +120,7 @@ impl Agent {
             next_turn_index: 0,
             pending_tool_calls: HashMap::new(),
             last_estimated_tokens: 0,
+            project_dir: config.project_dir.clone(),
         })
     }
 
@@ -193,6 +199,11 @@ impl Agent {
 
     pub fn model(&self) -> &str {
         &self.meta.model
+    }
+
+    /// The repo/project directory this agent works on (`RuntimeConfig::project_dir`).
+    pub fn project_dir(&self) -> &std::path::Path {
+        &self.project_dir
     }
 
     /// Lets any client (the TUI, a future CLI) observe the same event
@@ -499,6 +510,7 @@ mod tests {
             next_turn_index: 0,
             pending_tool_calls: HashMap::new(),
             last_estimated_tokens: 0,
+            project_dir: std::path::PathBuf::from("."),
         }
     }
 

@@ -1,9 +1,16 @@
 use arbe_core::SessionId;
 use std::path::PathBuf;
 
-/// Resolves the ArBeHarness root directory (`~/.arbe/`, overall design §6),
-/// honoring `ARBE_HOME` for tests/CI so nothing writes into a real home
-/// directory during automated runs.
+/// Resolves the ArBeHarness root directory (`~/.arbe/`, overall design §6):
+/// where the harness's *own* persistent state lives (sessions, skills,
+/// memory, mcp config, logs).
+///
+/// Honors `ARBE_HOME` as an override. This is a **dev/test-only** knob —
+/// it relocates the harness's entire storage root, not just one session —
+/// used so tests/CI never write into a real home directory. It is *not*
+/// the same thing as the project/repo directory the agent operates on;
+/// that's `RuntimeConfig::project_dir` (`ARBE_WORKDIR`/`--workdir`) in
+/// `arbe-runtime`.
 pub fn arbe_home() -> PathBuf {
     if let Ok(override_home) = std::env::var("ARBE_HOME") {
         return PathBuf::from(override_home);
