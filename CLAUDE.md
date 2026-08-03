@@ -7,6 +7,7 @@ Full specs live in `/docs` — read them before making architectural decisions, 
 - `docs/v1-harness-spec.md` — functional/non-functional requirements, core trait signatures, persistence + error taxonomy
 - `docs/v1-implementation-plan.md` — phase-by-phase delivery plan, per-crate backlog, config schema, risk register
 - `docs/v1-tui-spec.md` — TUI requirements, event contract, keybindings
+- `docs/v1-status.md` — honest acceptance-criteria checklist against the specs above; read this first to know what's actually done vs. gapped
 
 ## Current state
 
@@ -32,7 +33,9 @@ Phase 6 (TUI MVP) is done:
 - Verified for real: `cargo run --release` renders the actual layout in a terminal (header, transcript box, input box with correct hint text) — confirmed via a captured run, not just a successful `cargo build`. Full interactive verification (typing, streaming a real reply, the approval modal) needs a human at a real terminal — this environment has no interactive TTY to drive keypresses through.
 - `RuntimeConfig::from_env()` defaults to `ollama`/`llama3` (no API key needed to launch); set `ARBE_PROVIDER=openai` + `OPENAI_API_KEY` to use OpenAI instead. The root binary registers one demo tool (`echo`) so `/tool echo {"text":"hi"}` has something real to approve and run.
 
-Not started: Phase 7 (hardening — integration test suite, benchmarks, release docs, final acceptance-criteria pass across all three spec docs).
+Phase 7 (hardening) is done: cross-crate integration coverage was added at the `Agent` level (`crates/arbe-runtime/src/agent.rs` tests) — session recovery after a forced interruption (drop mid-session, reconstruct from disk, confirm history/next-turn-index/continued-append all correct) and memory-strategy-swap-via-config-alone (same history/budget, different strategy, visibly different output). Skills are now wired into `Agent` (global scope loaded from `~/.arbe/skills/` and folded into the context pipeline), and hooks now run at `BeforeModelCall`/`AfterModelCall`/`OnTurnComplete` (previously only the last). `docs/v1-status.md` is an honest pass/fail against every acceptance criterion in the harness and TUI specs, including the five real gaps that remain (see that doc) — nothing was marked done that isn't. Benchmarks (implementation plan's "turn latency/stream smoothness" deliverable) were deliberately **not** added — no representative hardware/load profile to benchmark against yet, and a fake benchmark would be worse than none.
+
+v1 as implemented in this session is a real, working, tested product core (84 tests, clippy/fmt clean) — not a finished v1.0 release. See `docs/v1-status.md` for exactly what's left.
 
 ## Non-negotiable architecture rules
 

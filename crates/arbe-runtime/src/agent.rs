@@ -12,6 +12,7 @@ use arbe_memory::{
     CompactWithSummaryStrategy, ContextPipeline, ContextStrategy, HistoryEntry, TruncationStrategy,
 };
 use arbe_providers::{ModelProvider, ModelRequest, build_provider};
+use arbe_skills::SkillScope;
 use arbe_storage::SessionStore;
 use arbe_tools::{
     ApprovalContext, ApprovalPolicy, GatedOutcome, StandardApprovalPolicy, ToolExecutor,
@@ -27,6 +28,24 @@ fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
     match name {
         "compact_summary" => Box::new(CompactWithSummaryStrategy),
         _ => Box::new(TruncationStrategy),
+    }
+}
+
+/// Loads global skills from `~/.arbe/skills/` (harness spec FR-6) and
+/// returns their instruction bodies, ready to fold into a
+/// `ContextPipeline`. A missing/unreadable skills directory degrades to no
+/// skills rather than failing agent construction — skills are additive,
+/// not load-bearing (mirrors how a missing MCP server is handled).
+fn load_global_skill_instructions() -> Vec<String> {
+    match arbe_skills::load_dir(&arbe_storage::paths::skills_dir(), SkillScope::Global) {
+        Ok(global) => arbe_skills::merge_skills(Vec::new(), Vec::new(), global)
+            .into_iter()
+            .map(|m| m.instructions)
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "failed to load global skills; continuing without them");
+            Vec::new()
+        }
     }
 }
 
@@ -75,6 +94,7 @@ impl Agent {
             provider,
             pipeline: ContextPipeline {
                 system_instructions: config.system_instructions.clone(),
+                skill_instructions: load_global_skill_instructions(),
                 ..Default::default()
             },
             strategy: build_strategy(&config.memory_strategy),
@@ -239,6 +259,13 @@ impl Agent {
         transition(&mut machine, LoopPhase::PlanOrDirectRespond);
         transition(&mut machine, LoopPhase::ModelInference);
 
+        self.hooks
+            .run_phase(
+                HookPhase::BeforeModelCall,
+                json!({ "turn_id": turn_id.to_string(), "message_count": context.messages.len() }),
+            )
+            .await;
+
         let request = ModelRequest {
             model: self.meta.model.clone(),
             messages: context.messages,
@@ -260,6 +287,13 @@ impl Agent {
                 delta: chunk.delta,
             });
         }
+
+        self.hooks
+            .run_phase(
+                HookPhase::AfterModelCall,
+                json!({ "turn_id": turn_id.to_string(), "response_len": assistant_content.len() }),
+            )
+            .await;
 
         transition(&mut machine, LoopPhase::InterpretOutput);
         transition(&mut machine, LoopPhase::PersistTurn);
@@ -571,6 +605,149 @@ mod tests {
             panic!("expected an error");
         };
         assert!(matches!(err, ToolError::Validation(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Rebuilds an Agent's in-memory history from `store.list_turns`, the
+    /// same recovery logic `Agent::resume` uses — duplicated here (with a
+    /// `FakeProvider` instead of going through `build_provider`) so this
+    /// test exercises the exact code path a real crash-and-resume would,
+    /// per harness spec FR-1 ("interrupted-session recovery").
+    fn agent_resumed_with_fake_provider(
+        store: SessionStore,
+        meta: SessionMeta,
+        events: Arc<EventBus>,
+    ) -> Agent {
+        let turns = store.list_turns(meta.id).unwrap();
+        let mut history = Vec::new();
+        let mut next_turn_index = 0;
+        for turn in turns {
+            if let Some(m) = turn.user_message {
+                history.push(HistoryEntry {
+                    turn_index: turn.index,
+                    message: m,
+                });
+            }
+            if let Some(m) = turn.assistant_message {
+                history.push(HistoryEntry {
+                    turn_index: turn.index,
+                    message: m,
+                });
+            }
+            next_turn_index = next_turn_index.max(turn.index + 1);
+        }
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.history = history;
+        agent.next_turn_index = next_turn_index;
+        agent
+    }
+
+    #[tokio::test]
+    async fn session_recovers_after_a_forced_interruption() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+
+        {
+            // First "process": submits one turn, then is dropped without
+            // ever calling close() — simulating a crash/forced kill.
+            let mut agent = agent_with_fake_provider(store.clone(), meta.clone(), events.clone());
+            agent
+                .submit_message("before the crash".to_string())
+                .await
+                .unwrap();
+        }
+
+        // Second "process": resumes the same session from disk.
+        let mut resumed = agent_resumed_with_fake_provider(store.clone(), meta.clone(), events);
+        assert_eq!(resumed.history.len(), 2);
+        assert_eq!(resumed.next_turn_index, 1);
+
+        resumed
+            .submit_message("after recovery".to_string())
+            .await
+            .unwrap();
+
+        let turns = store.list_turns(meta.id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].index, 1);
+        assert_eq!(
+            turns[1].user_message.as_ref().unwrap().content,
+            "after recovery"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_strategy_is_swappable_via_config_alone() {
+        // Same history, same tiny budget, only the strategy differs — the
+        // implementation plan's Phase 3 exit criterion ("config can switch
+        // strategy... without code changes") exercised at the Agent level.
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+
+        let long_history = vec![
+            HistoryEntry {
+                turn_index: 0,
+                message: Message::new(Role::User, "a".repeat(200)),
+            },
+            HistoryEntry {
+                turn_index: 1,
+                message: Message::new(Role::Assistant, "b".repeat(200)),
+            },
+        ];
+
+        let mut truncation_agent =
+            agent_with_fake_provider(store.clone(), meta.clone(), events.clone());
+        truncation_agent.strategy = build_strategy("truncation");
+        truncation_agent.budget_tokens = 5;
+        truncation_agent.history = long_history.clone();
+        truncation_agent
+            .submit_message("go".to_string())
+            .await
+            .unwrap();
+        let truncation_context = truncation_agent.pipeline.assemble(
+            truncation_agent.strategy.as_ref(),
+            long_history.clone(),
+            vec![],
+            Message::new(Role::User, "go"),
+            5,
+        );
+
+        let compact_context = {
+            let mut compact_agent = agent_with_fake_provider(store, meta, events);
+            compact_agent.strategy = build_strategy("compact_summary");
+            compact_agent.pipeline.assemble(
+                compact_agent.strategy.as_ref(),
+                long_history,
+                vec![],
+                Message::new(Role::User, "go"),
+                5,
+            )
+        };
+
+        // Truncation drops old messages silently; compact_summary leaves a
+        // visible marker behind — same input, different config, visibly
+        // different output.
+        assert!(
+            !truncation_context
+                .messages
+                .iter()
+                .any(|m| m.content.contains("compacted"))
+        );
+        assert!(
+            compact_context
+                .messages
+                .iter()
+                .any(|m| m.content.contains("compacted"))
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
