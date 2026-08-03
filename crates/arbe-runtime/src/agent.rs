@@ -23,7 +23,6 @@ use serde_json::json;
 
 use crate::EventBus;
 use crate::config::RuntimeConfig;
-use crate::project_context;
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
     match name {
@@ -97,20 +96,12 @@ impl Agent {
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
 
-        // Goes first so it's always present regardless of budget pressure
-        // elsewhere, and so the model has *some* answer to "what is this
-        // project" even though it can't go look for itself yet (no
-        // automatic tool-call parsing from model output — see
-        // docs/v1-status.md).
-        let mut system_instructions = vec![project_context::describe_project(&config.project_dir)];
-        system_instructions.extend(config.system_instructions.clone());
-
         Ok(Self {
             store,
             meta,
             provider,
             pipeline: ContextPipeline {
-                system_instructions,
+                system_instructions: config.system_instructions.clone(),
                 skill_instructions: load_global_skill_instructions(),
                 ..Default::default()
             },
@@ -812,39 +803,6 @@ mod tests {
             .map(|e| e["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["marker.txt"]);
-
-        std::fs::remove_dir_all(&store_dir).ok();
-        std::fs::remove_dir_all(&project_dir).ok();
-    }
-
-    /// Confirms the fix for "the agent can't answer 'tell me about our
-    /// current project' because it has no idea what directory it's in":
-    /// the project description is actually present in the pipeline every
-    /// turn's context gets assembled from, not just computed and discarded.
-    #[test]
-    fn agent_created_via_the_real_path_knows_what_project_it_is_in() {
-        let (store, store_dir) = temp_store();
-        let project_dir =
-            std::env::temp_dir().join(format!("arbe-agent-project-ctx-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(project_dir.join("Cargo.toml"), "[package]").unwrap();
-        std::fs::write(
-            project_dir.join("README.md"),
-            "# Widget Factory\nBuilds widgets.",
-        )
-        .unwrap();
-
-        let config = RuntimeConfig {
-            project_dir: project_dir.clone(),
-            ..RuntimeConfig::from_env()
-        };
-        let events = Arc::new(EventBus::default());
-        let agent = Agent::create(&config, store, events).unwrap();
-
-        let description = &agent.pipeline.system_instructions[0];
-        assert!(description.contains(&project_dir.display().to_string()));
-        assert!(description.contains("Rust (Cargo)"));
-        assert!(description.contains("Widget Factory"));
 
         std::fs::remove_dir_all(&store_dir).ok();
         std::fs::remove_dir_all(&project_dir).ok();

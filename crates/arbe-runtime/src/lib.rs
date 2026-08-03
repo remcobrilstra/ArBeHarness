@@ -5,12 +5,10 @@
 pub mod agent;
 pub mod config;
 pub mod event_bus;
-pub mod project_context;
 
 pub use agent::Agent;
 pub use config::RuntimeConfig;
 pub use event_bus::EventBus;
-pub use project_context::describe_project;
 
 pub use arbe_core;
 pub use arbe_storage;

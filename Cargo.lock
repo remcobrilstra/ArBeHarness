@@ -103,7 +103,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
  "uuid",
