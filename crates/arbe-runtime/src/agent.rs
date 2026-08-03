@@ -74,9 +74,8 @@ pub struct Agent {
     pending_tool_calls: HashMap<ToolCallId, ToolInvocation>,
     last_estimated_tokens: u64,
     /// The repo/project this agent works on — see `RuntimeConfig::project_dir`.
-    /// Not yet consumed by anything (no file/execute tools exist yet), but
-    /// plumbed through now so those tools have a sandbox root to read from
-    /// the moment they're added.
+    /// This is the sandbox root every builtin filesystem/execute tool is
+    /// registered against in `assemble`.
     project_dir: std::path::PathBuf,
 }
 
@@ -93,6 +92,10 @@ impl Agent {
             config.api_key.clone(),
             config.base_url.clone(),
         )?;
+
+        let mut registry = ToolRegistry::new();
+        arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
+
         Ok(Self {
             store,
             meta,
@@ -106,7 +109,7 @@ impl Agent {
             budget_tokens: config.context_budget_tokens,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
-            registry: ToolRegistry::new(),
+            registry,
             policy: Box::new(StandardApprovalPolicy),
             approval_ctx: ApprovalContext {
                 policy_mode: config.policy_mode,
@@ -762,5 +765,46 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Exercises the real `Agent::create` path (not `agent_with_fake_provider`,
+    /// which builds an `Agent` by hand and so never runs the builtin-tool
+    /// registration in `assemble`) to prove the builtin tools registered in
+    /// Phase 8 are actually reachable end to end: propose a `list_dir` call,
+    /// approve it, and confirm it reports the real file on disk.
+    #[tokio::test]
+    async fn builtin_tools_are_registered_and_usable_through_the_real_agent() {
+        let (store, store_dir) = temp_store();
+        let project_dir =
+            std::env::temp_dir().join(format!("arbe-agent-project-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("marker.txt"), "hi").unwrap();
+
+        let config = RuntimeConfig {
+            project_dir: project_dir.clone(),
+            ..RuntimeConfig::from_env()
+        };
+        let events = Arc::new(EventBus::default());
+        let mut agent = Agent::create(&config, store, events).unwrap();
+
+        let id = agent.propose_tool_call("list_dir".to_string(), json!({}), RiskLevel::Low);
+        let outcome = agent
+            .resolve_tool_call(id, ApprovalDecision::ApprovedOnce)
+            .await
+            .unwrap();
+
+        let GatedOutcome::Executed(result) = outcome else {
+            panic!("expected the tool to execute, got {outcome:?}");
+        };
+        let names: Vec<&str> = result.output["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["marker.txt"]);
+
+        std::fs::remove_dir_all(&store_dir).ok();
+        std::fs::remove_dir_all(&project_dir).ok();
     }
 }

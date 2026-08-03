@@ -1,0 +1,211 @@
+use std::path::PathBuf;
+
+use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::json;
+
+use super::path_guard::resolve_within_root;
+use crate::ToolExecutor;
+
+/// Files larger than this are rejected rather than read in full — keeps a
+/// single tool call from pulling an entire large binary/log into the
+/// model's context by accident.
+const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct Args {
+    path: String,
+    /// 1-indexed, inclusive. Omit both to read the whole file.
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+}
+
+pub struct ReadFileTool {
+    root: PathBuf,
+}
+
+impl ReadFileTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ReadFileTool {
+    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+        let args: Args = serde_json::from_value(invocation.arguments)
+            .map_err(|e| ToolError::Validation(format!("invalid read_file arguments: {e}")))?;
+        let path = resolve_within_root(&self.root, &args.path)?;
+
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
+        if metadata.len() > MAX_READ_BYTES {
+            return Err(ToolError::Validation(format!(
+                "{} is {} bytes, over the {MAX_READ_BYTES}-byte read limit",
+                path.display(),
+                metadata.len()
+            )));
+        }
+
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
+
+        let (content, total_lines) = slice_lines(&contents, args.start_line, args.end_line)?;
+
+        Ok(ToolResult {
+            id: invocation.id,
+            output: json!({ "content": content, "total_lines": total_lines }),
+            is_error: false,
+        })
+    }
+}
+
+/// Extracts `[start_line, end_line]` (1-indexed, inclusive) from `text`,
+/// or the whole text if both are `None`. Pure and separately tested so the
+/// line-range edge cases (out-of-range, reversed, single-line files) don't
+/// need a real file on disk to verify.
+fn slice_lines(
+    text: &str,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> Result<(String, u64), ToolError> {
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len() as u64;
+
+    let (Some(start), Some(end)) = (start_line, end_line) else {
+        return Ok((text.to_string(), total_lines));
+    };
+
+    if start == 0 || start > end {
+        return Err(ToolError::Validation(format!(
+            "invalid line range: start_line={start}, end_line={end}"
+        )));
+    }
+
+    let start_idx = (start - 1) as usize;
+    if start_idx >= lines.len() {
+        return Ok((String::new(), total_lines));
+    }
+    let end_idx = (end as usize).min(lines.len());
+
+    Ok((lines[start_idx..end_idx].join("\n"), total_lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbe_core::{RiskLevel, ToolCallId, TurnId};
+    use tempfile::tempdir;
+
+    fn invocation(args: serde_json::Value) -> ToolInvocation {
+        ToolInvocation {
+            id: ToolCallId::new(),
+            source_turn: TurnId::new(),
+            tool_name: "read_file".to_string(),
+            arguments: args,
+            risk: RiskLevel::Low,
+            rationale: None,
+        }
+    }
+
+    #[test]
+    fn slice_lines_returns_everything_when_no_range_given() {
+        let (content, total) = slice_lines("a\nb\nc", None, None).unwrap();
+        assert_eq!(content, "a\nb\nc");
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn slice_lines_extracts_an_inclusive_range() {
+        let (content, total) = slice_lines("a\nb\nc\nd", Some(2), Some(3)).unwrap();
+        assert_eq!(content, "b\nc");
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn slice_lines_clamps_an_end_past_the_file_length() {
+        let (content, _) = slice_lines("a\nb", Some(1), Some(100)).unwrap();
+        assert_eq!(content, "a\nb");
+    }
+
+    #[test]
+    fn slice_lines_rejects_a_zero_start_line() {
+        assert!(slice_lines("a\nb", Some(0), Some(1)).is_err());
+    }
+
+    #[test]
+    fn slice_lines_rejects_a_reversed_range() {
+        assert!(slice_lines("a\nb\nc", Some(3), Some(1)).is_err());
+    }
+
+    #[test]
+    fn slice_lines_returns_empty_for_a_start_past_the_file_length() {
+        let (content, total) = slice_lines("a\nb", Some(10), Some(20)).unwrap();
+        assert_eq!(content, "");
+        assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn reads_a_whole_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(invocation(json!({ "path": "hello.txt" })))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["content"], "hello world");
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn reads_a_line_range() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(invocation(
+                json!({ "path": "f.txt", "start_line": 2, "end_line": 2 }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output["content"], "two");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_path_escaping_the_root() {
+        let dir = tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let err = tool
+            .execute(invocation(json!({ "path": "../outside.txt" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_a_runtime_failure_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let err = tool
+            .execute(invocation(json!({ "path": "nope.txt" })))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::RuntimeFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_are_a_validation_error() {
+        let dir = tempdir().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let err = tool.execute(invocation(json!({}))).await.unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+}

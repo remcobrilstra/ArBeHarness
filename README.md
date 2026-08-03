@@ -68,7 +68,19 @@ Once it's running:
 - Type a message and press `Enter` to chat (response streams token-by-token).
 - `Ctrl+L` clears the transcript view (no data loss — it's still on disk under `~/.arbe/sessions/<session-id>/`).
 - `Ctrl+C` quits.
-- `/tool echo {"text":"hi"}` proposes a demo tool call (the only tool registered by default is `echo`) — approve/deny it with `y`/`n`/`a`/`d` in the modal that appears. This exists because no provider currently returns structured tool calls in its response (see `docs/v1-status.md`), so there's no automatic way to trigger the approval flow from a real model reply yet.
+- `/tool <name> <json-args>` proposes a tool call — approve/deny it with `y`/`n`/`a`/`d` in the modal that appears. This exists because no provider currently returns structured tool calls in its response (see `docs/v1-status.md`), so there's no automatic way to trigger the approval flow from a real model reply yet; `/tool` is the manual stand-in. Every session registers these builtin tools by default, sandboxed to `ARBE_WORKDIR`:
+
+  | Tool | Args | Notes |
+  |---|---|---|
+  | `read_file` | `{"path": "...", "start_line"?, "end_line"?}` | line range is optional and 1-indexed |
+  | `write_file` | `{"path": "...", "content": "..."}` | creates parent dirs, atomic write |
+  | `edit_file` | `{"path": "...", "find": "...", "replace": "...", "replace_all"?}` | errors if `find` isn't found (or matches more than once without `replace_all: true`) |
+  | `list_dir` | `{"path"?: "..."}` | defaults to the workdir root |
+  | `glob` | `{"pattern": "...", "path"?: "..."}` | e.g. `{"pattern":"**/*.rs"}` |
+  | `grep` | `{"pattern": "...", "path"?: "...", "case_insensitive"?}` | pattern is a regex |
+  | `execute` | `{"command": "...", "timeout_secs"?}` | runs in a shell, cwd = workdir — **highest risk**, always goes through approval |
+
+  e.g. `/tool list_dir {}` or `/tool read_file {"path":"Cargo.toml"}`.
 
 There is no session-resume picker in the TUI yet — every run starts a new session (`docs/v1-status.md` tracks this as a known gap).
 

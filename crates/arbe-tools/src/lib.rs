@@ -1,6 +1,7 @@
 //! Tool registry, approval policy, and execution contracts (harness spec
 //! FR-4, overall design §4.6).
 
+pub mod builtin;
 pub mod gate;
 pub mod policy;
 pub mod registry;
