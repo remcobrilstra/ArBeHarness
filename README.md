@@ -64,6 +64,8 @@ bash/zsh:
 ARBE_PROVIDER=openai OPENAI_API_KEY=sk-... cargo run
 ```
 
+On startup, the agent takes a one-time snapshot of `ARBE_WORKDIR` (path, detected ecosystem from files like `Cargo.toml`/`package.json`, a top-level directory listing, and a README excerpt if one exists) and folds it into the system prompt — so "tell me about our current project" has an answer even before automatic tool-calling exists. It won't reflect changes made mid-session; ask it to `/tool list_dir {}` or `/tool read_file {"path":"..."}` for up-to-date info.
+
 Once it's running:
 - Type a message and press `Enter` to chat (response streams token-by-token).
 - `Ctrl+L` clears the transcript view (no data loss — it's still on disk under `~/.arbe/sessions/<session-id>/`).
