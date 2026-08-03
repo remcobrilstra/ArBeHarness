@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 bytes = "1"
 async-stream = "0.3"
 toml = "0.9"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [package]
 name = "arbeharness"
@@ -45,3 +47,4 @@ license.workspace = true
 arbe-runtime = { workspace = true }
 arbe-tui = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
