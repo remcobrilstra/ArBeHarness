@@ -22,6 +22,41 @@ crates/
   arbe-tui/                 # terminal UI (depends only on arbe-runtime)
 ```
 
+## Running
+
+`cargo run` launches the TUI. With no configuration it defaults to a local Ollama server (`http://localhost:11434`, model `llama3`) — no API key needed to launch, but you'll need Ollama actually running to get a reply.
+
+To use OpenAI instead, set these environment variables before running:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ARBE_PROVIDER` | yes | set to `openai` |
+| `OPENAI_API_KEY` | yes (when provider is `openai`) | your OpenAI API key — never hardcode this, only ever read from env |
+| `ARBE_MODEL` | no | defaults to `gpt-5-mini` when provider is `openai` |
+| `ARBE_BASE_URL` | no | override the API base URL, e.g. to point at an OpenAI-compatible gateway |
+
+PowerShell:
+
+```powershell
+$env:ARBE_PROVIDER = "openai"
+$env:OPENAI_API_KEY = "sk-..."
+cargo run
+```
+
+bash/zsh:
+
+```bash
+ARBE_PROVIDER=openai OPENAI_API_KEY=sk-... cargo run
+```
+
+Once it's running:
+- Type a message and press `Enter` to chat (response streams token-by-token).
+- `Ctrl+L` clears the transcript view (no data loss — it's still on disk under `~/.arbe/sessions/<session-id>/`).
+- `Ctrl+C` quits.
+- `/tool echo {"text":"hi"}` proposes a demo tool call (the only tool registered by default is `echo`) — approve/deny it with `y`/`n`/`a`/`d` in the modal that appears. This exists because no provider currently returns structured tool calls in its response (see `docs/v1-status.md`), so there's no automatic way to trigger the approval flow from a real model reply yet.
+
+There is no session-resume picker in the TUI yet — every run starts a new session (`docs/v1-status.md` tracks this as a known gap).
+
 ## Local commands
 
 ```bash
