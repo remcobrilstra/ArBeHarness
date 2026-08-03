@@ -14,7 +14,7 @@ pub mod turn;
 pub use error::{ConfigError, HarnessError, HookError, MemoryError, ProviderError, ToolError};
 pub use event::{RuntimeCommand, RuntimeEvent};
 pub use ids::{SessionId, ToolCallId, TurnId};
-pub use loop_state::LoopPhase;
+pub use loop_state::{IllegalTransition, LoopMachine, LoopPhase};
 pub use message::{Message, Role};
 pub use session::{SessionMeta, SessionStatus};
 pub use tool::{ApprovalDecision, ApprovalPolicyMode, RiskLevel, ToolInvocation, ToolResult};

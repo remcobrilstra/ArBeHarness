@@ -1,3 +1,4 @@
+use arbe_core::SessionId;
 use std::path::PathBuf;
 
 /// Resolves the ArBeHarness root directory (`~/.arbe/`, overall design §6),
@@ -25,8 +26,8 @@ pub fn sessions_dir() -> PathBuf {
     arbe_home().join("sessions")
 }
 
-pub fn session_dir(session_id: &str) -> PathBuf {
-    sessions_dir().join(session_id)
+pub fn session_dir(session_id: SessionId) -> PathBuf {
+    sessions_dir().join(session_id.to_string())
 }
 
 pub fn skills_dir() -> PathBuf {
