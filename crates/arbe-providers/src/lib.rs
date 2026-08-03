@@ -1,6 +1,15 @@
 //! Model provider abstraction (harness spec FR-2, overall design §4.2).
-//! Concrete adapters (OpenAI, Anthropic, xAI, Mistral, Ollama) land in
-//! Phase 2; this crate currently defines only the shared contract.
+//! OpenAI and Ollama adapters ship in Phase 2 (implementation plan);
+//! Anthropic/xAI/Mistral adapters follow the same `ModelProvider`
+//! contract and can be added without touching call sites.
+
+pub mod error_map;
+pub mod ollama;
+pub mod openai;
+pub mod sse;
+
+pub use ollama::OllamaProvider;
+pub use openai::OpenAiProvider;
 
 use arbe_core::ProviderError;
 use async_trait::async_trait;
@@ -44,4 +53,72 @@ pub trait ModelProvider: Send + Sync {
         Box<dyn futures_core::Stream<Item = Result<TokenChunk, ProviderError>> + Send + Unpin>,
         ProviderError,
     >;
+}
+
+/// Config-driven construction so swapping providers is a config change,
+/// not a code change (overall design §7, implementation plan Phase 2 exit
+/// criteria: "same prompt runs on both adapters by config switch only").
+///
+/// `api_key` is required for `"openai"` and ignored for `"ollama"`; per
+/// NFR-4 it must come from env/config indirection, never a literal in code.
+pub fn build_provider(
+    provider_name: &str,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> Result<Box<dyn ModelProvider>, ProviderError> {
+    match provider_name {
+        "openai" => {
+            let api_key = api_key.ok_or_else(|| {
+                ProviderError::Auth("openai provider requires an api_key".to_string())
+            })?;
+            let mut provider = OpenAiProvider::new(api_key);
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
+            Ok(Box::new(provider))
+        }
+        "ollama" => {
+            let mut provider = OllamaProvider::new();
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
+            Ok(Box::new(provider))
+        }
+        other => Err(ProviderError::InvalidRequest(format!(
+            "unknown provider: {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_openai_provider_with_api_key() {
+        let provider = build_provider("openai", Some("sk-test".to_string()), None).unwrap();
+        assert!(provider.capabilities().tool_calls);
+    }
+
+    #[test]
+    fn openai_without_api_key_is_an_auth_error() {
+        let Err(err) = build_provider("openai", None, None) else {
+            panic!("expected an error");
+        };
+        assert!(matches!(err, ProviderError::Auth(_)));
+    }
+
+    #[test]
+    fn builds_ollama_provider_without_api_key() {
+        let provider = build_provider("ollama", None, None).unwrap();
+        assert!(!provider.capabilities().tool_calls);
+    }
+
+    #[test]
+    fn unknown_provider_name_is_invalid_request() {
+        let Err(err) = build_provider("not-a-provider", None, None) else {
+            panic!("expected an error");
+        };
+        assert!(matches!(err, ProviderError::InvalidRequest(_)));
+    }
 }

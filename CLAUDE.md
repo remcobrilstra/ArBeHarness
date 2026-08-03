@@ -14,7 +14,9 @@ Phase 0 (workspace + CI skeleton) is done: the `crates/arbe-*` workspace exists,
 
 Phase 1 (loop skeleton + persistence) is done: `arbe_core::LoopMachine` enforces the legal `LoopPhase` transition graph from the design doc (including the tool-call and direct-response branches); `arbe_storage::SessionStore` persists `meta.json` (atomic write), append-only `turns.jsonl`/`events.jsonl`, and supports create/load/resume/list, with tests covering forced-interruption recovery. `SessionStore` takes an explicit root (`with_root`) rather than always reading the global `~/.arbe/` — use that in tests instead of mutating `ARBE_HOME`, since env vars are process-global and races across parallel tests.
 
-Not started: Phase 2 (provider adapters) onward — see `docs/v1-implementation-plan.md` and the tracked tasks for the phase breakdown. Follow phase order; don't wire a tool executor or context strategy before real provider inference (Phase 2) exists, since later phases assume a working model round-trip.
+Phase 2 (provider abstraction + first adapters) is done: `arbe-providers` has `OpenAiProvider` and `OllamaProvider`, both implementing `ModelProvider` (non-streaming `infer` + streaming `infer_stream` over SSE / newline-delimited JSON respectively), plus `build_provider(name, api_key, base_url)` so switching providers is a config change (implementation plan Phase 2 exit criterion). HTTP/parsing logic is split into pure, network-free functions (`build_request_body`, `parse_response`, `parse_stream_payload`/`parse_stream_line`, `SseDecoder`, `map_http_error`/`map_transport_error`) so they're unit-testable without a live API or mock server — there is currently no integration test that hits a real OpenAI/Ollama endpoint.
+
+Not started: Phase 3 (context & memory strategies) onward — see `docs/v1-implementation-plan.md` and the tracked tasks for the phase breakdown. Follow phase order; don't build the tool approval gate before a context-assembled turn can actually reach a tool call.
 
 ## Non-negotiable architecture rules
 
