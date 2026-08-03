@@ -34,6 +34,7 @@ To use OpenAI instead, set these environment variables before running:
 | `OPENAI_API_KEY` | yes (when provider is `openai`) | your OpenAI API key — never hardcode this, only ever read from env |
 | `ARBE_MODEL` | no | defaults to `gpt-5-mini` when provider is `openai` |
 | `ARBE_BASE_URL` | no | override the API base URL, e.g. to point at an OpenAI-compatible gateway |
+| `ARBE_TEMPERATURE` | no | defaults to `1.0` for `openai` (its reasoning-family models reject any other value), `0.2` otherwise |
 
 PowerShell:
 

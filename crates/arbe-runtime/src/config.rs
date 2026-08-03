@@ -31,17 +31,23 @@ impl RuntimeConfig {
     /// env, never a literal in code).
     pub fn from_env() -> Self {
         let provider_name = std::env::var("ARBE_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
-        let default_model = if provider_name == "openai" {
-            "gpt-5-mini"
-        } else {
-            "llama3"
-        };
+        let is_openai = provider_name == "openai";
+        let default_model = if is_openai { "gpt-5-mini" } else { "llama3" };
+        // OpenAI's newer reasoning-family models (o1/o3/gpt-5) reject any
+        // temperature other than the default (1) with a 400 error; older
+        // chat models tolerate a lower temperature fine, but 1 is a safe
+        // default for both. `ARBE_TEMPERATURE` overrides this if a caller
+        // knows their chosen model supports something else.
+        let default_temperature = if is_openai { 1.0 } else { 0.2 };
         Self {
             profile: "default".to_string(),
             model: std::env::var("ARBE_MODEL").unwrap_or_else(|_| default_model.to_string()),
             api_key: std::env::var("OPENAI_API_KEY").ok(),
             base_url: std::env::var("ARBE_BASE_URL").ok(),
-            temperature: 0.2,
+            temperature: std::env::var("ARBE_TEMPERATURE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default_temperature),
             max_tokens: 4096,
             context_budget_tokens: 8_000,
             memory_strategy: "truncation".to_string(),
