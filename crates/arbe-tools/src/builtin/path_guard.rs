@@ -62,6 +62,55 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     result
 }
 
+/// Second, filesystem-aware line of defense against a symlink planted
+/// inside `root` (e.g. by `execute`, or already present in a checked-out
+/// repo) that points somewhere outside it. [`resolve_within_root`] is
+/// purely lexical and has no way to see this — a symlink's path
+/// *components* stay lexically under `root` even though following it at
+/// I/O time lands outside it. Every builtin tool that does filesystem I/O
+/// must call this with the path [`resolve_within_root`] returned,
+/// immediately before the actual read/write/list call.
+///
+/// Walks up from `path` to the nearest existing ancestor (the target
+/// itself may not exist yet, e.g. a file about to be created), canonicalizes
+/// that ancestor (which resolves any symlinks in it), and rejects the
+/// request unless the canonicalized ancestor still starts with the
+/// canonicalized `root`.
+pub async fn verify_no_symlink_escape(root: &Path, path: &Path) -> Result<(), ToolError> {
+    let canonical_root = tokio::fs::canonicalize(root).await.map_err(|e| {
+        ToolError::RuntimeFailure(format!(
+            "could not canonicalize root {}: {e}",
+            root.display()
+        ))
+    })?;
+
+    let mut existing = path;
+    loop {
+        if tokio::fs::metadata(existing).await.is_ok() {
+            break;
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break,
+        }
+    }
+
+    let canonical_existing = tokio::fs::canonicalize(existing).await.map_err(|e| {
+        ToolError::RuntimeFailure(format!(
+            "could not canonicalize {}: {e}",
+            existing.display()
+        ))
+    })?;
+
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(ToolError::Validation(format!(
+            "path {path:?} escapes the working directory via a symlink"
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +179,67 @@ mod tests {
     fn the_root_itself_resolves_to_the_root() {
         let resolved = resolve_within_root(&root(), ".").unwrap();
         assert_eq!(resolved, root());
+    }
+
+    #[tokio::test]
+    async fn accepts_a_path_with_no_symlinks_involved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hi").unwrap();
+        let resolved = resolve_within_root(dir.path(), "f.txt").unwrap();
+        verify_no_symlink_escape(dir.path(), &resolved)
+            .await
+            .unwrap();
+    }
+
+    // Symlink creation on Windows requires elevated privileges or developer
+    // mode, so this exercises the actual escape scenario only on Unix,
+    // where CI can create symlinks unprivileged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_a_symlink_inside_root_that_points_outside_it() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+
+        let sandbox = tempfile::tempdir().unwrap();
+        symlink(outside.path(), sandbox.path().join("escape")).unwrap();
+
+        let resolved = resolve_within_root(sandbox.path(), "escape/secret.txt").unwrap();
+        let err = verify_no_symlink_escape(sandbox.path(), &resolved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_a_symlinked_file_inside_root_pointing_outside_it() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+
+        let sandbox = tempfile::tempdir().unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            sandbox.path().join("link.txt"),
+        )
+        .unwrap();
+
+        let resolved = resolve_within_root(sandbox.path(), "link.txt").unwrap();
+        let err = verify_no_symlink_escape(sandbox.path(), &resolved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn allows_a_not_yet_created_file_whose_parent_stays_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_within_root(dir.path(), "new/nested/file.txt").unwrap();
+        verify_no_symlink_escape(dir.path(), &resolved)
+            .await
+            .unwrap();
     }
 }

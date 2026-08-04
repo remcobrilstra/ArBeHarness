@@ -43,8 +43,8 @@ impl ContextPipeline {
     pub fn assemble(
         &self,
         strategy: &dyn ContextStrategy,
-        history: Vec<HistoryEntry>,
-        pinned_turn_indices: Vec<u64>,
+        history: &[HistoryEntry],
+        pinned_turn_indices: &[u64],
         user_message: Message,
         budget_tokens: u64,
     ) -> ContextOutput {
@@ -103,8 +103,8 @@ mod tests {
         let strategy = TruncationStrategy;
         let out = pipeline.assemble(
             &strategy,
-            vec![history_entry(0, "earlier turn")],
-            vec![],
+            &[history_entry(0, "earlier turn")],
+            &[],
             Message::new(Role::User, "current question"),
             10_000,
         );
@@ -132,8 +132,8 @@ mod tests {
         let strategy = TruncationStrategy;
         let out = pipeline.assemble(
             &strategy,
-            vec![history_entry(0, "aaaa"), history_entry(1, "bbbb")],
-            vec![],
+            &[history_entry(0, "aaaa"), history_entry(1, "bbbb")],
+            &[],
             Message::new(Role::User, "q"),
             12, // only ~1 token left for history after the preamble + user
         );

@@ -130,6 +130,10 @@ impl SessionStore {
         read_jsonl(&path)
     }
 
+    /// Lists every session under the sessions root. A single damaged
+    /// `meta.json` (unreadable or unparseable) is skipped rather than
+    /// failing the entire listing — one corrupt session directory
+    /// shouldn't hide every other, healthy session.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>, StorageError> {
         let dir = &self.sessions_root;
         if !dir.exists() {
@@ -140,23 +144,14 @@ impl SessionStore {
             path: dir.display().to_string(),
             source,
         })? {
-            let entry = entry.map_err(|source| StorageError::Io {
-                path: dir.display().to_string(),
-                source,
-            })?;
+            let Ok(entry) = entry else { continue };
             let meta_path = entry.path().join("meta.json");
-            if !meta_path.exists() {
+            let Ok(bytes) = fs::read(&meta_path) else {
                 continue;
-            }
-            let bytes = fs::read(&meta_path).map_err(|source| StorageError::Io {
-                path: meta_path.display().to_string(),
-                source,
-            })?;
-            let meta: SessionMeta =
-                serde_json::from_slice(&bytes).map_err(|source| StorageError::Serde {
-                    path: meta_path.display().to_string(),
-                    source,
-                })?;
+            };
+            let Ok(meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+                continue;
+            };
             sessions.push(meta);
         }
         Ok(sessions)
@@ -169,6 +164,12 @@ impl Default for SessionStore {
     }
 }
 
+/// Parses each non-blank line as `T`. A crash mid-`append_line` can only
+/// ever tear the *last* line in the file (all earlier lines were fully
+/// written and fsynced by prior calls), so only the last line is allowed to
+/// fail parsing — it's dropped rather than failing the whole load. A
+/// malformed line anywhere else indicates real corruption and is still a
+/// hard error.
 fn read_jsonl<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
 ) -> Result<Vec<T>, StorageError> {
@@ -179,16 +180,27 @@ fn read_jsonl<T: serde::de::DeserializeOwned>(
         path: path.display().to_string(),
         source,
     })?;
-    contents
+    let lines: Vec<&str> = contents
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).map_err(|source| StorageError::Serde {
-                path: path.display().to_string(),
-                source,
-            })
-        })
-        .collect()
+        .collect();
+
+    let mut result = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(value) => result.push(value),
+            Err(source) => {
+                if idx == lines.len() - 1 {
+                    break;
+                }
+                return Err(StorageError::Serde {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -233,6 +245,49 @@ mod tests {
         assert_eq!(recovered_meta.id, meta.id);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_message.as_ref().unwrap().content, "hello");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_turns_drops_a_torn_trailing_line_but_keeps_earlier_ones() {
+        let (store, dir) = temp_store();
+        let meta = store.create_session("default", "openai", "gpt-5").unwrap();
+
+        let mut turn = Turn::new(meta.id, 0);
+        turn.user_message = Some(arbe_core::Message::new(Role::User, "hello"));
+        store.append_turn(&turn).unwrap();
+
+        // Simulate a crash mid-append: a second, torn line with no closing
+        // brace appended directly to the file (append_line always writes a
+        // complete line, so this models the file state a crash mid-write
+        // would leave behind).
+        let path = store.turns_path(meta.id);
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{{\"partial\": tru").unwrap();
+        drop(file);
+
+        let turns = store.list_turns(meta.id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_message.as_ref().unwrap().content, "hello");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_turns_still_errors_on_a_malformed_line_that_is_not_the_last() {
+        let (store, dir) = temp_store();
+        let meta = store.create_session("default", "openai", "gpt-5").unwrap();
+        let path = store.turns_path(meta.id);
+
+        append_line(&path, "not valid json").unwrap();
+        let mut turn = Turn::new(meta.id, 0);
+        turn.user_message = Some(arbe_core::Message::new(Role::User, "hello"));
+        store.append_turn(&turn).unwrap();
+
+        let err = store.list_turns(meta.id).unwrap_err();
+        assert!(matches!(err, StorageError::Serde { .. }));
 
         fs::remove_dir_all(&dir).ok();
     }

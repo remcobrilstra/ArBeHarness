@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use walkdir::WalkDir;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
 
 /// Caps how many matches a single `glob` call returns, so a broad pattern
@@ -46,6 +46,7 @@ impl ToolExecutor for GlobTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid glob arguments: {e}")))?;
         let search_root = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &search_root).await?;
         let matcher = build_matcher(&args.pattern)?;
 
         let search_root_owned = search_root.clone();
@@ -76,6 +77,15 @@ fn build_matcher(pattern: &str) -> Result<GlobMatcher, ToolError> {
 
 /// The blocking directory walk + match, isolated from the tool's async
 /// plumbing so it's testable as a plain synchronous function.
+///
+/// Truncation happens *during* the walk (capping `matches` at
+/// `MAX_MATCHES` as soon as it's reached), then the surviving subset is
+/// sorted — so a truncated result is "the first `MAX_MATCHES` matches in
+/// filesystem walk order, then sorted," not "the lexicographically-first
+/// `MAX_MATCHES` matches." Collecting every match before truncating would
+/// give the latter, but defeats the point of capping memory use on a huge
+/// tree; walk order is OS/filesystem-dependent, so don't rely on which
+/// specific matches survive a truncated result.
 fn walk_and_match(search_root: &Path, matcher: &GlobMatcher) -> (Vec<String>, bool) {
     let mut matches = Vec::new();
     let mut truncated = false;

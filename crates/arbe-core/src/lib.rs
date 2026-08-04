@@ -17,5 +17,8 @@ pub use ids::{SessionId, ToolCallId, TurnId};
 pub use loop_state::{IllegalTransition, LoopMachine, LoopPhase};
 pub use message::{Message, Role};
 pub use session::{SessionMeta, SessionStatus};
-pub use tool::{ApprovalDecision, ApprovalPolicyMode, RiskLevel, ToolInvocation, ToolResult};
+pub use tool::{
+    ApprovalDecision, ApprovalPolicyMode, RequestedToolCall, RiskLevel, ToolInvocation, ToolResult,
+    ToolSpec,
+};
 pub use turn::Turn;

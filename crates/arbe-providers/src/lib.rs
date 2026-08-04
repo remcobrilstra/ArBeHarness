@@ -7,6 +7,7 @@ pub mod error_map;
 pub mod ollama;
 pub mod openai;
 pub mod sse;
+pub mod utf8_buffer;
 
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
@@ -29,11 +30,19 @@ pub struct ModelRequest {
     pub messages: Vec<arbe_core::Message>,
     pub temperature: f32,
     pub max_tokens: u64,
+    /// Tools the model may call (empty when the caller isn't offering any,
+    /// or the provider doesn't support it — see `ProviderCapabilities::tool_calls`).
+    #[serde(default)]
+    pub tools: Vec<arbe_core::ToolSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelResponse {
     pub content: String,
+    /// Tool calls the model asked for. Non-empty only when `tools` was
+    /// non-empty on the request and the model chose to use one.
+    #[serde(default)]
+    pub tool_calls: Vec<arbe_core::RequestedToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

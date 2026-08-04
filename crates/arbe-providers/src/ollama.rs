@@ -4,6 +4,7 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::error_map::{map_http_error, map_transport_error};
+use crate::utf8_buffer::Utf8ChunkBuffer;
 use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderCapabilities, TokenChunk};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -83,7 +84,12 @@ fn parse_response(body: &str) -> Result<ModelResponse, ProviderError> {
         .message
         .map(|m| m.content)
         .ok_or_else(|| ProviderError::Internal("Ollama response had no message".to_string()))?;
-    Ok(ModelResponse { content })
+    // Tool calling isn't wired up for Ollama yet (`capabilities().tool_calls`
+    // is `false`, so `agent.rs` never sends `tools` here) — always empty.
+    Ok(ModelResponse {
+        content,
+        tool_calls: Vec::new(),
+    })
 }
 
 /// Returns `None` once the stream reports `done: true` with no further
@@ -157,6 +163,7 @@ impl ModelProvider for OllamaProvider {
             use futures_util::StreamExt;
 
             let mut buffer = String::new();
+            let mut utf8_buf = Utf8ChunkBuffer::new();
             let mut bytes_stream = response.bytes_stream();
             'outer: while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -166,7 +173,7 @@ impl ModelProvider for OllamaProvider {
                         break;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.push_str(&utf8_buf.push(&chunk));
                 while let Some(newline_pos) = buffer.find('\n') {
                     let line = buffer[..newline_pos].trim().to_string();
                     buffer.drain(..=newline_pos);
@@ -201,6 +208,7 @@ mod tests {
             messages: vec![Message::new(Role::User, "hi")],
             temperature: 0.2,
             max_tokens: 100,
+            tools: Vec::new(),
         };
         let body = build_request_body(&req, true);
         assert_eq!(body.model, "llama3");

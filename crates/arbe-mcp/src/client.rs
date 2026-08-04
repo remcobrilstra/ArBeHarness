@@ -1,10 +1,17 @@
 use serde_json::{Value, json};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::McpServerConfig;
 use crate::protocol::{McpError, build_notification, build_request, parse_response};
+
+/// How long to wait for a response line before giving up on a request.
+/// `arbe-mcp` is documented as best-effort/optional (FR-8: handle
+/// unavailable servers gracefully) — without this, a hung child process
+/// would block the calling turn indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {
@@ -68,23 +75,53 @@ impl McpClient {
             .map_err(|e| McpError::Transport(e.to_string()))
     }
 
+    /// Sends a request and waits for its response, tolerating notifications
+    /// (server-to-client messages with no `id`) arriving first — the MCP
+    /// spec allows a server to interleave those before the matching
+    /// response — and giving up after [`REQUEST_TIMEOUT`] if nothing usable
+    /// arrives, rather than blocking the caller forever on a hung server.
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id;
         self.next_id += 1;
         let req = build_request(id, method, params);
         self.write_line(&req).await?;
 
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .await
-            .map_err(|e| McpError::Transport(e.to_string()))?;
-        if line.is_empty() {
-            return Err(McpError::Transport(
-                "MCP server closed the connection".to_string(),
-            ));
+        loop {
+            let mut line = String::new();
+            let bytes_read =
+                tokio::time::timeout(REQUEST_TIMEOUT, self.stdout.read_line(&mut line))
+                    .await
+                    .map_err(|_| {
+                        McpError::Transport(format!(
+                            "timed out after {:?} waiting for a response to {method}",
+                            REQUEST_TIMEOUT
+                        ))
+                    })?
+                    .map_err(|e| McpError::Transport(e.to_string()))?;
+
+            if bytes_read == 0 {
+                return Err(McpError::Transport(
+                    "MCP server closed the connection".to_string(),
+                ));
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let has_id = serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .is_some();
+            if !has_id {
+                // A notification, not a response to our request — keep
+                // waiting for the actual response.
+                continue;
+            }
+
+            return parse_response(trimmed, id);
         }
-        parse_response(line.trim(), id)
     }
 
     /// Performs the `initialize` handshake and sends the

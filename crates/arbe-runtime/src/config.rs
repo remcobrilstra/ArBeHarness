@@ -22,7 +22,6 @@ pub struct RuntimeConfig {
     pub allowlist: Vec<String>,
     pub denylist: Vec<String>,
     pub hook_timeout_ms: u64,
-    pub system_instructions: Vec<String>,
     /// The directory the agent operates *in* — usually the repo it's
     /// working on. This is distinct from `ARBE_HOME`/`~/.arbe/`, which is
     /// where the harness's own persistent state (sessions, skills, memory)
@@ -68,9 +67,6 @@ impl RuntimeConfig {
             allowlist: Vec::new(),
             denylist: Vec::new(),
             hook_timeout_ms: 500,
-            system_instructions: vec![
-                "You are ArBeHarness, a terse and helpful coding assistant.".to_string(),
-            ],
             provider_name,
             project_dir: std::env::var("ARBE_WORKDIR")
                 .map(PathBuf::from)

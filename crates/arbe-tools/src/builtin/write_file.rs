@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +34,7 @@ impl ToolExecutor for WriteFileTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid write_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &path).await?;
 
         let bytes_written = args.content.len();
         tokio::task::spawn_blocking(move || write_atomic(&path, args.content.as_bytes()))

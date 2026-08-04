@@ -150,6 +150,7 @@ name = "arbe-tui"
 version = "0.1.0"
 dependencies = [
  "arbe-runtime",
+ "chrono",
  "crossterm",
  "ratatui",
  "serde_json",

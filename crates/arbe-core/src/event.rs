@@ -39,7 +39,14 @@ pub enum RuntimeEvent {
     ToolExecuted {
         turn_id: TurnId,
         tool_call_id: ToolCallId,
+        tool_name: String,
         result: ToolResult,
+    },
+    ToolCallDenied {
+        turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        reason: String,
     },
     TurnCompleted {
         session_id: SessionId,

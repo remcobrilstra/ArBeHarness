@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
 
 /// Caps how many entries a single `list_dir` call returns, so a huge
@@ -44,6 +44,7 @@ impl ToolExecutor for ListDirTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid list_dir arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &path).await?;
 
         let mut read_dir = tokio::fs::read_dir(&path)
             .await

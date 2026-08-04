@@ -6,8 +6,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
+
+/// Mirrors `read_file::MAX_READ_BYTES` — an edit reads the whole file into
+/// memory before applying the find/replace, so it needs the same guard
+/// against a single tool call pulling an entire large file into memory.
+const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -38,6 +43,18 @@ impl ToolExecutor for EditFileTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid edit_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &path).await?;
+
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
+        if metadata.len() > MAX_READ_BYTES {
+            return Err(ToolError::Validation(format!(
+                "{} is {} bytes, over the {MAX_READ_BYTES}-byte read limit",
+                path.display(),
+                metadata.len()
+            )));
+        }
 
         let original = tokio::fs::read_to_string(&path)
             .await

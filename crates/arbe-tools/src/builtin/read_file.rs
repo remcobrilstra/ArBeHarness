@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
 
 /// Files larger than this are rejected rather than read in full — keeps a
@@ -37,6 +37,7 @@ impl ToolExecutor for ReadFileTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid read_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &path).await?;
 
         let metadata = tokio::fs::metadata(&path)
             .await

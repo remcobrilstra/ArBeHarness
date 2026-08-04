@@ -1,4 +1,4 @@
-use arbe_core::ApprovalPolicyMode;
+use arbe_core::{ApprovalPolicyMode, RiskLevel};
 
 use crate::{ApprovalContext, ApprovalPolicy};
 
@@ -29,7 +29,7 @@ impl ApprovalPolicy for StandardApprovalPolicy {
         invocation: &arbe_core::ToolInvocation,
         ctx: &ApprovalContext,
     ) -> PolicyOutcome {
-        match ctx.policy_mode {
+        let outcome = match ctx.policy_mode {
             ApprovalPolicyMode::AlwaysPrompt => PolicyOutcome::RequiresPrompt,
             ApprovalPolicyMode::AllowlistAuto => {
                 if ctx.allowlist.iter().any(|t| t == &invocation.tool_name) {
@@ -46,7 +46,17 @@ impl ApprovalPolicy for StandardApprovalPolicy {
                 }
             }
             ApprovalPolicyMode::DryRunOnly => PolicyOutcome::AutoDeny,
+        };
+
+        // A High-risk call (e.g. `execute`'s arbitrary shell access) never
+        // auto-approves purely because the mode/allowlist/denylist happened
+        // to let its *name* through — it still always needs a human
+        // decision. DryRunOnly's AutoDeny is untouched: it's already the
+        // maximally safe outcome, nothing safer to fall back to.
+        if invocation.risk == RiskLevel::High && outcome == PolicyOutcome::AutoApprove {
+            return PolicyOutcome::RequiresPrompt;
         }
+        outcome
     }
 }
 
@@ -57,12 +67,16 @@ mod tests {
     use serde_json::json;
 
     fn invocation(tool_name: &str) -> ToolInvocation {
+        invocation_with_risk(tool_name, RiskLevel::Low)
+    }
+
+    fn invocation_with_risk(tool_name: &str, risk: RiskLevel) -> ToolInvocation {
         ToolInvocation {
             id: ToolCallId::new(),
             source_turn: TurnId::new(),
             tool_name: tool_name.to_string(),
             arguments: json!({}),
-            risk: RiskLevel::Low,
+            risk,
             rationale: None,
         }
     }
@@ -111,6 +125,41 @@ mod tests {
             policy.decide(&invocation("read_file"), &deny_ctx),
             PolicyOutcome::AutoApprove
         );
+    }
+
+    #[test]
+    fn high_risk_call_always_requires_a_prompt_even_under_a_permissive_mode() {
+        let policy = StandardApprovalPolicy;
+        let deny_ctx = ctx(ApprovalPolicyMode::DenylistBlock, &[], &[]);
+        // Not on the denylist, so DenylistBlock would normally auto-approve
+        // it — but its risk is High, so it must still require a prompt.
+        assert_eq!(
+            policy.decide(&invocation_with_risk("execute", RiskLevel::High), &deny_ctx),
+            PolicyOutcome::RequiresPrompt
+        );
+    }
+
+    #[test]
+    fn high_risk_call_under_allowlist_still_requires_a_prompt() {
+        let policy = StandardApprovalPolicy;
+        let allow_ctx = ctx(ApprovalPolicyMode::AllowlistAuto, &["execute"], &[]);
+        assert_eq!(
+            policy.decide(
+                &invocation_with_risk("execute", RiskLevel::High),
+                &allow_ctx
+            ),
+            PolicyOutcome::RequiresPrompt
+        );
+    }
+
+    #[test]
+    fn high_risk_call_under_dry_run_only_still_auto_denies() {
+        let policy = StandardApprovalPolicy;
+        let outcome = policy.decide(
+            &invocation_with_risk("execute", RiskLevel::High),
+            &ctx(ApprovalPolicyMode::DryRunOnly, &[], &[]),
+        );
+        assert_eq!(outcome, PolicyOutcome::AutoDeny);
     }
 
     #[test]

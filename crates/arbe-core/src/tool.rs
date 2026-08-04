@@ -30,6 +30,31 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// A tool's name/description/JSON-schema, sent to a provider that supports
+/// tool calling (`ProviderCapabilities::tool_calls`) so the model knows
+/// what it can invoke and how to shape arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema (object type) describing the arguments this tool
+    /// accepts — passed through to the provider largely as-is.
+    pub parameters: Value,
+}
+
+/// A tool call the model asked for, as surfaced by a provider's response.
+/// `id` is the provider's own call id (e.g. OpenAI's `tool_calls[].id`) —
+/// distinct from `arbe_core::ToolCallId`, which is the harness's internal
+/// identifier assigned once the call is turned into a `ToolInvocation`.
+/// The provider's id has to be threaded back into the follow-up
+/// `role: "tool"` message so the API can match the result to the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
 /// Policy modes from harness spec FR-4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

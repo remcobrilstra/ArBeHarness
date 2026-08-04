@@ -20,11 +20,11 @@ impl ContextStrategy for CompactWithSummaryStrategy {
         "compact_summary"
     }
 
-    fn build_context(&self, input: ContextInput) -> ContextOutput {
+    fn build_context(&self, input: ContextInput<'_>) -> ContextOutput {
         let (keep, dropped_tokens) = select_kept(
-            &input.session_history,
+            input.session_history,
             input.budget_tokens,
-            &input.pinned_turn_indices,
+            input.pinned_turn_indices,
         );
         let dropped_count = keep.iter().filter(|k| !**k).count();
 
@@ -40,10 +40,10 @@ impl ContextStrategy for CompactWithSummaryStrategy {
         messages.extend(
             input
                 .session_history
-                .into_iter()
+                .iter()
                 .zip(keep)
                 .filter(|(_, k)| *k)
-                .map(|(e, _)| e.message),
+                .map(|(e, _)| e.message.clone()),
         );
 
         let estimated_tokens = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
@@ -72,9 +72,9 @@ mod tests {
     fn no_summary_when_nothing_dropped() {
         let strategy = CompactWithSummaryStrategy;
         let out = strategy.build_context(ContextInput {
-            session_history: vec![entry(0, "hi")],
+            session_history: &[entry(0, "hi")],
             budget_tokens: 1000,
-            pinned_turn_indices: vec![],
+            pinned_turn_indices: &[],
         });
         assert_eq!(out.messages.len(), 1);
         assert!(!out.truncated);
@@ -84,9 +84,9 @@ mod tests {
     fn prepends_a_summary_message_when_entries_are_dropped() {
         let strategy = CompactWithSummaryStrategy;
         let out = strategy.build_context(ContextInput {
-            session_history: vec![entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
+            session_history: &[entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
             budget_tokens: 1,
-            pinned_turn_indices: vec![],
+            pinned_turn_indices: &[],
         });
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, Role::System);

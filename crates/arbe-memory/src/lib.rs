@@ -18,11 +18,15 @@ pub use truncation::TruncationStrategy;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextInput {
-    pub session_history: Vec<HistoryEntry>,
+/// Borrows the caller's session history/pinned-index storage rather than
+/// taking ownership, so assembling context for a turn doesn't require
+/// cloning the entire session history just to hand it to a strategy that
+/// only ever reads it.
+#[derive(Debug, Clone)]
+pub struct ContextInput<'a> {
+    pub session_history: &'a [HistoryEntry],
     pub budget_tokens: u64,
-    pub pinned_turn_indices: Vec<u64>,
+    pub pinned_turn_indices: &'a [u64],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,5 +40,5 @@ pub struct ContextOutput {
 /// ("memory.strategy"); switchable at runtime without a code change.
 pub trait ContextStrategy: Send + Sync {
     fn name(&self) -> &'static str;
-    fn build_context(&self, input: ContextInput) -> ContextOutput;
+    fn build_context(&self, input: ContextInput<'_>) -> ContextOutput;
 }

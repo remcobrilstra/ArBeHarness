@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use walkdir::WalkDir;
 
-use super::path_guard::resolve_within_root;
+use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
 use crate::ToolExecutor;
 
 /// Caps how many matching lines a single `grep` call returns.
@@ -54,6 +54,7 @@ impl ToolExecutor for GrepTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid grep arguments: {e}")))?;
         let search_root = resolve_within_root(&self.root, &args.path)?;
+        verify_no_symlink_escape(&self.root, &search_root).await?;
         let regex = RegexBuilder::new(&args.pattern)
             .case_insensitive(args.case_insensitive)
             .build()

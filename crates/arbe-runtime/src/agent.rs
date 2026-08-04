@@ -5,7 +5,7 @@ use std::time::Duration;
 use arbe_core::{
     ApprovalDecision, HarnessError, LoopMachine, LoopPhase, MemoryError, Message, ProviderError,
     RiskLevel, Role, RuntimeEvent, SessionId, SessionMeta, SessionStatus, ToolCallId, ToolError,
-    ToolInvocation, Turn, TurnId,
+    ToolInvocation, ToolSpec, Turn, TurnId,
 };
 use arbe_hooks::{HookPhase, HookRegistry};
 use arbe_memory::{
@@ -24,11 +24,99 @@ use serde_json::json;
 use crate::EventBus;
 use crate::config::RuntimeConfig;
 
+/// A mailbox for human decisions on tool calls currently paused mid-turn
+/// inside `Agent::run_tool_loop` (via `resolve_gated_call`), reachable
+/// *without* locking the `Agent` itself.
+///
+/// This has to be separate from `Agent` (rather than a plain field a
+/// caller reaches through `&mut Agent`): a caller normally holds the
+/// `Agent` behind a single `tokio::sync::Mutex` (the TUI does — see
+/// `arbe-tui`) and calls `submit_message` through it; `submit_message`
+/// holds that lock for the *entire* turn, including the moment it's
+/// suspended awaiting a human decision. If supplying that decision also
+/// required the same lock, it could never be acquired — the in-flight
+/// turn is holding it precisely because it's waiting on the thing only
+/// that lock would let you send. `ToolDecisions` is `Clone` (cheaply —
+/// it's an `Arc` around a small, uncontended `std::sync::Mutex`, so a
+/// caller can hold its own copy (via `Agent::tool_decisions`) alongside
+/// the `Agent` lock, not behind it.
+#[derive(Clone, Default)]
+pub struct ToolDecisions {
+    inner:
+        Arc<std::sync::Mutex<HashMap<ToolCallId, tokio::sync::oneshot::Sender<ApprovalDecision>>>>,
+}
+
+impl ToolDecisions {
+    fn register(&self, id: ToolCallId) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .lock()
+            .expect("tool decisions mutex poisoned")
+            .insert(id, tx);
+        rx
+    }
+
+    /// Supplies a decision for `id`. Returns `false` if nothing is (or is
+    /// no longer — e.g. already timed out) waiting on it, which a caller
+    /// can use to fall back to a different resolution path (see
+    /// `arbe-tui`'s dispatch between this and the manual `/tool` demo
+    /// path's `Agent::resolve_tool_call`).
+    pub fn supply(&self, id: ToolCallId, decision: ApprovalDecision) -> bool {
+        match self
+            .inner
+            .lock()
+            .expect("tool decisions mutex poisoned")
+            .remove(&id)
+        {
+            Some(tx) => tx.send(decision).is_ok(),
+            None => false,
+        }
+    }
+}
+
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
     match name {
         "compact_summary" => Box::new(CompactWithSummaryStrategy),
         _ => Box::new(TruncationStrategy),
     }
+}
+
+/// Reads `<arbe_home>/instructions/agent.md` and
+/// `<project_dir>/agent.md`/`CLAUDE.md`, then renders them into the system
+/// prompt template (`crate::system_prompt`). Re-read on every turn (see
+/// `submit_message`) rather than cached at `Agent::assemble`, so edits to
+/// either file take effect on the next turn without restarting the
+/// session. A read error degrades to an absent section — same
+/// skills-are-additive-not-load-bearing reasoning as
+/// `load_global_skill_instructions`, so a transient/permission error on an
+/// instructions file can't take down a turn.
+fn build_system_prompt(project_dir: &std::path::Path) -> String {
+    let global = arbe_storage::instructions::read_global_instructions().unwrap_or_else(|err| {
+        tracing::warn!(%err, "failed to read global instructions; continuing without them");
+        None
+    });
+    let project = arbe_storage::instructions::read_project_instructions(project_dir)
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "failed to read project instructions; continuing without them");
+            None
+        });
+    crate::system_prompt::render_system_prompt(global.as_deref(), project.as_deref())
+}
+
+/// Same as [`build_system_prompt`], but for the `submit_message` hot path
+/// (re-read on every turn, see that function's doc comment) — `arbe_storage`
+/// has no `tokio` dependency, so its instructions readers are synchronous
+/// `std::fs` calls; running them directly in an `async fn` would block the
+/// executor's worker thread for the duration of two disk reads instead of
+/// yielding. `spawn_blocking` moves that work to a thread meant for it.
+async fn build_system_prompt_async(project_dir: &std::path::Path) -> String {
+    let project_dir = project_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || build_system_prompt(&project_dir))
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
+            crate::system_prompt::render_system_prompt(None, None)
+        })
 }
 
 /// Loads global skills from `~/.arbe/skills/` (harness spec FR-6) and
@@ -72,6 +160,10 @@ pub struct Agent {
     pinned_turn_indices: Vec<u64>,
     next_turn_index: u64,
     pending_tool_calls: HashMap<ToolCallId, ToolInvocation>,
+    /// Mailbox for human decisions on model-initiated tool calls paused
+    /// mid-turn — see `ToolDecisions`'s doc comment for why this can't
+    /// just be a plain field reached through `&mut self`.
+    tool_decisions: ToolDecisions,
     last_estimated_tokens: u64,
     /// The repo/project this agent works on — see `RuntimeConfig::project_dir`.
     /// This is the sandbox root every builtin filesystem/execute tool is
@@ -101,7 +193,7 @@ impl Agent {
             meta,
             provider,
             pipeline: ContextPipeline {
-                system_instructions: config.system_instructions.clone(),
+                system_instructions: vec![build_system_prompt(&config.project_dir)],
                 skill_instructions: load_global_skill_instructions(),
                 ..Default::default()
             },
@@ -122,6 +214,7 @@ impl Agent {
             pinned_turn_indices: Vec::new(),
             next_turn_index: 0,
             pending_tool_calls: HashMap::new(),
+            tool_decisions: ToolDecisions::default(),
             last_estimated_tokens: 0,
             project_dir: config.project_dir.clone(),
         })
@@ -231,23 +324,36 @@ impl Agent {
         self.store.save_meta(&self.meta)
     }
 
-    /// Runs one full turn: assemble context, stream inference, persist,
-    /// emit events. There is no tool-call parsing from the model's output
-    /// yet (that needs each provider to surface structured tool calls,
-    /// which `ModelResponse`/`TokenChunk` don't model — only plain text
-    /// content), so every turn currently takes the direct-response branch
-    /// of the loop graph. Tool approval is demoed via
-    /// `propose_tool_call`/`resolve_tool_call` instead, which exercise the
-    /// exact same `ToolApproval`/`ToolExecution` machinery a parsed tool
-    /// call would.
+    /// Runs one full turn: assemble context, run inference (looping through
+    /// approval-gated tool calls if the provider/model want any — see
+    /// `run_tool_loop`), persist, emit events.
+    ///
+    /// Only the direct-response path (no tools requested) streams
+    /// token-by-token via `ModelProvider::infer_stream`. When tools are on
+    /// the table, each round instead uses the non-streaming `infer` — the
+    /// model has to fully decide "call a tool" vs. "answer" before there's
+    /// anything useful to show, and accumulating a *streamed* tool call
+    /// (OpenAI sends its arguments as fragmented JSON-string deltas keyed
+    /// by index) is real complexity this doesn't need yet. The loop's
+    /// final round (the one that returns plain content, no more tool
+    /// calls) still emits that content as a `ModelStreamChunk`, so from
+    /// the TUI/event-consumer side both paths look the same.
+    ///
+    /// The intermediate tool-calling exchange (the assistant's tool-call
+    /// requests and each tool's result) lives only in this turn's local
+    /// `messages` — it is **not** persisted to `history`/`turns.jsonl` or
+    /// replayed into a future turn's context. Only the original user
+    /// message and the final assistant answer are, exactly as for a
+    /// direct-response turn. That means a resumed session sees what the
+    /// agent concluded, not the tool trace that got it there — an
+    /// intentional v1 scope cut (persisting/replaying the full trace would
+    /// mean threading `Message::tool_calls`/`tool_call_id` through
+    /// `ContextPipeline`, memory strategies, and `Turn`'s schema too).
     pub async fn submit_message(&mut self, content: String) -> Result<String, HarnessError> {
         let mut machine = LoopMachine::new();
-        let transition = |m: &mut LoopMachine, phase: LoopPhase| {
-            m.transition(phase)
-                .expect("agent loop transition graph violated");
-        };
-
-        transition(&mut machine, LoopPhase::ReceiveUserInput);
+        machine
+            .transition(LoopPhase::ReceiveUserInput)
+            .expect("agent loop transition graph violated");
         let turn = Turn::new(self.meta.id, self.next_turn_index);
         let turn_id = turn.id;
         self.events.publish(RuntimeEvent::TurnStarted {
@@ -255,12 +361,16 @@ impl Agent {
             turn_id,
         });
 
-        transition(&mut machine, LoopPhase::AssembleContext);
+        machine
+            .transition(LoopPhase::AssembleContext)
+            .expect("agent loop transition graph violated");
+        self.pipeline.system_instructions =
+            vec![build_system_prompt_async(&self.project_dir).await];
         let user_message = Message::new(Role::User, content);
         let context = self.pipeline.assemble(
             self.strategy.as_ref(),
-            self.history.clone(),
-            self.pinned_turn_indices.clone(),
+            &self.history,
+            &self.pinned_turn_indices,
             user_message.clone(),
             self.budget_tokens,
         );
@@ -270,47 +380,68 @@ impl Agent {
             estimated_tokens: context.estimated_tokens,
         });
 
-        transition(&mut machine, LoopPhase::PlanOrDirectRespond);
-        transition(&mut machine, LoopPhase::ModelInference);
+        machine
+            .transition(LoopPhase::PlanOrDirectRespond)
+            .expect("agent loop transition graph violated");
 
-        self.hooks
-            .run_phase(
-                HookPhase::BeforeModelCall,
-                json!({ "turn_id": turn_id.to_string(), "message_count": context.messages.len() }),
-            )
-            .await;
-
-        let request = ModelRequest {
-            model: self.meta.model.clone(),
-            messages: context.messages,
-            temperature: self.temperature,
-            max_tokens: self.max_tokens,
+        let tool_specs: Vec<ToolSpec> = if self.provider.capabilities().tool_calls {
+            arbe_tools::builtin::tool_specs()
+        } else {
+            Vec::new()
         };
-        let mut stream = self
-            .provider
-            .infer_stream(request)
-            .await
-            .map_err(HarnessError::Provider)?;
 
-        let mut assistant_content = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(HarnessError::Provider)?;
-            assistant_content.push_str(&chunk.delta);
-            self.events.publish(RuntimeEvent::ModelStreamChunk {
-                turn_id,
-                delta: chunk.delta,
-            });
-        }
+        let assistant_content = if tool_specs.is_empty() {
+            machine
+                .transition(LoopPhase::ModelInference)
+                .expect("agent loop transition graph violated");
+            self.hooks
+                .run_phase(
+                    HookPhase::BeforeModelCall,
+                    json!({ "turn_id": turn_id.to_string(), "message_count": context.messages.len() }),
+                )
+                .await;
 
-        self.hooks
-            .run_phase(
-                HookPhase::AfterModelCall,
-                json!({ "turn_id": turn_id.to_string(), "response_len": assistant_content.len() }),
-            )
-            .await;
+            let request = ModelRequest {
+                model: self.meta.model.clone(),
+                messages: context.messages,
+                temperature: self.temperature,
+                max_tokens: self.max_tokens,
+                tools: Vec::new(),
+            };
+            let mut stream = self
+                .provider
+                .infer_stream(request)
+                .await
+                .map_err(HarnessError::Provider)?;
 
-        transition(&mut machine, LoopPhase::InterpretOutput);
-        transition(&mut machine, LoopPhase::PersistTurn);
+            let mut acc = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(HarnessError::Provider)?;
+                acc.push_str(&chunk.delta);
+                self.events.publish(RuntimeEvent::ModelStreamChunk {
+                    turn_id,
+                    delta: chunk.delta,
+                });
+            }
+
+            self.hooks
+                .run_phase(
+                    HookPhase::AfterModelCall,
+                    json!({ "turn_id": turn_id.to_string(), "response_len": acc.len() }),
+                )
+                .await;
+
+            machine
+                .transition(LoopPhase::InterpretOutput)
+                .expect("agent loop transition graph violated");
+            machine
+                .transition(LoopPhase::PersistTurn)
+                .expect("agent loop transition graph violated");
+            acc
+        } else {
+            self.run_tool_loop(turn_id, context.messages, tool_specs, &mut machine)
+                .await?
+        };
 
         let assistant_message = Message::new(Role::Assistant, assistant_content.clone());
         let mut persisted_turn = turn;
@@ -330,12 +461,16 @@ impl Agent {
         });
         self.next_turn_index += 1;
 
-        transition(&mut machine, LoopPhase::EmitEvents);
+        machine
+            .transition(LoopPhase::EmitEvents)
+            .expect("agent loop transition graph violated");
         self.events.publish(RuntimeEvent::TurnCompleted {
             session_id: self.meta.id,
             turn_id,
         });
-        transition(&mut machine, LoopPhase::Idle);
+        machine
+            .transition(LoopPhase::Idle)
+            .expect("agent loop transition graph violated");
 
         self.hooks
             .run_phase(
@@ -347,10 +482,229 @@ impl Agent {
         Ok(assistant_content)
     }
 
-    /// Manually proposes a tool call for approval — a stand-in for
-    /// automatic tool-call extraction from model output (not implemented
-    /// yet; see `submit_message`'s doc comment). Emits the same
-    /// `ToolCallProposed`/`ToolApprovalRequested` events a real one would.
+    /// Caps how many model<->tool round trips one turn can take before
+    /// giving up and returning whatever's been learned so far as a plain
+    /// message — a runaway "call a tool, get a result, call another tool"
+    /// loop shouldn't be able to hang a turn forever.
+    const MAX_TOOL_ROUNDS: u32 = 8;
+
+    /// Drives the model<->tool round-trip loop for a turn whose provider
+    /// supports tool calling (see `submit_message`'s doc comment for why
+    /// this uses non-streaming `infer` for the decision rounds). Every
+    /// call still passes through `execute_gated` — the same choke point
+    /// the manual `/tool` demo path (`propose_tool_call`/`resolve_tool_call`)
+    /// uses — so a model-initiated call is never less gated than a
+    /// human-initiated one.
+    async fn run_tool_loop(
+        &mut self,
+        turn_id: TurnId,
+        mut messages: Vec<Message>,
+        tool_specs: Vec<ToolSpec>,
+        machine: &mut LoopMachine,
+    ) -> Result<String, HarnessError> {
+        for round in 0..Self::MAX_TOOL_ROUNDS {
+            machine
+                .transition(LoopPhase::ModelInference)
+                .expect("agent loop transition graph violated");
+            self.hooks
+                .run_phase(
+                    HookPhase::BeforeModelCall,
+                    json!({ "turn_id": turn_id.to_string(), "round": round, "message_count": messages.len() }),
+                )
+                .await;
+
+            let request = ModelRequest {
+                model: self.meta.model.clone(),
+                messages: messages.clone(),
+                temperature: self.temperature,
+                max_tokens: self.max_tokens,
+                tools: tool_specs.clone(),
+            };
+            let response = self
+                .provider
+                .infer(request)
+                .await
+                .map_err(HarnessError::Provider)?;
+
+            self.hooks
+                .run_phase(
+                    HookPhase::AfterModelCall,
+                    json!({ "turn_id": turn_id.to_string(), "response_len": response.content.len(), "tool_calls": response.tool_calls.len() }),
+                )
+                .await;
+
+            machine
+                .transition(LoopPhase::InterpretOutput)
+                .expect("agent loop transition graph violated");
+
+            if response.tool_calls.is_empty() {
+                machine
+                    .transition(LoopPhase::PersistTurn)
+                    .expect("agent loop transition graph violated");
+                // Mirrors the direct-response path's event, so a consumer
+                // (the TUI transcript) doesn't need to know which branch
+                // produced the final content.
+                self.events.publish(RuntimeEvent::ModelStreamChunk {
+                    turn_id,
+                    delta: response.content.clone(),
+                });
+                return Ok(response.content);
+            }
+
+            machine
+                .transition(LoopPhase::ToolApproval)
+                .expect("agent loop transition graph violated");
+            messages.push(Message::assistant_tool_calls(response.tool_calls.clone()));
+
+            let mut any_executed = false;
+            for call in response.tool_calls {
+                let risk = arbe_tools::builtin::default_risk_for(&call.name);
+                let invocation = ToolInvocation {
+                    id: ToolCallId::new(),
+                    source_turn: turn_id,
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    risk,
+                    rationale: None,
+                };
+                let invocation_id = invocation.id;
+                self.events.publish(RuntimeEvent::ToolCallProposed {
+                    turn_id,
+                    tool_call_id: invocation_id,
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    risk,
+                });
+
+                let outcome = self.resolve_gated_call(turn_id, invocation).await?;
+
+                let result_text = match &outcome {
+                    GatedOutcome::Executed(result) => {
+                        any_executed = true;
+                        self.events.publish(RuntimeEvent::ToolExecuted {
+                            turn_id,
+                            tool_call_id: invocation_id,
+                            tool_name: call.name.clone(),
+                            result: result.clone(),
+                        });
+                        serde_json::to_string(&result.output).unwrap_or_default()
+                    }
+                    GatedOutcome::Denied => {
+                        let reason = "denied by approval policy".to_string();
+                        self.events.publish(RuntimeEvent::ToolCallDenied {
+                            turn_id,
+                            tool_call_id: invocation_id,
+                            tool_name: call.name.clone(),
+                            reason: reason.clone(),
+                        });
+                        reason
+                    }
+                    // `resolve_gated_call` never returns this — it always
+                    // resolves a `PendingApproval` before returning.
+                    GatedOutcome::PendingApproval => "still awaiting approval".to_string(),
+                };
+                messages.push(Message::tool_result(call.id, result_text));
+            }
+
+            if !any_executed {
+                // Every call this round was denied. `ToolApproval`'s only
+                // legal exits are `ToolExecution` (something ran) or
+                // straight to `PersistTurn` (nothing did) — mirrors the
+                // same branch `resolve_tool_call`'s manual path takes on a
+                // denial.
+                machine
+                    .transition(LoopPhase::PersistTurn)
+                    .expect("agent loop transition graph violated");
+                let fallback =
+                    "I don't have permission to run the tool(s) needed to answer that.".to_string();
+                self.events.publish(RuntimeEvent::ModelStreamChunk {
+                    turn_id,
+                    delta: fallback.clone(),
+                });
+                return Ok(fallback);
+            }
+
+            machine
+                .transition(LoopPhase::ToolExecution)
+                .expect("agent loop transition graph violated");
+            machine
+                .transition(LoopPhase::PostToolReflection)
+                .expect("agent loop transition graph violated");
+            // Loops back to ModelInference for the next round.
+        }
+
+        machine
+            .transition(LoopPhase::PersistTurn)
+            .expect("agent loop transition graph violated");
+        let fallback =
+            "I wasn't able to finish that within the allotted tool-call steps.".to_string();
+        self.events.publish(RuntimeEvent::ModelStreamChunk {
+            turn_id,
+            delta: fallback.clone(),
+        });
+        Ok(fallback)
+    }
+
+    /// Runs one invocation through `execute_gated`; if the policy requires
+    /// a human decision, publishes `ToolApprovalRequested` (so the TUI
+    /// shows the same approval modal a manual `/tool` call would) and
+    /// waits for `supply_tool_decision` to unblock it — the turn's async
+    /// task simply awaits, which does not block the TUI's render loop
+    /// (that loop only ever polls channels/receivers, never this future).
+    /// Falls back to `DeniedOnce` if the decision channel is dropped
+    /// (e.g. the session ends) rather than hanging forever.
+    async fn resolve_gated_call(
+        &mut self,
+        turn_id: TurnId,
+        invocation: ToolInvocation,
+    ) -> Result<GatedOutcome, HarnessError> {
+        let id = invocation.id;
+        let first_pass = execute_gated(
+            &self.registry,
+            self.policy.as_ref(),
+            &self.approval_ctx,
+            invocation.clone(),
+            None,
+        )
+        .await
+        .map_err(HarnessError::Tool)?;
+        if !matches!(first_pass, GatedOutcome::PendingApproval) {
+            return Ok(first_pass);
+        }
+
+        self.events.publish(RuntimeEvent::ToolApprovalRequested {
+            turn_id,
+            tool_call_id: id,
+        });
+        let rx = self.tool_decisions.register(id);
+        let decision = rx.await.unwrap_or(ApprovalDecision::DeniedOnce);
+
+        execute_gated(
+            &self.registry,
+            self.policy.as_ref(),
+            &self.approval_ctx,
+            invocation,
+            Some(decision),
+        )
+        .await
+        .map_err(HarnessError::Tool)
+    }
+
+    /// A cheap, independently-lockable handle for supplying decisions on
+    /// tool calls this agent pauses mid-turn on — see `ToolDecisions`'s
+    /// doc comment for why a caller needs to hold this *alongside* (not
+    /// through) whatever lock guards the `Agent` itself.
+    pub fn tool_decisions(&self) -> ToolDecisions {
+        self.tool_decisions.clone()
+    }
+
+    /// Manually proposes a tool call for approval, bypassing the model
+    /// entirely — the TUI's `/tool <name> <json>` demo command. A model
+    /// requesting a tool itself goes through `run_tool_loop` instead (see
+    /// `submit_message`'s doc comment); this exists for exercising/testing
+    /// a specific tool directly regardless of what the model would choose.
+    /// Emits the same `ToolCallProposed`/`ToolApprovalRequested` events
+    /// `run_tool_loop` would.
     pub fn propose_tool_call(
         &mut self,
         tool_name: String,
@@ -400,16 +754,28 @@ impl Agent {
             &self.registry,
             self.policy.as_ref(),
             &self.approval_ctx,
-            invocation,
+            invocation.clone(),
             Some(decision),
         )
         .await?;
-        if let GatedOutcome::Executed(ref result) = outcome {
-            self.events.publish(RuntimeEvent::ToolExecuted {
-                turn_id,
-                tool_call_id: id,
-                result: result.clone(),
-            });
+        match &outcome {
+            GatedOutcome::Executed(result) => {
+                self.events.publish(RuntimeEvent::ToolExecuted {
+                    turn_id,
+                    tool_call_id: id,
+                    tool_name: invocation.tool_name.clone(),
+                    result: result.clone(),
+                });
+            }
+            GatedOutcome::Denied => {
+                self.events.publish(RuntimeEvent::ToolCallDenied {
+                    turn_id,
+                    tool_call_id: id,
+                    tool_name: invocation.tool_name.clone(),
+                    reason: "denied by approval policy".to_string(),
+                });
+            }
+            GatedOutcome::PendingApproval => {}
         }
         Ok(outcome)
     }
@@ -440,6 +806,7 @@ mod tests {
         async fn infer(&self, _req: ModelRequest) -> Result<ModelResponse, ProviderError> {
             Ok(ModelResponse {
                 content: "hi".to_string(),
+                tool_calls: Vec::new(),
             })
         }
 
@@ -461,6 +828,64 @@ mod tests {
                 }),
             ];
             Ok(Box::new(Box::pin(futures_util::stream::iter(chunks))))
+        }
+    }
+
+    /// A provider that requests one `echo` tool call on its first `infer`
+    /// call, then returns plain final content on the next — exercises
+    /// `run_tool_loop`'s round-trip without a real model.
+    struct FakeToolCallingProvider {
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl FakeToolCallingProvider {
+        fn new() -> Self {
+            Self {
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for FakeToolCallingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                tool_calls: true,
+                json_mode: false,
+                max_context_tokens: 8_000,
+            }
+        }
+
+        async fn infer(&self, _req: ModelRequest) -> Result<ModelResponse, ProviderError> {
+            let round = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 0 {
+                Ok(ModelResponse {
+                    content: String::new(),
+                    tool_calls: vec![arbe_core::RequestedToolCall {
+                        id: "call_1".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({"x": 1}),
+                    }],
+                })
+            } else {
+                Ok(ModelResponse {
+                    content: "final answer".to_string(),
+                    tool_calls: Vec::new(),
+                })
+            }
+        }
+
+        async fn infer_stream(
+            &self,
+            _req: ModelRequest,
+        ) -> Result<
+            Box<dyn Stream<Item = Result<TokenChunk, ProviderError>> + Send + Unpin>,
+            ProviderError,
+        > {
+            unimplemented!("run_tool_loop never streams — see submit_message's doc comment")
         }
     }
 
@@ -512,6 +937,7 @@ mod tests {
             pinned_turn_indices: Vec::new(),
             next_turn_index: 0,
             pending_tool_calls: HashMap::new(),
+            tool_decisions: ToolDecisions::default(),
             last_estimated_tokens: 0,
             project_dir: std::path::PathBuf::from("."),
         }
@@ -568,6 +994,38 @@ mod tests {
         assert_eq!(agent.next_turn_index, 2);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn project_instructions_are_reread_and_reflected_on_the_next_turn() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+
+        let project_dir =
+            std::env::temp_dir().join(format!("arbe-agent-project-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        agent.project_dir = project_dir.clone();
+
+        agent.submit_message("first".to_string()).await.unwrap();
+        assert!(
+            !agent.pipeline.system_instructions[0].contains("edited mid-session"),
+            "system prompt should not mention a file that doesn't exist yet"
+        );
+
+        std::fs::write(project_dir.join("agent.md"), "edited mid-session").unwrap();
+
+        agent.submit_message("second".to_string()).await.unwrap();
+        assert!(
+            agent.pipeline.system_instructions[0].contains("edited mid-session"),
+            "system prompt should pick up an agent.md written after the session started"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&project_dir).ok();
     }
 
     #[tokio::test]
@@ -730,8 +1188,8 @@ mod tests {
             .unwrap();
         let truncation_context = truncation_agent.pipeline.assemble(
             truncation_agent.strategy.as_ref(),
-            long_history.clone(),
-            vec![],
+            &long_history,
+            &[],
             Message::new(Role::User, "go"),
             5,
         );
@@ -741,8 +1199,8 @@ mod tests {
             compact_agent.strategy = build_strategy("compact_summary");
             compact_agent.pipeline.assemble(
                 compact_agent.strategy.as_ref(),
-                long_history,
-                vec![],
+                &long_history,
+                &[],
                 Message::new(Role::User, "go"),
                 5,
             )
@@ -806,5 +1264,95 @@ mod tests {
 
         std::fs::remove_dir_all(&store_dir).ok();
         std::fs::remove_dir_all(&project_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_tool_loop_auto_executes_an_allowlisted_tool_and_returns_final_content() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.provider = Box::new(FakeToolCallingProvider::new());
+        agent.register_tool("echo", Arc::new(EchoExecutor));
+        agent.approval_ctx = ApprovalContext {
+            policy_mode: ApprovalPolicyMode::AllowlistAuto,
+            allowlist: vec!["echo".to_string()],
+            denylist: vec![],
+        };
+
+        let reply = agent.submit_message("use echo".to_string()).await.unwrap();
+        assert_eq!(reply, "final answer");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn run_tool_loop_returns_a_fallback_message_when_every_call_is_denied() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.provider = Box::new(FakeToolCallingProvider::new());
+        agent.register_tool("echo", Arc::new(EchoExecutor));
+        agent.approval_ctx = ApprovalContext {
+            policy_mode: ApprovalPolicyMode::DenylistBlock,
+            allowlist: vec![],
+            denylist: vec!["echo".to_string()],
+        };
+
+        let reply = agent.submit_message("use echo".to_string()).await.unwrap();
+        assert!(reply.contains("don't have permission"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression test for the deadlock `ToolDecisions` exists to
+    /// avoid: with the default `AlwaysPrompt` policy, `run_tool_loop`
+    /// pauses awaiting a decision. This drives `submit_message` on a
+    /// spawned task (mirroring how the TUI runs it behind a
+    /// `tokio::sync::Mutex`) and supplies the decision from the outside,
+    /// via a `ToolDecisions` handle obtained *before* the task started —
+    /// proving the decision path never needs to re-enter `&mut Agent`.
+    #[tokio::test]
+    async fn run_tool_loop_pauses_for_a_human_decision_and_resumes_via_tool_decisions() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut events_rx = events.subscribe();
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.provider = Box::new(FakeToolCallingProvider::new());
+        agent.register_tool("echo", Arc::new(EchoExecutor));
+        // agent_with_fake_provider defaults to AlwaysPrompt.
+
+        let decisions = agent.tool_decisions();
+        let turn = tokio::spawn(async move { agent.submit_message("use echo".to_string()).await });
+
+        let tool_call_id = loop {
+            match tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .expect("timed out waiting for ToolApprovalRequested")
+                .unwrap()
+            {
+                RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => break tool_call_id,
+                _ => continue,
+            }
+        };
+
+        assert!(decisions.supply(tool_call_id, ApprovalDecision::ApprovedOnce));
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), turn)
+            .await
+            .expect("submit_message never returned — likely deadlocked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "final answer");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

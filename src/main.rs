@@ -52,7 +52,7 @@ async fn run() {
     // Builtin tools (read_file/write_file/edit_file/list_dir/glob/grep/
     // execute) are registered automatically by Agent::create, sandboxed to
     // config.project_dir — see arbe_tools::builtin.
-    let agent = match Agent::create(&config, store, events) {
+    let agent = match Agent::create(&config, store, events.clone()) {
         Ok(agent) => agent,
         Err(err) => {
             eprintln!("failed to start ArBeHarness: {err}");
@@ -61,7 +61,7 @@ async fn run() {
     };
 
     let handle = tokio::runtime::Handle::current();
-    let result = tokio::task::spawn_blocking(move || arbe_tui::run(agent, handle))
+    let result = tokio::task::spawn_blocking(move || arbe_tui::run(agent, handle, config, events))
         .await
         .expect("TUI task panicked");
 

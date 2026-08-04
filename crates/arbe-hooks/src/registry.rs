@@ -41,11 +41,8 @@ impl HookRegistry {
         for hook in self.hooks.iter().filter(|h| h.phase() == phase) {
             let hook = hook.clone();
             let input = current.clone();
-            let outcome = tokio::time::timeout(
-                self.timeout,
-                tokio::spawn(async move { hook.run(input).await }),
-            )
-            .await;
+            let mut handle = tokio::spawn(async move { hook.run(input).await });
+            let outcome = tokio::time::timeout(self.timeout, &mut handle).await;
 
             current = match outcome {
                 Ok(Ok(Ok(transformed))) => transformed,
@@ -58,9 +55,15 @@ impl HookRegistry {
                     current
                 }
                 Err(_elapsed) => {
+                    // Dropping the timeout future doesn't stop the spawned
+                    // task — only .abort() does. Without this, a hook that
+                    // times out (e.g. a slow outbound HTTP call) keeps
+                    // running in the background indefinitely instead of
+                    // actually being cut off.
+                    handle.abort();
                     tracing::warn!(
                         timeout_ms = self.timeout.as_millis(),
-                        "hook timed out; skipping its output"
+                        "hook timed out; aborting and skipping its output"
                     );
                     current
                 }
@@ -179,5 +182,40 @@ mod tests {
 
         let result = registry.run_phase(HookPhase::OnError, json!("start")).await;
         assert_eq!(result, json!("start-after"));
+    }
+
+    struct MarkerHook(HookPhase, Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl Hook for MarkerHook {
+        fn phase(&self) -> HookPhase {
+            self.0
+        }
+        async fn run(&self, payload: Value) -> Result<Value, HookError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(payload)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_hook_is_actually_aborted_not_just_ignored() {
+        let ran_to_completion = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = HookRegistry::new(Duration::from_millis(50));
+        registry.register(Arc::new(MarkerHook(
+            HookPhase::OnError,
+            ran_to_completion.clone(),
+        )));
+
+        registry.run_phase(HookPhase::OnError, json!("start")).await;
+
+        // Advance virtual time well past the hook's own 10s sleep. If the
+        // spawned task were merely ignored (not aborted), it would still be
+        // running in the background and would flip the flag once its sleep
+        // elapses; aborting it means it never gets the chance to.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+
+        assert!(!ran_to_completion.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

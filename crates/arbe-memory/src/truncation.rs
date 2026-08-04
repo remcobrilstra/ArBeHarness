@@ -64,19 +64,19 @@ impl ContextStrategy for TruncationStrategy {
         "truncation"
     }
 
-    fn build_context(&self, input: ContextInput) -> ContextOutput {
+    fn build_context(&self, input: ContextInput<'_>) -> ContextOutput {
         let (keep, dropped_tokens) = select_kept(
-            &input.session_history,
+            input.session_history,
             input.budget_tokens,
-            &input.pinned_turn_indices,
+            input.pinned_turn_indices,
         );
 
         let messages: Vec<arbe_core::Message> = input
             .session_history
-            .into_iter()
+            .iter()
             .zip(keep)
             .filter(|(_, k)| *k)
-            .map(|(e, _)| e.message)
+            .map(|(e, _)| e.message.clone())
             .collect();
 
         let estimated_tokens = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
@@ -105,9 +105,9 @@ mod tests {
     fn keeps_everything_within_budget() {
         let strategy = TruncationStrategy;
         let input = ContextInput {
-            session_history: vec![entry(0, "hi"), entry(1, "there")],
+            session_history: &[entry(0, "hi"), entry(1, "there")],
             budget_tokens: 1000,
-            pinned_turn_indices: vec![],
+            pinned_turn_indices: &[],
         };
         let out = strategy.build_context(input);
         assert_eq!(out.messages.len(), 2);
@@ -120,9 +120,9 @@ mod tests {
         // Each message is ~1 token ("hi"/"there"-ish); budget of 1 forces
         // dropping all but the single most recent entry.
         let input = ContextInput {
-            session_history: vec![entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
+            session_history: &[entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
             budget_tokens: 1,
-            pinned_turn_indices: vec![],
+            pinned_turn_indices: &[],
         };
         let out = strategy.build_context(input);
         assert_eq!(out.messages.len(), 1);
@@ -134,9 +134,9 @@ mod tests {
     fn pinned_turns_survive_even_when_old() {
         let strategy = TruncationStrategy;
         let input = ContextInput {
-            session_history: vec![entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
+            session_history: &[entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
             budget_tokens: 1,
-            pinned_turn_indices: vec![0],
+            pinned_turn_indices: &[0],
         };
         let out = strategy.build_context(input);
         // Pinned turn 0 always kept; budget of 1 is fully consumed by it
@@ -150,13 +150,30 @@ mod tests {
     fn preserves_chronological_order_of_kept_messages() {
         let strategy = TruncationStrategy;
         let input = ContextInput {
-            session_history: vec![entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
+            session_history: &[entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
             budget_tokens: 2,
-            pinned_turn_indices: vec![],
+            pinned_turn_indices: &[],
         };
         let out = strategy.build_context(input);
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].content, "bbbb");
         assert_eq!(out.messages[1].content, "cccc");
+    }
+
+    #[test]
+    fn select_kept_with_zero_budget_and_no_pinned_keeps_nothing() {
+        let history = [entry(0, "aaaa"), entry(1, "bbbb")];
+        let (keep, dropped_tokens) = select_kept(&history, 0, &[]);
+        assert_eq!(keep, vec![false, false]);
+        assert!(dropped_tokens > 0);
+    }
+
+    #[test]
+    fn select_kept_keeps_all_pinned_turns_even_when_they_alone_exceed_the_budget() {
+        let history = [entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")];
+        // Budget of 1 is smaller than the combined cost of the two pinned
+        // entries — both must still be kept; saturating_sub must not panic.
+        let (keep, _dropped_tokens) = select_kept(&history, 1, &[0, 1]);
+        assert_eq!(keep, vec![true, true, false]);
     }
 }

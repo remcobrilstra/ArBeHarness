@@ -6,11 +6,21 @@ use crate::error::StorageError;
 /// Writes `contents` to `path` via a temp-file-then-rename so a crash mid
 /// write can never leave `path` truncated or partially written (overall
 /// design §6, harness spec §5).
+///
+/// The temp file's name includes a random suffix (not just `path`'s
+/// extension swapped for `.tmp`) so two concurrent `write_atomic` calls
+/// targeting the same `path` never share a temp file and race on the same
+/// `fs::write` — each writer gets its own temp file and only the final
+/// `rename` (atomic on all supported platforms) decides which write wins.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().expect("path must have a parent directory");
     fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
 
-    let tmp_path = path.with_extension("tmp");
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp_path = parent.join(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     fs::write(&tmp_path, contents).map_err(|source| io_err(&tmp_path, source))?;
     fs::rename(&tmp_path, path).map_err(|source| io_err(path, source))?;
     Ok(())
@@ -19,6 +29,11 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
 /// Appends `line` (plus a trailing newline) to `path`, creating the file
 /// and its parent directory if needed. Used for the append-only
 /// `turns.jsonl` / `events.jsonl` logs.
+///
+/// Writes the line and its trailing newline as a single `write_all` call
+/// (one syscall) rather than two separate writes, so a crash mid-append can
+/// only ever leave the file missing the whole line, never half of it —
+/// which is what lets `read_jsonl`'s tolerant trailing-line handling work.
 pub fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
     use std::io::Write;
 
@@ -30,7 +45,11 @@ pub fn append_line(path: &Path, line: &str) -> Result<(), StorageError> {
         .append(true)
         .open(path)
         .map_err(|source| io_err(path, source))?;
-    writeln!(file, "{line}").map_err(|source| io_err(path, source))?;
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    file.write_all(buf.as_bytes())
+        .map_err(|source| io_err(path, source))?;
     Ok(())
 }
 
