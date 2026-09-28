@@ -153,6 +153,7 @@ impl ContextStrategy for TruncationStrategy {
             messages,
             estimated_tokens,
             truncated: dropped_tokens > 0,
+            pruned_tool_results: 0,
         }
     }
 }

@@ -24,5 +24,5 @@ pub use tool::{
     ApprovalDecision, ApprovalPolicyMode, RequestedToolCall, RiskLevel, ToolInvocation, ToolResult,
     ToolSpec,
 };
-pub use turn::{TURN_SCHEMA_VERSION, Turn};
+pub use turn::{Compaction, TURN_SCHEMA_VERSION, Turn};
 pub use usage::{StopReason, Usage};

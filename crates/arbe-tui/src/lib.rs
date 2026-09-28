@@ -39,6 +39,7 @@ use app::{APPROVAL_TIMEOUT_TICKS, App, PendingApproval, ProposedToolCall, Sessio
 enum AgentOutcome {
     ChatDone(Result<String, String>),
     ToolInvoked(Result<(), String>),
+    Compacted(Result<bool, String>),
 }
 
 /// Runs the TUI until the user quits. Blocking: call this from a dedicated
@@ -210,6 +211,15 @@ fn drain_runtime_events(
             Ok(RuntimeEvent::HookFailed { hook, reason }) => {
                 app.status_message = Some(format!("{hook} failed: {reason}"));
             }
+            Ok(RuntimeEvent::CompactionPerformed {
+                compacted_messages, ..
+            }) => {
+                app.working = false;
+                app.activity = None;
+                app.notice = Some(format!(
+                    "compacted {compacted_messages} older message(s) into a summary"
+                ));
+            }
             Ok(RuntimeEvent::UsageUpdated { session, .. }) => {
                 app.session_tokens = session.total_tokens();
             }
@@ -334,6 +344,17 @@ fn drain_outcomes(app: &mut App, outcome_rx: &Receiver<AgentOutcome>) {
             AgentOutcome::ChatDone(Ok(_)) | AgentOutcome::ToolInvoked(Ok(())) => {}
             AgentOutcome::ToolInvoked(Err(err)) => {
                 app.status_message = Some(format!("tool call failed: {err}"));
+            }
+            AgentOutcome::Compacted(Ok(true)) => {}
+            AgentOutcome::Compacted(Ok(false)) => {
+                app.working = false;
+                app.activity = None;
+                app.notice = Some("nothing to compact yet".to_string());
+            }
+            AgentOutcome::Compacted(Err(err)) => {
+                app.working = false;
+                app.activity = None;
+                app.status_message = Some(format!("compaction failed: {err}"));
             }
         }
     }
@@ -579,6 +600,18 @@ fn submit_input(
     let content = app.take_input();
     app.status_message = None;
     app.notice = None;
+
+    if content.trim() == "/compact" {
+        app.working = true;
+        app.activity = Some("summarizing older messages…".to_string());
+        let agent = agent.clone();
+        let tx = outcome_tx.clone();
+        handle.spawn(async move {
+            let result = agent.compact().await.map_err(|e| e.to_string());
+            let _ = tx.send(AgentOutcome::Compacted(result));
+        });
+        return;
+    }
 
     if let Some(rest) = content.strip_prefix("/tool ") {
         let Some((name, args_text)) = rest.split_once(' ') else {

@@ -16,7 +16,7 @@ use arbe_storage::InFlightMessage;
 use futures_util::StreamExt;
 
 use super::hooks::{self, ErrorPayload, ModelCallPayload, ModelResultPayload, TurnPayload};
-use super::{Agent, build_system_prompt_async, tools};
+use super::{Agent, build_system_prompt_async, compaction, tools};
 
 /// How many consecutive rounds may request the identical set of tool calls
 /// before the turn is stopped as stuck.
@@ -299,12 +299,21 @@ impl TurnRunner<'_> {
         .await;
 
         advance(&mut self.machine, LoopPhase::AssembleContext)?;
+        if agent.settings.auto_compact {
+            match compaction::compact(agent, false, self.cancel).await {
+                Ok(_) => {}
+                Err(HarnessError::Cancelled) => return Err(HarnessError::Cancelled),
+                // Not fatal: the history strategy still trims to fit.
+                Err(err) => tracing::warn!(%err, "compaction failed; trimming history instead"),
+            }
+        }
         let system_prompt =
             build_system_prompt_async(&agent.settings.prompt, &agent.settings.project_dir).await;
         let user_message = Message::new(Role::User, content);
         let (context, estimated_display) = {
             let mut state = agent.state();
             state.pipeline.system_instructions = vec![system_prompt];
+            state.pipeline.conversation_summary = state.summary.as_ref().map(|c| c.summary.clone());
             // The pipeline budgets in estimator units; convert so the real
             // prompt lands inside the budget.
             let budget = state
@@ -379,6 +388,21 @@ impl TurnRunner<'_> {
                 },
             )
             .await;
+
+            // A long tool loop grows the turn's own messages without bound;
+            // stub out its older tool results once they no longer fit
+            // (the persisted trace keeps them in full). The newest results
+            // — the ones the model hasn't read yet — are never touched.
+            if round > 0 {
+                let budget = agent
+                    .state()
+                    .calibration
+                    .budget_in_estimate_units(agent.settings.budget_tokens);
+                let pruned = arbe_memory::prune_tool_results(&mut messages, budget, 1);
+                if pruned > 0 {
+                    tracing::debug!(pruned, "stubbed old tool output within the turn");
+                }
+            }
 
             let request = ModelRequest {
                 model: agent.settings.model.clone(),

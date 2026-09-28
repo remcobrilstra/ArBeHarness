@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use arbe_core::{Message, RuntimeEvent, SessionId, SessionMeta, SessionStatus, Turn, TurnId};
+use arbe_core::{
+    Compaction, Message, RuntimeEvent, SessionId, SessionMeta, SessionStatus, Turn, TurnId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::{append_line, write_atomic};
@@ -53,6 +55,10 @@ impl SessionStore {
 
     fn events_path(&self, id: SessionId) -> PathBuf {
         self.session_dir(id).join("events.jsonl")
+    }
+
+    fn compactions_path(&self, id: SessionId) -> PathBuf {
+        self.session_dir(id).join("compactions.jsonl")
     }
 
     fn in_flight_path(&self, id: SessionId) -> PathBuf {
@@ -163,6 +169,24 @@ impl SessionStore {
                 source,
             }),
         }
+    }
+
+    pub fn append_compaction(
+        &self,
+        id: SessionId,
+        compaction: &Compaction,
+    ) -> Result<(), StorageError> {
+        let path = self.compactions_path(id);
+        let line = serde_json::to_string(compaction).map_err(|source| StorageError::Serde {
+            path: path.display().to_string(),
+            source,
+        })?;
+        append_line(&path, &line)
+    }
+
+    /// The most recent compaction, which supersedes all earlier ones.
+    pub fn latest_compaction(&self, id: SessionId) -> Result<Option<Compaction>, StorageError> {
+        Ok(read_jsonl::<Compaction>(&self.compactions_path(id))?.pop())
     }
 
     pub fn append_event(&self, id: SessionId, event: &RuntimeEvent) -> Result<(), StorageError> {
@@ -306,6 +330,30 @@ mod tests {
         assert_eq!(turns[1].schema_version, arbe_core::TURN_SCHEMA_VERSION);
         assert_eq!(turns[1].user_message().unwrap().text(), "again");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_latest_compaction_wins() {
+        let (store, dir) = temp_store();
+        let meta = store.create_session("default", "ollama", "m").unwrap();
+        assert!(store.latest_compaction(meta.id).unwrap().is_none());
+        for (through, summary) in [(3, "first"), (7, "second")] {
+            store
+                .append_compaction(
+                    meta.id,
+                    &Compaction {
+                        through_turn_index: through,
+                        summary: summary.into(),
+                        usage: Default::default(),
+                        created_at: chrono::Utc::now(),
+                    },
+                )
+                .unwrap();
+        }
+        let latest = store.latest_compaction(meta.id).unwrap().unwrap();
+        assert_eq!(latest.through_turn_index, 7);
+        assert_eq!(latest.summary, "second");
         fs::remove_dir_all(&dir).ok();
     }
 

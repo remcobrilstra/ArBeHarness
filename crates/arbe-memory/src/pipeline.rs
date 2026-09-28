@@ -1,6 +1,7 @@
 use arbe_core::{Message, Role};
 
 use crate::history::HistoryEntry;
+use crate::prune::prune_tool_results;
 use crate::tokens::estimate_message_tokens;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
@@ -16,15 +17,23 @@ pub struct ContextPipeline {
     pub global_instructions: Vec<String>,
     pub skill_instructions: Vec<String>,
     pub memory_notes: Vec<String>,
+    /// A summary standing in for compacted older turns; placed right after
+    /// the instructions, before the remaining history.
+    pub conversation_summary: Option<String>,
 }
 
 impl ContextPipeline {
     fn preamble(&self) -> Vec<Message> {
+        let summary = self.conversation_summary.as_ref().map(|s| {
+            format!("Summary of the earlier conversation (older messages were compacted to save space):\n{s}")
+        });
         self.system_instructions
             .iter()
             .chain(self.global_instructions.iter())
             .chain(self.skill_instructions.iter())
-            .map(|text| Message::new(Role::System, text.clone()))
+            .cloned()
+            .chain(summary)
+            .map(|text| Message::new(Role::System, text))
             .collect()
     }
 
@@ -59,8 +68,31 @@ impl ContextPipeline {
             + estimate_message_tokens(&user_message);
 
         let history_budget = budget_tokens.saturating_sub(fixed_tokens);
+
+        // Over budget: stub out old tool results first (cheap, keeps every
+        // message), and only let the strategy drop turns if that isn't
+        // enough. The copy is only made when pruning is needed.
+        let history_cost: u64 = history
+            .iter()
+            .map(|e| estimate_message_tokens(&e.message))
+            .sum();
+        let mut pruned_tool_results = 0;
+        let pruned_history: Option<Vec<HistoryEntry>> =
+            (history_cost > history_budget).then(|| {
+                let mut messages: Vec<Message> =
+                    history.iter().map(|e| e.message.clone()).collect();
+                pruned_tool_results = prune_tool_results(&mut messages, history_budget, 0);
+                history
+                    .iter()
+                    .zip(messages)
+                    .map(|(e, message)| HistoryEntry {
+                        turn_index: e.turn_index,
+                        message,
+                    })
+                    .collect()
+            });
         let history_output = strategy.build_context(ContextInput {
-            session_history: history,
+            session_history: pruned_history.as_deref().unwrap_or(history),
             budget_tokens: history_budget,
             pinned_turn_indices,
         });
@@ -76,6 +108,7 @@ impl ContextPipeline {
             messages,
             estimated_tokens,
             truncated: history_output.truncated,
+            pruned_tool_results,
         }
     }
 }
@@ -99,6 +132,7 @@ mod tests {
             global_instructions: vec!["be terse".to_string()],
             skill_instructions: vec!["skill: rust".to_string()],
             memory_notes: vec!["remembered fact".to_string()],
+            conversation_summary: None,
         };
         let strategy = TruncationStrategy;
         let out = pipeline.assemble(
@@ -121,6 +155,61 @@ mod tests {
                 "current question",
             ]
         );
+    }
+
+    #[test]
+    fn a_conversation_summary_sits_between_the_instructions_and_the_history() {
+        let pipeline = ContextPipeline {
+            system_instructions: vec!["be helpful".to_string()],
+            conversation_summary: Some("- fixed the login bug".to_string()),
+            ..Default::default()
+        };
+        let out = pipeline.assemble(
+            &TruncationStrategy,
+            &[history_entry(5, "recent turn")],
+            &[],
+            Message::new(Role::User, "next"),
+            10_000,
+        );
+        let texts: Vec<String> = out.messages.iter().map(|m| m.text()).collect();
+        assert_eq!(texts[0], "be helpful");
+        assert_eq!(out.messages[1].role, Role::System);
+        assert!(texts[1].ends_with("- fixed the login bug"));
+        assert_eq!(texts[2], "recent turn");
+        assert_eq!(texts[3], "next");
+    }
+
+    #[test]
+    fn old_tool_output_is_pruned_before_any_turn_is_dropped() {
+        let call = arbe_core::RequestedToolCall {
+            id: "c".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+        };
+        let history: Vec<HistoryEntry> = [
+            Message::new(Role::User, "read it"),
+            Message::assistant_tool_calls(vec![call]),
+            Message::tool_result("c", "x".repeat(40_000)),
+            Message::new(Role::Assistant, "it says x"),
+        ]
+        .into_iter()
+        .map(|message| HistoryEntry {
+            turn_index: 0,
+            message,
+        })
+        .collect();
+        let out = ContextPipeline::default().assemble(
+            &TruncationStrategy,
+            &history,
+            &[],
+            Message::new(Role::User, "and?"),
+            1_000,
+        );
+        // The whole turn survived, with its tool output stubbed.
+        assert_eq!(out.messages.len(), 5);
+        assert_eq!(out.pruned_tool_results, 1);
+        assert!(!out.truncated);
+        assert!(out.estimated_tokens < 1_000);
     }
 
     #[test]

@@ -248,6 +248,7 @@ fn test_parts(
             max_tool_rounds: 50,
             max_turn_tokens: None,
             max_tool_output_chars: 50_000,
+            auto_compact: false,
             retry: RetryPolicy::none(),
             thinking_budget_tokens: None,
             // Doesn't exist: no project instruction files, so tests don't
@@ -265,6 +266,7 @@ fn test_parts(
         registry: ToolRegistry::new(),
         history: Vec::new(),
         next_turn_index: 0,
+        summary: None,
         skill_instructions: Vec::new(),
         allowed_tools: None,
         startup_warnings: Vec::new(),
@@ -1319,4 +1321,137 @@ fn only_credential_looking_configured_values_are_redacted() {
         r.redact("sk-config-key-000111 gateway-secret-999 https://example.dev"),
         "[REDACTED] [REDACTED] https://example.dev"
     );
+}
+
+#[tokio::test]
+async fn a_long_tool_loop_prunes_its_own_old_output_but_persists_it_in_full() {
+    let big = "y".repeat(20_000); // ~5000 tokens per result
+    let rounds = (0..3)
+        // Different arguments each round, or the repeated-call guard
+        // (rightly) stops the loop.
+        .map(|i| tool_calls(&[(&format!("c{i}"), "echo", json!(format!("{i}{big}")))]))
+        .collect();
+    let provider = ScriptedProvider::new(rounds, answer("done"));
+    let requests = provider.requests.clone();
+    let (t, _rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.settings.budget_tokens = 8_000;
+        parts.settings.max_tool_output_chars = 100_000;
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    t.agent.submit_message("go".into()).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    let last = &requests.last().unwrap().messages;
+    let results: Vec<String> = last
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| tool_result_of(m, 0).1)
+        .collect();
+    assert_eq!(results.len(), 3);
+    assert!(
+        results[0].starts_with("[tool output omitted"),
+        "oldest was pruned"
+    );
+    assert!(results[2].len() >= 20_000, "newest was kept");
+
+    // The persisted trace has every result in full.
+    let turns = t.store.list_turns(t.session_id).unwrap();
+    let persisted: Vec<String> = turns[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| tool_result_of(m, 0).1)
+        .collect();
+    assert!(persisted.iter().all(|r| r.len() >= 20_000));
+}
+
+/// A plain answer with no usage report (so calibration stays neutral).
+fn bare_answer(text: &str) -> Round {
+    Round::Events(vec![
+        ProviderEvent::TextDelta(text.to_string()),
+        ProviderEvent::Stop(StopReason::EndTurn),
+    ])
+}
+
+#[tokio::test]
+async fn history_past_the_trigger_is_summarized_by_the_model_and_the_summary_replaces_it() {
+    let long = "z".repeat(2_000); // ~500 tokens per answer
+    let mut rounds: Vec<Round> = (0..4).map(|_| bare_answer(&long)).collect();
+    rounds.push(bare_answer("- the user asked four questions about z")); // the summary
+    rounds.push(bare_answer("final answer"));
+    let provider = ScriptedProvider::new(rounds, bare_answer("unused"));
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, |parts| {
+        parts.settings.auto_compact = true;
+        parts.settings.budget_tokens = 2_000; // compacts past ~1600
+    });
+    for i in 0..4 {
+        t.agent
+            .submit_message(format!("question {i}"))
+            .await
+            .unwrap();
+    }
+    assert!(t.store.latest_compaction(t.session_id).unwrap().is_none());
+
+    assert_eq!(
+        t.agent.submit_message("question 4".into()).await.unwrap(),
+        "final answer"
+    );
+
+    let compaction = t.store.latest_compaction(t.session_id).unwrap().unwrap();
+    assert_eq!(
+        compaction.summary,
+        "- the user asked four questions about z"
+    );
+    assert!(compaction.through_turn_index >= 2);
+    // Only the turns after the compaction remain in live history.
+    assert!(
+        t.agent
+            .state()
+            .history
+            .iter()
+            .all(|e| e.turn_index > compaction.through_turn_index)
+    );
+
+    let requests = requests.lock().unwrap();
+    // The summarization request saw the old conversation, without tools.
+    let summarize = &requests[4];
+    assert!(summarize.tools.is_empty());
+    assert!(summarize.messages[1].text().contains("User: question 0"));
+    // The answer's request carries the summary instead of those turns.
+    let answer = &requests[5].messages;
+    assert!(
+        answer.iter().any(|m| m.role == Role::System
+            && m.text().contains("the user asked four questions about z"))
+    );
+    assert!(!answer.iter().any(|m| m.text() == "question 0"));
+
+    assert!(drain(&mut rx)
+        .iter()
+        .any(|e| matches!(e, RuntimeEvent::CompactionPerformed { compacted_messages, .. } if *compacted_messages > 0)));
+    // Every turn is still on disk.
+    assert_eq!(t.store.list_turns(t.session_id).unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn compact_now_summarizes_everything_but_the_newest_turn() {
+    let rounds = vec![
+        bare_answer("one"),
+        bare_answer("two"),
+        bare_answer("- summary of one"),
+    ];
+    let t = test_agent(ScriptedProvider::new(rounds, bare_answer("unused")));
+    t.agent.submit_message("first".into()).await.unwrap();
+    t.agent.submit_message("second".into()).await.unwrap();
+
+    assert!(t.agent.compact().await.unwrap());
+    let compaction = t.store.latest_compaction(t.session_id).unwrap().unwrap();
+    assert_eq!(compaction.through_turn_index, 0);
+    assert_eq!(
+        t.agent.state().summary.as_ref().unwrap().summary,
+        "- summary of one"
+    );
+    // With a single turn left there's nothing more to compact.
+    assert!(!t.agent.compact().await.unwrap());
 }

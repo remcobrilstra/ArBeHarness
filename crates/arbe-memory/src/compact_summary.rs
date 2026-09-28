@@ -52,6 +52,7 @@ impl ContextStrategy for CompactWithSummaryStrategy {
             messages,
             estimated_tokens,
             truncated: dropped_count > 0,
+            pruned_tool_results: 0,
         }
     }
 }

@@ -19,17 +19,18 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested (296 tests). **Not Done yet:** the exit criterion needs live runs, and there are no API keys or Ollama server here — run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with keys set |
 | P3 | Agent loop v2 | In progress | 8 / 10 | 322 tests, fmt/clippy clean. Open: P3.7 image/block tool results, P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
-| P5 | Context management v2 | Not started | 0 / 6 | Depends on P3 |
+| P5 | Context management v2 | In progress | 3 / 6 | Tool-output pruning and LLM compaction done (P5.1 met by a different shape); cache-aware assembly, nested instructions, memory tool next |
 | P6 | Multi-purpose & embedding | Not started | 0 / 8 | Depends on P4 |
 | P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; live provider smoke tests exist (P7.2, partial) |
 
-**Current focus:** P5 (context management: async strategies, LLM compaction, tool-output pruning)
-**Last updated:** 2026-09-28 · test count: 399 (+4 ignored live tests)
+**Current focus:** P5.4–P5.6 (cache-aware assembly, nested instructions, memory tool)
+**Last updated:** 2026-09-28 · test count: 413 (+4 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — P5.1–P5.3 done (pruning + compaction).** Old tool results are stubbed before any turn is dropped — in history and within a long tool loop (newest results protected, persisted trace untouched). `compact_summary` now really summarizes: past ~80% of the budget the model summarizes the oldest whole turns (down to ~40%) into `compactions.jsonl`, chained onto the previous summary, restored on resume; `/compact` forces it; failure falls back to trimming. 399 → 413 tests. Next: P5.4.
 - **2026-09-28 — P4.9 done; P4 complete.** `provider.api_key_command` (password-manager CLIs; runs once at startup, trust-gated) instead of an OS-keychain dependency. `Redactor` scrubs the API key, MCP bearer tokens, credential-named header values and secret-named env vars from tool output before the model, `turns.jsonl` and the TUI see it. First cut over-redacted (every MCP `env` value and header value, hiding URLs); narrowed to credential-looking names before committing. 392 → 399 tests. Next: P5.
 - **2026-09-28 — P4.8 done (permission rules).** `tool(pattern)` rules (`*` wildcard) for `approval.allow`/`deny`, matched against each tool's *subject* (`ToolExecutor::subject`: path for file tools, command line for `execute`). Deny rules now apply in every mode. High-risk tools auto-approve only via a *specific* rule (`execute(cargo test*)`), never a bare name. Pressing `a` on a high-risk call now approves that exact call for the session (compared literally — a `*` in an approved command can't widen it; caught while writing it) instead of doing nothing special. Rules are validated at config load. 386 → 392 tests.
 - **2026-09-28 — P4.7 done (command hooks).** `[[hooks.commands]]` run a shell command per phase with the JSON payload on stdin; `before_tool_execute` output can rewrite arguments or veto. Per-hook timeouts, `HookFailed` events (a broken hook is visible, not silent), project hooks only when trusted. Found and fixed along the way: the `execute` tool mangled any command containing quotes on Windows (Rust's argument escaping vs. `cmd /C`) — e.g. `git commit -m "msg"`; now passed verbatim via `raw_arg`, with a regression test confirmed to fail on the old code. 373 → 386 tests.
@@ -248,9 +249,12 @@ Make the harness configurable from files and connect the parts v1 built but neve
 
 ## P5 — Context management v2
 
-- [ ] **P5.1 Async `ContextStrategy`.** Make `build_context` async and give it access to a provider handle, so strategies can call a model.
-- [ ] **P5.2 LLM compaction.** Replace the placeholder `CompactWithSummaryStrategy` with real summarization: when history exceeds a threshold (e.g. 80% of window), summarize the oldest span into a persisted `Compaction` record (so it's done once, not every turn), keep tool-use/tool-result pairs intact at the cut point, emit `CompactionPerformed`. Manual `/compact` command in the TUI.
-- [ ] **P5.3 Tool-output pruning.** Older, large tool results are replaced with short stubs ("[read_file output, 12 KB, elided]") before dropping whole messages — cheaper and less lossy than summarizing.
+- [x] **P5.1 Async `ContextStrategy`.** Make `build_context` async and give it access to a provider handle, so strategies can call a model.
+  - *Met differently:* `ContextStrategy` stays synchronous and pure (selection only); the model-calling part lives in `arbe_runtime::agent::compaction`, which runs before selection and has the provider. Keeps `arbe-memory` free of provider/async dependencies and the selection logic trivially testable.
+- [x] **P5.2 LLM compaction.** Replace the placeholder `CompactWithSummaryStrategy` with real summarization: when history exceeds a threshold (e.g. 80% of window), summarize the oldest span into a persisted `Compaction` record (so it's done once, not every turn), keep tool-use/tool-result pairs intact at the cut point, emit `CompactionPerformed`. Manual `/compact` command in the TUI.
+  - *Done:* `compaction::plan` (whole turns, trigger 80% / target 40%, newest turn always kept), plain-text transcript for the summarizer (tool results clipped to 2 000 chars), `arbe_core::Compaction` in `compactions.jsonl` (latest wins, chains the previous summary), `ContextPipeline::conversation_summary` right after the instructions (stable prefix for caching), `Agent::compact()` + TUI `/compact`, restored by `Agent::resume`. Tool pairs are never split because whole turns are summarized. No `/compact` preview (the plan's risk-table mitigation) yet.
+- [x] **P5.3 Tool-output pruning.** Older, large tool results are replaced with short stubs ("[read_file output, 12 KB, elided]") before dropping whole messages — cheaper and less lossy than summarizing.
+  - *Done:* `arbe_memory::prune_tool_results` (oldest first, results < 200 tokens left alone, newest N protected). Applied in `ContextPipeline::assemble` before the strategy drops turns (reported as `ContextOutput::pruned_tool_results`), and in the model loop between rounds (latest results protected). The persisted trace keeps full outputs.
 - [ ] **P5.4 Prompt-cache-aware assembly.** Stable prefix ordering (system → tools → skills → history) with `CacheHint`s at the boundaries so providers that support caching get hits across turns.
 - [ ] **P5.5 Nested project instructions.** Discover `agent.md`/`AGENTS.md`/`CLAUDE.md` in subdirectories and inject a directory's instructions when the agent first touches a file under it (from `docs/todo.md`).
 - [ ] **P5.6 Persistent memory tool.** A `memory` tool the model can use to read/append to the global and project `memory.md` files (currently read-only inputs), gated like any other write.

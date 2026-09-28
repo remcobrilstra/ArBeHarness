@@ -183,7 +183,7 @@ context_window = 32768
 | `generation.max_tokens` | `4096` | Maximum length of one model response, in tokens. |
 | `generation.thinking_budget_tokens` | off | Same as `ARBE_THINKING_BUDGET`. |
 | `context.budget_tokens` | window − `max_tokens` | Same as `ARBE_CONTEXT_BUDGET`. |
-| `context.memory_strategy` | `truncation` | What happens to older history that no longer fits. `truncation` leaves it out silently; `compact_summary` leaves it out and adds a one-line note saying how many messages (and roughly how many tokens) were left out. Neither summarizes the content yet. |
+| `context.memory_strategy` | `truncation` | What happens when history grows too large. `truncation` leaves older turns out; `compact_summary` has the model summarize them first (see [Long sessions](#sessions)). |
 | `loop.max_tool_rounds` | `50` | Same as `ARBE_MAX_TOOL_ROUNDS`. |
 | `loop.max_turn_tokens` | off | Same as `ARBE_MAX_TURN_TOKENS`. |
 | `loop.max_tool_output_chars` | `50000` | Same as `ARBE_MAX_TOOL_OUTPUT_CHARS`. |
@@ -371,6 +371,7 @@ Anything you type is sent to the model, except lines starting with a recognized 
 
 | Command | Description |
 |---|---|
+| `/compact` | Have the model summarize everything but your latest exchange now, to free up context. Works with either memory strategy. |
 | `/tool <name> <json-args>` | Run one of the [builtin tools](#builtin-tools) yourself. It goes through exactly the same path as a call from the model: the same approval dialog, the same output limit, the same transcript lines. Handy for checking that a tool works. Invalid JSON is treated as `{}`. Not available while a turn is running. |
 
 Examples:
@@ -593,7 +594,13 @@ Each launch starts a **new session**. Everything a turn produces is saved as it 
 
 When you resume, the transcript shows each turn's question, how many tool calls it made, and its final answer. The model gets the full history, tool calls and results included, so it remembers what it looked at and did.
 
-**Long sessions.** When the history no longer fits the context budget, older turns are left out of what's sent to the model, whole turns at a time (never half a turn, so a tool call is never separated from its result). A turn that's too large to include in full is shortened to just your question and its final answer. Nothing is deleted from disk.
+**Long sessions.** When the history no longer fits the context budget, the harness makes room in this order:
+
+1. **Old tool output is shortened.** The oldest large tool results (a file read many turns ago, a long command output) are replaced by a one-line note, keeping every message. The same happens inside a single long turn: once its own tool results no longer fit, the older ones are shortened, while the results the model hasn't read yet are always kept whole.
+2. **With `memory_strategy = "compact_summary"`: the model summarizes.** Once history passes about 80% of the budget, the oldest turns are summarized by the model (goals, decisions, facts learned, what was done, what's pending) and the summary takes their place, leaving the history at about 40%. This costs one extra model call now and then, and an `[info]` line reports it. You can also trigger it with `/compact`. If summarizing fails, step 3 is used instead.
+3. **Whole turns are left out**, oldest first (never half a turn, so a tool call is never separated from its result). A turn that's too large to include in full is shortened to just your question and its final answer.
+
+None of this deletes anything from disk: `turns.jsonl` always has everything in full.
 
 To delete a session, remove its folder under `~/.arbe/sessions/`. There is no in-app delete.
 
@@ -617,6 +624,7 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 │       ├── meta.json          session info (active)
 │       ├── turns.jsonl        conversation history (active)
 │       ├── in_flight.jsonl    the turn in progress (active; see below)
+│       ├── compactions.jsonl  summaries of older turns (active)
 │       └── events.jsonl       event log (reserved)
 ├── instructions/
 │   └── agent.md               your global instructions (active)
@@ -691,6 +699,10 @@ One line per completed turn (schema version 2):
 - Older (v1) records have no `schema_version`, and store `user_message` / `assistant_message` fields with plain-string `content`. They still load and are converted when read.
 - If the app is killed mid-write, a half-written last line is ignored on load. A damaged line anywhere else makes the session fail to load.
 
+### `sessions/<id>/compactions.jsonl`
+
+One line per summary made by `compact_summary` or `/compact`: `{"through_turn_index": 7, "summary": "...", "usage": {...}, "created_at": "..."}`. Only the latest line is used: it covers every turn up to and including `through_turn_index` (it builds on the previous summary). Deleting the file makes the next resume use the full history again.
+
 ### `sessions/<id>/in_flight.jsonl`
 
 A write-ahead log for the turn in progress: one line per message, `{"turn_id": ..., "turn_index": ..., "message": {...}}`, appended as each message is produced. When the turn finishes, it's written to `turns.jsonl` and this file is deleted. If it's still there when a session is resumed, the previous run stopped mid-turn and its contents are recovered into `turns.jsonl` as an interrupted turn. Don't edit it by hand.
@@ -745,7 +757,6 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | Feature | Status |
 |---|---|
 | Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
-| Real summarization of old history | `compact_summary` only notes how much was left out; it doesn't summarize it. |
 | Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |

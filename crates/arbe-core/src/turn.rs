@@ -65,6 +65,20 @@ impl Turn {
     }
 }
 
+/// A summary that stands in for the turns up to and including
+/// `through_turn_index` when building context (the turns themselves stay
+/// in `turns.jsonl`). A later compaction's summary already covers earlier
+/// ones, so only the latest is ever used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    pub through_turn_index: u64,
+    pub summary: String,
+    /// Tokens the summarization call itself used.
+    #[serde(default)]
+    pub usage: Usage,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Accepts both record formats: v2's `messages`, and v1's separate
 /// `user_message`/`assistant_message` (converted into `messages`).
 #[derive(Deserialize)]

@@ -13,6 +13,7 @@
 //! hook payloads; `approvals` is the decision mailbox.
 
 mod approvals;
+mod compaction;
 mod hooks;
 mod skills;
 mod tools;
@@ -26,9 +27,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use arbe_core::{
-    ApprovalDecision, EventEnvelope, HarnessError, Message, ProviderError, RequestedToolCall,
-    RuntimeEvent, SessionId, SessionMeta, SessionStatus, StopReason, ToolCallId, Turn, TurnId,
-    Usage,
+    ApprovalDecision, Compaction, EventEnvelope, HarnessError, Message, ProviderError,
+    RequestedToolCall, RuntimeEvent, SessionId, SessionMeta, SessionStatus, StopReason, ToolCallId,
+    Turn, TurnId, Usage,
 };
 use arbe_hooks::HookRegistry;
 use arbe_memory::{
@@ -63,6 +64,9 @@ struct Settings {
     max_tool_rounds: u32,
     max_turn_tokens: Option<u64>,
     max_tool_output_chars: usize,
+    /// Summarize old turns with the model when history grows too large
+    /// (`memory_strategy = "compact_summary"`).
+    auto_compact: bool,
     retry: RetryPolicy,
     thinking_budget_tokens: Option<u64>,
     /// The repo/project this agent works on (`RuntimeConfig::project_dir`)
@@ -82,6 +86,8 @@ struct SessionState {
     last_estimated_tokens: u64,
     calibration: TokenCalibration,
     pipeline: ContextPipeline,
+    /// The latest compaction; history holds only the turns after it.
+    summary: Option<Compaction>,
 }
 
 pub struct Agent {
@@ -129,6 +135,7 @@ struct Parts {
     registry: ToolRegistry,
     history: Vec<HistoryEntry>,
     next_turn_index: u64,
+    summary: Option<Compaction>,
     skill_instructions: Vec<String>,
     allowed_tools: Option<Vec<String>>,
     startup_warnings: Vec<String>,
@@ -284,6 +291,7 @@ impl Agent {
                 next_turn_index: parts.next_turn_index,
                 last_estimated_tokens: 0,
                 calibration: TokenCalibration::default(),
+                summary: parts.summary,
                 pipeline: ContextPipeline {
                     skill_instructions: parts.skill_instructions,
                     ..Default::default()
@@ -299,6 +307,7 @@ impl Agent {
         events: Arc<EventBus>,
         history: Vec<HistoryEntry>,
         next_turn_index: u64,
+        summary: Option<Compaction>,
     ) -> Result<Self, ProviderError> {
         let provider = ProviderRegistry::with_builtins().build(
             &config.provider_name,
@@ -356,6 +365,7 @@ impl Agent {
                 max_tool_rounds: config.max_tool_rounds,
                 max_turn_tokens: config.max_turn_tokens,
                 max_tool_output_chars: config.max_tool_output_chars,
+                auto_compact: config.memory_strategy == "compact_summary",
                 retry: config.retry,
                 thinking_budget_tokens: config.thinking_budget_tokens,
                 project_dir: config.project_dir.clone(),
@@ -388,6 +398,7 @@ impl Agent {
             registry,
             history,
             next_turn_index,
+            summary,
             skill_instructions,
             allowed_tools: config.tools.clone(),
             startup_warnings,
@@ -465,7 +476,7 @@ impl Agent {
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
         });
-        Self::assemble(config, store, meta, events, Vec::new(), 0)
+        Self::assemble(config, store, meta, events, Vec::new(), 0, None)
     }
 
     /// Resumes a session from disk (harness spec FR-1): recovers a turn the
@@ -486,12 +497,28 @@ impl Agent {
         let turns = store
             .list_turns(session_id)
             .map_err(|e| ProviderError::Internal(format!("failed to load session history: {e}")))?;
-        let (history, next_turn_index) = history_from_turns(&turns);
+        let (mut history, next_turn_index) = history_from_turns(&turns);
+        // Turns covered by the latest compaction are represented by its
+        // summary, exactly as they were before the restart.
+        let summary = store
+            .latest_compaction(session_id)
+            .map_err(|e| ProviderError::Internal(format!("failed to load compaction: {e}")))?;
+        if let Some(summary) = &summary {
+            history.retain(|e| e.turn_index > summary.through_turn_index);
+        }
 
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
         });
-        Self::assemble(config, store, meta, events, history, next_turn_index)
+        Self::assemble(
+            config,
+            store,
+            meta,
+            events,
+            history,
+            next_turn_index,
+            summary,
+        )
     }
 
     fn state(&self) -> MutexGuard<'_, SessionState> {
@@ -613,6 +640,16 @@ impl Agent {
     pub async fn submit_message(&self, content: String) -> Result<String, HarnessError> {
         let active = self.begin_exclusive()?;
         turn::run_turn(self, content, &active.cancel).await
+    }
+
+    /// Summarizes all but the newest turn with the model (the `/compact`
+    /// command), whatever the memory strategy. Returns whether anything
+    /// was compacted.
+    pub async fn compact(&self) -> Result<bool, HarnessError> {
+        let active = self.begin_exclusive()?;
+        Ok(compaction::compact(self, true, &active.cancel)
+            .await?
+            .is_some())
     }
 
     /// Runs one tool directly, as if the model had requested it — the TUI's
