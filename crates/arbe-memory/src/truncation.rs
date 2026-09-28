@@ -17,6 +17,14 @@ use crate::{ContextInput, ContextOutput, ContextStrategy};
 /// kept is always a contiguous recent stretch of the conversation (plus
 /// pinned turns).
 ///
+/// When something has to be dropped, the cut is then moved forward to a
+/// turn index that's a multiple of [`CUT_QUANTUM`]: without that, every new
+/// turn at the budget limit would push out exactly one old turn, the start
+/// of the history would change on every request, and provider prompt
+/// caching would never hit. With it, the history keeps starting at the
+/// same turn for several turns in a row (at the cost of sometimes leaving
+/// out a few more old turns than strictly necessary).
+///
 /// Returns per-index `keep` flags (chronological order) and the estimated
 /// token cost of everything dropped. Shared by [`TruncationStrategy`] and
 /// [`crate::CompactWithSummaryStrategy`] so both select identically.
@@ -63,6 +71,8 @@ pub(crate) fn select_kept(
         break;
     }
 
+    quantize_cut(history, &mut keep, &pinned_set);
+
     let dropped_tokens = costs
         .iter()
         .zip(&keep)
@@ -71,6 +81,46 @@ pub(crate) fn select_kept(
         .sum();
 
     (keep, dropped_tokens)
+}
+
+/// Cut points are rounded up to turn indices divisible by this.
+pub const CUT_QUANTUM: u64 = 4;
+
+/// Moves the start of the kept (unpinned) history forward to the next
+/// multiple of [`CUT_QUANTUM`], if anything was dropped at all — but only
+/// when at least `2 * CUT_QUANTUM` turns remain afterwards: caching only
+/// pays off for long histories, and on a short one rounding up would throw
+/// away most of what's left.
+fn quantize_cut(history: &[HistoryEntry], keep: &mut [bool], pinned: &HashSet<u64>) {
+    let unpinned = |i: &usize| !pinned.contains(&history[*i].turn_index);
+    let dropped_any = (0..history.len()).filter(unpinned).any(|i| !keep[i]);
+    let Some(oldest_kept) = (0..history.len())
+        .filter(unpinned)
+        .find(|&i| keep[i])
+        .map(|i| history[i].turn_index)
+    else {
+        return;
+    };
+    if !dropped_any {
+        return;
+    }
+    let cut = oldest_kept
+        .div_ceil(CUT_QUANTUM)
+        .saturating_mul(CUT_QUANTUM);
+    let mut remaining: Vec<u64> = (0..history.len())
+        .filter(unpinned)
+        .map(|i| history[i].turn_index)
+        .filter(|t| *t >= cut)
+        .collect();
+    remaining.dedup();
+    if (remaining.len() as u64) < 2 * CUT_QUANTUM {
+        return;
+    }
+    for i in 0..history.len() {
+        if unpinned(&i) && history[i].turn_index < cut {
+            keep[i] = false;
+        }
+    }
 }
 
 /// A run of consecutive entries sharing one `turn_index`: `start..end`.
@@ -278,6 +328,39 @@ mod tests {
             keep,
             vec![false, true, false, false, true, true, true, true, true]
         );
+    }
+
+    fn kept_turns(history: &[HistoryEntry], budget: u64) -> Vec<u64> {
+        let (keep, _) = select_kept(history, budget, &[]);
+        let mut turns: Vec<u64> = history
+            .iter()
+            .zip(keep)
+            .filter(|(_, k)| *k)
+            .map(|(e, _)| e.turn_index)
+            .collect();
+        turns.dedup();
+        turns
+    }
+
+    #[test]
+    fn the_cut_moves_in_quanta_so_the_history_prefix_stays_stable() {
+        // Turns of 100 tokens each.
+        let turns =
+            |n: u64| -> Vec<HistoryEntry> { (0..n).map(|i| entry(i, &"x".repeat(400))).collect() };
+        let first = |n, budget| kept_turns(&turns(n), budget)[0];
+        // Everything fits: nothing is cut.
+        assert_eq!(kept_turns(&turns(5), 10_000), vec![0, 1, 2, 3, 4]);
+        // Room for 21 of 30 turns → minimal start 9 → rounded up to 12.
+        assert_eq!(first(30, 2_150), 12);
+        // Over the next turns the history keeps starting at turn 12 — same
+        // prefix, so the provider's prompt cache keeps hitting...
+        assert_eq!(first(31, 2_150), 12);
+        assert_eq!(first(32, 2_150), 12);
+        assert_eq!(first(33, 2_150), 12);
+        // ...until the minimal start passes it, then it jumps a quantum.
+        assert_eq!(first(34, 2_150), 16);
+        // Short histories aren't rounded: room for 5 of 10 keeps 5..9.
+        assert_eq!(kept_turns(&turns(10), 550), vec![5, 6, 7, 8, 9]);
     }
 
     #[test]

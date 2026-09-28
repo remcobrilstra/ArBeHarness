@@ -14,7 +14,7 @@ pub mod truncation;
 pub use compact_summary::CompactWithSummaryStrategy;
 pub use history::HistoryEntry;
 pub use pipeline::ContextPipeline;
-pub use prune::prune_tool_results;
+pub use prune::{drop_oldest_turns, prune_history, prune_tool_results};
 pub use tokens::{TokenCalibration, estimate_message_tokens, estimate_tokens};
 pub use truncation::TruncationStrategy;
 

@@ -399,6 +399,8 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `list_dir` | optional `path` (defaults to workdir root) | low | Lists a directory (max 1,000 entries). |
 | `glob` | `pattern` (e.g. `**/*.rs`), optional `path` | low | Finds files by pattern (max 2,000 matches). |
 | `grep` | `pattern` (regex), optional `path`, `case_insensitive` | low | Searches file contents (max 500 matches). |
+| `remember` | `note`, optional `scope` (`project` default, or `global`) | medium | Saves a one-line note to [memory](#memory), shown at the start of future sessions. |
+| `load_skill` | `name` | low | Reads a skill's full instructions (only present when [skills](#skills) load on demand). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
 | `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
@@ -496,7 +498,8 @@ The model gets a system prompt made from a built-in template plus up to two inst
 | `~/.arbe/instructions/agent.md` | Global: applies to every project. |
 | `<workdir>/agent.md`, or `<workdir>/CLAUDE.md` if there's no `agent.md` | Project: applies to this workdir only. |
 
-- Only the workdir itself is checked, not parent directories or subdirectories.
+- Only the workdir itself is checked for these two, not parent directories.
+- **Subdirectories can have their own:** an `AGENTS.md`, `agent.md` or `CLAUDE.md` in any folder inside the workdir applies to work in that folder. It's shown to the model the first time a tool reads, writes or lists something in that folder (added to that tool's result, labelled with the folder it applies to) — so in a large repository, each part's instructions only take up space once they're relevant. Each is shown once per session.
 - Each file is capped at 8,000 characters. Anything longer is cut off with a `[truncated]` note.
 - Both are **re-read before every message**, so edits take effect on your next message without restarting.
 
@@ -532,6 +535,19 @@ Prefer `thiserror` for error types.
 | `always` | Every skill's full instructions are included in every request. |
 
 `on_demand` needs a model that can call tools; with one that can't, skills are always included in full. `load_skill` is available whenever skills are loaded on demand, even if a profile's `tools` list doesn't mention it.
+
+### Memory
+
+Memory is notes that carry over between sessions — your preferences, a project's conventions, where things live. Two plain Markdown files, both included at the start of every request:
+
+| File | Scope |
+|---|---|
+| `~/.arbe/memory/global/memory.md` | Every project. |
+| `~/.arbe/memory/projects/<id>/memory.md` | One project. `<id>` is the workdir's folder name plus a short code derived from its full path, e.g. `my-app-3f9a12c0`. |
+
+The model adds to them with the `remember` tool (one `- note` line per call), which asks for approval like any other write — memory shapes every future session, so it's worth a look. You can also edit the files yourself; changes apply from the next message. Each file is capped at 8,000 characters in the request.
+
+---
 
 ---
 
@@ -598,7 +614,7 @@ When you resume, the transcript shows each turn's question, how many tool calls 
 
 1. **Old tool output is shortened.** The oldest large tool results (a file read many turns ago, a long command output) are replaced by a one-line note, keeping every message. The same happens inside a single long turn: once its own tool results no longer fit, the older ones are shortened, while the results the model hasn't read yet are always kept whole.
 2. **With `memory_strategy = "compact_summary"`: the model summarizes.** Once history passes about 80% of the budget, the oldest turns are summarized by the model (goals, decisions, facts learned, what was done, what's pending) and the summary takes their place, leaving the history at about 40%. This costs one extra model call now and then, and an `[info]` line reports it. You can also trigger it with `/compact`. If summarizing fails, step 3 is used instead.
-3. **Whole turns are left out**, oldest first (never half a turn, so a tool call is never separated from its result). A turn that's too large to include in full is shortened to just your question and its final answer.
+3. **Whole turns are left out**, oldest first (never half a turn, so a tool call is never separated from its result). A turn that's too large to include in full is shortened to just your question and its final answer. This also happens in the middle of a long turn if a new tool result wouldn't otherwise fit: earlier turns make way, never the current one.
 
 None of this deletes anything from disk: `turns.jsonl` always has everything in full.
 
@@ -631,8 +647,8 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 ├── skills/
 │   └── *.md                   skill files (active)
 ├── memory/
-│   ├── global/memory.md       (reserved, not read yet)
-│   └── projects/<id>/memory.md (reserved, not read yet)
+│   ├── global/memory.md       notes for every project (active; see Memory)
+│   └── projects/<id>/memory.md notes for one project (active)
 ├── mcp/                        (unused; MCP servers are configured in config.toml)
 ├── config/
 │   └── config.toml            your global settings (active)
@@ -756,7 +772,6 @@ These have code in the repository but **can't be used yet**. They're listed so y
 
 | Feature | Status |
 |---|---|
-| Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
 | Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |

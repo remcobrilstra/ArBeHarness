@@ -22,7 +22,7 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
     message.content.iter().map(estimate_block_tokens).sum()
 }
 
-fn estimate_block_tokens(block: &ContentBlock) -> u64 {
+pub(crate) fn estimate_block_tokens(block: &ContentBlock) -> u64 {
     match block {
         ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => estimate_tokens(text),
         ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,

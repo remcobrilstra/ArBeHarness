@@ -110,7 +110,7 @@ const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
 
 /// Tools the built-in `general` profile allows: nothing that touches the
 /// file system or runs commands.
-const GENERAL_PROFILE_TOOLS: &[&str] = &["todo_write"];
+const GENERAL_PROFILE_TOOLS: &[&str] = &["todo_write", "remember"];
 
 /// Settings that are only decided once every layer has been applied,
 /// because their defaults depend on other settings (e.g. the provider).
@@ -804,7 +804,10 @@ mod tests {
     fn the_general_profile_restricts_tools_and_switches_the_prompt() {
         let c = load(&[], &env_of(&[("ARBE_PROFILE", "general")])).unwrap();
         assert_eq!(c.profile, "general");
-        assert_eq!(c.tools, Some(vec!["todo_write".to_string()]));
+        assert_eq!(
+            c.tools,
+            Some(vec!["todo_write".to_string(), "remember".to_string()])
+        );
         assert_eq!(c.prompt, PromptTemplate::General);
     }
 

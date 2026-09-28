@@ -19,17 +19,18 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested (296 tests). **Not Done yet:** the exit criterion needs live runs, and there are no API keys or Ollama server here — run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with keys set |
 | P3 | Agent loop v2 | In progress | 8 / 10 | 322 tests, fmt/clippy clean. Open: P3.7 image/block tool results, P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
-| P5 | Context management v2 | In progress | 3 / 6 | Tool-output pruning and LLM compaction done (P5.1 met by a different shape); cache-aware assembly, nested instructions, memory tool next |
+| P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | Not started | 0 / 8 | Depends on P4 |
 | P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; live provider smoke tests exist (P7.2, partial) |
 
-**Current focus:** P5.4–P5.6 (cache-aware assembly, nested instructions, memory tool)
-**Last updated:** 2026-09-28 · test count: 413 (+4 ignored live tests)
+**Current focus:** P6 (library facade, headless mode, subagents)
+**Last updated:** 2026-09-28 · test count: 423 (+4 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — P5 complete.** Cache-aware assembly (memory notes moved into the stable prefix; truncation cut quantized to multiples of 4 turns on long histories so the prefix stays stable), nested `AGENTS.md`/`agent.md`/`CLAUDE.md` shown with the first tool call touching their folder, persistent memory read every turn plus a `remember` tool. The 200-turn exit test found two real problems, both fixed: (1) a round could overflow the budget when a new, must-keep result arrived on a full context — the loop now drops the oldest earlier turns from the request as a last resort; (2) truncation kept every full tool output in memory forever and re-copied it every turn (42 s → 2 s) — history is now pruned in place (full text stays on disk). 413 → 423 tests. Next: P6.
 - **2026-09-28 — P5.1–P5.3 done (pruning + compaction).** Old tool results are stubbed before any turn is dropped — in history and within a long tool loop (newest results protected, persisted trace untouched). `compact_summary` now really summarizes: past ~80% of the budget the model summarizes the oldest whole turns (down to ~40%) into `compactions.jsonl`, chained onto the previous summary, restored on resume; `/compact` forces it; failure falls back to trimming. 399 → 413 tests. Next: P5.4.
 - **2026-09-28 — P4.9 done; P4 complete.** `provider.api_key_command` (password-manager CLIs; runs once at startup, trust-gated) instead of an OS-keychain dependency. `Redactor` scrubs the API key, MCP bearer tokens, credential-named header values and secret-named env vars from tool output before the model, `turns.jsonl` and the TUI see it. First cut over-redacted (every MCP `env` value and header value, hiding URLs); narrowed to credential-looking names before committing. 392 → 399 tests. Next: P5.
 - **2026-09-28 — P4.8 done (permission rules).** `tool(pattern)` rules (`*` wildcard) for `approval.allow`/`deny`, matched against each tool's *subject* (`ToolExecutor::subject`: path for file tools, command line for `execute`). Deny rules now apply in every mode. High-risk tools auto-approve only via a *specific* rule (`execute(cargo test*)`), never a bare name. Pressing `a` on a high-risk call now approves that exact call for the session (compared literally — a `*` in an approved command can't widen it; caught while writing it) instead of doing nothing special. Rules are validated at config load. 386 → 392 tests.
@@ -255,11 +256,16 @@ Make the harness configurable from files and connect the parts v1 built but neve
   - *Done:* `compaction::plan` (whole turns, trigger 80% / target 40%, newest turn always kept), plain-text transcript for the summarizer (tool results clipped to 2 000 chars), `arbe_core::Compaction` in `compactions.jsonl` (latest wins, chains the previous summary), `ContextPipeline::conversation_summary` right after the instructions (stable prefix for caching), `Agent::compact()` + TUI `/compact`, restored by `Agent::resume`. Tool pairs are never split because whole turns are summarized. No `/compact` preview (the plan's risk-table mitigation) yet.
 - [x] **P5.3 Tool-output pruning.** Older, large tool results are replaced with short stubs ("[read_file output, 12 KB, elided]") before dropping whole messages — cheaper and less lossy than summarizing.
   - *Done:* `arbe_memory::prune_tool_results` (oldest first, results < 200 tokens left alone, newest N protected). Applied in `ContextPipeline::assemble` before the strategy drops turns (reported as `ContextOutput::pruned_tool_results`), and in the model loop between rounds (latest results protected). The persisted trace keeps full outputs.
-- [ ] **P5.4 Prompt-cache-aware assembly.** Stable prefix ordering (system → tools → skills → history) with `CacheHint`s at the boundaries so providers that support caching get hits across turns.
-- [ ] **P5.5 Nested project instructions.** Discover `agent.md`/`AGENTS.md`/`CLAUDE.md` in subdirectories and inject a directory's instructions when the agent first touches a file under it (from `docs/todo.md`).
-- [ ] **P5.6 Persistent memory tool.** A `memory` tool the model can use to read/append to the global and project `memory.md` files (currently read-only inputs), gated like any other write.
+- [x] **P5.4 Prompt-cache-aware assembly.** Stable prefix ordering (system → tools → skills → history) with `CacheHint`s at the boundaries so providers that support caching get hits across turns.
+  - *Done:* order is system → global → skills → memory → summary → history → user (memory moved out of the tail — a deliberate deviation from overall design §5.2); tools sorted by name; Anthropic breakpoints on the last system block and the final message (P2.4). New: `select_kept` quantizes the cut to multiples of `CUT_QUANTUM` (4) when ≥ 8 turns remain, so at the budget limit the prefix no longer changes every turn. Not measured against a live provider's cache-hit counters yet (P7.2).
+- [x] **P5.5 Nested project instructions.** Discover `agent.md`/`AGENTS.md`/`CLAUDE.md` in subdirectories and inject a directory's instructions when the agent first touches a file under it (from `docs/todo.md`).
+  - *Done:* `agent/nested.rs` — directories between the root (exclusive) and a successful path-subject tool call's target, first `AGENTS.md`/`agent.md`/`CLAUDE.md` in each, appended to that tool result once per session (tracked in session state; not persisted, so a resumed session re-shows them on first touch).
+- [x] **P5.6 Persistent memory tool.** A `memory` tool the model can use to read/append to the global and project `memory.md` files (currently read-only inputs), gated like any other write.
+  - *Done:* `agent/memory.rs` — `~/.arbe/memory/global/memory.md` + `projects/<name>-<fnv32>/memory.md`, read every turn into the stable prefix (capped), `remember {note, scope}` appends a line (medium risk, not parallel-safe). Included in the `general` profile's tools.
 
 **Exit criteria:** a scripted 200-turn session with large tool outputs stays within budget without ever breaking tool-use/result pairing (test-verified); compaction is persisted and survives resume.
+
+*Status:* both met — `a_200_turn_session_with_large_tool_output_stays_within_budget` (checks all 400 requests) and `a_compaction_survives_resume` (through the real `Agent::resume`).
 
 ---
 

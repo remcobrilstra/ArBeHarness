@@ -5,12 +5,17 @@ use crate::prune::prune_tool_results;
 use crate::tokens::estimate_message_tokens;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
-/// Assembles a full turn's context in the order from overall design §5.2:
-/// base system instructions, global instructions, active skills, selected
-/// session history, memory notes, then the user's turn. History selection
-/// is delegated to whichever `ContextStrategy` the active profile
-/// configures (truncation vs compact-with-summary), so swapping strategies
-/// only changes step 4, not this ordering.
+/// Assembles a full turn's context: system instructions, global
+/// instructions, active skills, memory notes, the conversation summary (if
+/// older turns were compacted), the selected history, then the user's
+/// turn. History selection is delegated to whichever `ContextStrategy` the
+/// profile configures, so swapping strategies only changes that step.
+///
+/// Everything that rarely changes comes first, in a fixed order: providers
+/// cache a request's longest unchanged *prefix*, so stable content ahead of
+/// the growing history is what gets cache hits turn after turn. (Overall
+/// design §5.2 put memory notes after the history; they were moved into
+/// the stable prefix for this reason.)
 #[derive(Debug, Clone, Default)]
 pub struct ContextPipeline {
     pub system_instructions: Vec<String>,
@@ -31,16 +36,10 @@ impl ContextPipeline {
             .iter()
             .chain(self.global_instructions.iter())
             .chain(self.skill_instructions.iter())
+            .chain(self.memory_notes.iter())
             .cloned()
             .chain(summary)
             .map(|text| Message::new(Role::System, text))
-            .collect()
-    }
-
-    fn memory_messages(&self) -> Vec<Message> {
-        self.memory_notes
-            .iter()
-            .map(|text| Message::new(Role::System, text.clone()))
             .collect()
     }
 
@@ -58,13 +57,8 @@ impl ContextPipeline {
         budget_tokens: u64,
     ) -> ContextOutput {
         let preamble = self.preamble();
-        let memory_messages = self.memory_messages();
 
-        let fixed_tokens: u64 = preamble
-            .iter()
-            .chain(memory_messages.iter())
-            .map(estimate_message_tokens)
-            .sum::<u64>()
+        let fixed_tokens: u64 = preamble.iter().map(estimate_message_tokens).sum::<u64>()
             + estimate_message_tokens(&user_message);
 
         let history_budget = budget_tokens.saturating_sub(fixed_tokens);
@@ -99,7 +93,6 @@ impl ContextPipeline {
 
         let mut messages = preamble;
         messages.extend(history_output.messages);
-        messages.extend(memory_messages);
         messages.push(user_message);
 
         let estimated_tokens = messages.iter().map(estimate_message_tokens).sum();
@@ -126,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_preamble_then_history_then_memory_then_user() {
+    fn orders_stable_content_first_then_history_then_user() {
         let pipeline = ContextPipeline {
             system_instructions: vec!["be helpful".to_string()],
             global_instructions: vec!["be terse".to_string()],
@@ -150,8 +143,8 @@ mod tests {
                 "be helpful",
                 "be terse",
                 "skill: rust",
-                "earlier turn",
                 "remembered fact",
+                "earlier turn",
                 "current question",
             ]
         );

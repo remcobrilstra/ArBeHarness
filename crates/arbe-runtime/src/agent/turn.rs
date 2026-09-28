@@ -16,7 +16,7 @@ use arbe_storage::InFlightMessage;
 use futures_util::StreamExt;
 
 use super::hooks::{self, ErrorPayload, ModelCallPayload, ModelResultPayload, TurnPayload};
-use super::{Agent, build_system_prompt_async, compaction, tools};
+use super::{Agent, build_system_prompt_async, compaction, memory, tools};
 
 /// How many consecutive rounds may request the identical set of tool calls
 /// before the turn is stopped as stuck.
@@ -309,16 +309,28 @@ impl TurnRunner<'_> {
         }
         let system_prompt =
             build_system_prompt_async(&agent.settings.prompt, &agent.settings.project_dir).await;
+        let memory_notes = {
+            let home = agent.settings.memory_home.clone();
+            let project = agent.settings.project_dir.clone();
+            tokio::task::spawn_blocking(move || memory::load_notes(&home, &project))
+                .await
+                .unwrap_or_default()
+        };
         let user_message = Message::new(Role::User, content);
         let (context, estimated_display) = {
             let mut state = agent.state();
             state.pipeline.system_instructions = vec![system_prompt];
+            state.pipeline.memory_notes = memory_notes;
             state.pipeline.conversation_summary = state.summary.as_ref().map(|c| c.summary.clone());
             // The pipeline budgets in estimator units; convert so the real
             // prompt lands inside the budget.
             let budget = state
                 .calibration
                 .budget_in_estimate_units(agent.settings.budget_tokens);
+            // Stub out old tool output in the live history itself (the
+            // full text is on disk), down to a bit under the budget so the
+            // pipeline rarely has to copy and prune it again each turn.
+            arbe_memory::prune_history(&mut state.history, budget / 10 * 8);
             let context = state.pipeline.assemble(
                 agent.strategy.as_ref(),
                 &state.history,
@@ -360,6 +372,13 @@ impl TurnRunner<'_> {
     ) -> Result<LoopEnd, HarnessError> {
         let agent = self.agent;
         let turn_id = self.turn_id();
+        // Where earlier history starts (after the instructions/summary) and
+        // where this turn starts (its user message), for in-turn trimming.
+        let history_start = messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .count();
+        let mut turn_start = messages.len().saturating_sub(1);
         let mut previous_calls: Option<Vec<(String, String)>> = None;
         let mut identical_rounds = 1;
 
@@ -399,8 +418,18 @@ impl TurnRunner<'_> {
                     .calibration
                     .budget_in_estimate_units(agent.settings.budget_tokens);
                 let pruned = arbe_memory::prune_tool_results(&mut messages, budget, 1);
-                if pruned > 0 {
-                    tracing::debug!(pruned, "stubbed old tool output within the turn");
+                // Still too big (e.g. a single huge result that must stay
+                // whole): make room by dropping the oldest earlier turns
+                // from this request — never the preamble, never this turn.
+                let removed = arbe_memory::drop_oldest_turns(
+                    &mut messages,
+                    history_start,
+                    turn_start,
+                    budget,
+                );
+                turn_start -= removed;
+                if pruned + removed > 0 {
+                    tracing::debug!(pruned, removed, "made room within the turn");
                 }
             }
 

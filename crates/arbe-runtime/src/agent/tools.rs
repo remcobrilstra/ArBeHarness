@@ -14,8 +14,8 @@ use arbe_tools::{Authorization, Authorized, ToolContext, authorize};
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
-use super::Agent;
 use super::hooks::{self, ToolCallPayload, ToolCallVerdict, ToolResultPayload};
+use super::{Agent, nested};
 
 /// What one call in the round turned into, before execution.
 enum Slot {
@@ -138,6 +138,7 @@ pub(super) async fn run_round(
         .iter()
         .zip(results)
         .map(|(call, result)| {
+            let succeeded = matches!(result, Some((_, false)));
             let (text, is_error) = result.unwrap_or_else(|| {
                 (
                     "not executed: the turn was cancelled before this tool call ran".to_string(),
@@ -146,12 +147,20 @@ pub(super) async fn run_round(
             });
             // Redacted before anything else sees it: the model, the
             // persisted trace, and the transcript.
+            let mut content = vec![ContentBlock::text(truncate_middle(
+                agent.redactor.redact(&text),
+                agent.settings.max_tool_output_chars,
+            ))];
+            if succeeded {
+                content.extend(
+                    nested_instructions(agent, &registry, call)
+                        .into_iter()
+                        .map(ContentBlock::text),
+                );
+            }
             ContentBlock::ToolResult {
                 tool_use_id: call.id.clone(),
-                content: vec![ContentBlock::text(truncate_middle(
-                    agent.redactor.redact(&text),
-                    agent.settings.max_tool_output_chars,
-                ))],
+                content,
                 is_error,
             }
         })
@@ -160,6 +169,29 @@ pub(super) async fn run_round(
         message: Message::with_blocks(Role::Tool, blocks),
         cancelled,
     }
+}
+
+/// Instruction files from subdirectories the call touched for the first
+/// time this session (see `nested`). Only tools whose subject is a path
+/// inside the project can have any.
+fn nested_instructions(
+    agent: &Agent,
+    registry: &arbe_tools::ToolRegistry,
+    call: &RequestedToolCall,
+) -> Vec<String> {
+    let Some(subject) = registry
+        .get(&call.name)
+        .ok()
+        .and_then(|executor| executor.subject(&call.arguments))
+    else {
+        return Vec::new();
+    };
+    let dirs = nested::candidate_dirs(&agent.settings.project_dir, &subject);
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let fresh = nested::claim_unseen(&mut agent.state().shown_instruction_dirs, dirs);
+    nested::read_instructions(&agent.settings.project_dir, &fresh)
 }
 
 /// Hooks + approval for one call. `None` means the turn was cancelled

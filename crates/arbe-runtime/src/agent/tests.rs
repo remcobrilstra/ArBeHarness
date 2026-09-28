@@ -255,6 +255,7 @@ fn test_parts(
             // depend on this repo's own CLAUDE.md.
             project_dir: temp_dir("no-project"),
             prompt: crate::system_prompt::PromptTemplate::Coding,
+            memory_home: temp_dir("no-home"),
         },
         store,
         meta,
@@ -1454,4 +1455,197 @@ async fn compact_now_summarizes_everything_but_the_newest_turn() {
     );
     // With a single turn left there's nothing more to compact.
     assert!(!t.agent.compact().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_subdirectorys_instructions_arrive_with_the_first_tool_call_that_touches_it() {
+    let project = temp_dir("nested-project");
+    std::fs::create_dir_all(project.join("api")).unwrap();
+    std::fs::write(
+        project.join("api").join("AGENTS.md"),
+        "Use snake_case in the API.",
+    )
+    .unwrap();
+    std::fs::write(project.join("api").join("lib.rs"), "pub fn x() {}").unwrap();
+
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "read_file", json!({"path": "api/lib.rs"}))]),
+            tool_calls(&[(
+                "c2",
+                "read_file",
+                json!({"path": "api/lib.rs", "start_line": 1}),
+            )]),
+        ],
+        answer("done"),
+    );
+    let requests = provider.requests.clone();
+    let dir = project.clone();
+    let (t, _rx) = test_agent_with(provider, move |parts| {
+        allow(&["read_file"])(parts);
+        parts.settings.project_dir = dir.clone();
+        arbe_tools::builtin::register_all(&mut parts.registry, &dir);
+    });
+    t.agent
+        .submit_message("look at the api".into())
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    let first = &requests[1].messages.last().unwrap().content[0];
+    let ContentBlock::ToolResult { content, .. } = first else {
+        panic!("expected a tool result");
+    };
+    assert_eq!(content.len(), 2);
+    assert!(
+        Message::with_blocks(Role::Tool, content.clone())
+            .text()
+            .contains("Use snake_case in the API.")
+    );
+    // The second touch doesn't repeat them.
+    let second = &requests[2].messages.last().unwrap().content[0];
+    let ContentBlock::ToolResult { content, .. } = second else {
+        panic!("expected a tool result");
+    };
+    assert_eq!(content.len(), 1);
+    std::fs::remove_dir_all(&project).ok();
+}
+
+/// Every tool call in `messages` is answered by a result in the tool
+/// message right after it, and no result appears without its call —
+/// what every provider requires of a request.
+fn assert_tool_pairs_intact(messages: &[Message]) {
+    for (i, message) in messages.iter().enumerate() {
+        let calls = message.tool_uses();
+        if calls.is_empty() {
+            continue;
+        }
+        let next = messages
+            .get(i + 1)
+            .expect("tool calls at the very end of a request");
+        assert_eq!(next.role, Role::Tool, "tool calls not followed by results");
+        for call in calls {
+            assert!(
+                next.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::ToolResult { tool_use_id, .. } if *tool_use_id == call.id
+                )),
+                "call {} has no result",
+                call.id
+            );
+        }
+    }
+    for (i, message) in messages.iter().enumerate() {
+        if message.role == Role::Tool {
+            assert!(
+                i > 0 && messages[i - 1].has_tool_uses(),
+                "tool results without the calls before them"
+            );
+        }
+    }
+}
+
+/// P5 exit criterion: 200 turns, each reading a large "file", against a
+/// small budget. Every request must fit and keep call/result pairs whole.
+#[tokio::test]
+async fn a_200_turn_session_with_large_tool_output_stays_within_budget() {
+    const BUDGET: u64 = 6_000;
+
+    /// Small arguments, ~3000 tokens of output — like reading a big file.
+    struct BigFile;
+    #[async_trait]
+    impl ToolExecutor for BigFile {
+        async fn execute(
+            &self,
+            invocation: ToolInvocation,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                id: invocation.id,
+                output: json!("q".repeat(12_000)),
+                is_error: false,
+            })
+        }
+    }
+
+    let mut rounds = Vec::new();
+    for i in 0..200 {
+        rounds.push(Round::Events(vec![
+            ProviderEvent::ToolUseStart {
+                id: format!("c{i}"),
+                name: "big_file".into(),
+            },
+            ProviderEvent::ToolUseInputDelta {
+                id: format!("c{i}"),
+                partial_json: json!({ "path": format!("file{i}.txt") }).to_string(),
+            },
+            ProviderEvent::Stop(StopReason::ToolUse),
+        ]));
+        rounds.push(bare_answer(&format!("answer {i}")));
+    }
+    let provider = ScriptedProvider::new(rounds, bare_answer("unused"));
+    let requests = provider.requests.clone();
+    let (t, _rx) = test_agent_with(provider, |parts| {
+        allow(&["big_file"])(parts);
+        parts.settings.budget_tokens = BUDGET;
+        parts.settings.max_tool_output_chars = 100_000;
+    });
+    t.agent.register_tool("big_file", Arc::new(BigFile));
+
+    for i in 0..200 {
+        t.agent
+            .submit_message(format!("question {i}"))
+            .await
+            .unwrap();
+    }
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 400);
+    for (n, request) in requests.iter().enumerate() {
+        let tokens: u64 = request
+            .messages
+            .iter()
+            .map(arbe_memory::estimate_message_tokens)
+            .sum();
+        assert!(tokens <= BUDGET, "request {n} is {tokens} tokens");
+        assert_tool_pairs_intact(&request.messages);
+    }
+    assert_eq!(t.store.list_turns(t.session_id).unwrap().len(), 200);
+}
+
+/// P5 exit criterion: a compaction is persisted and survives resume.
+#[tokio::test]
+async fn a_compaction_survives_resume() {
+    let rounds = vec![
+        bare_answer("one"),
+        bare_answer("two"),
+        bare_answer("three"),
+        bare_answer("- summary of one and two"),
+    ];
+    let t = test_agent(ScriptedProvider::new(rounds, bare_answer("unused")));
+    for q in ["first", "second", "third"] {
+        t.agent.submit_message(q.into()).await.unwrap();
+    }
+    assert!(t.agent.compact().await.unwrap());
+
+    // A new process resuming the same session.
+    let config = crate::RuntimeConfig {
+        provider_name: "ollama".into(),
+        ..crate::RuntimeConfig::defaults(temp_dir("resume-project"))
+    };
+    let resumed = Agent::resume(
+        &config,
+        t.store.clone(),
+        t.session_id,
+        Arc::new(EventBus::default()),
+    )
+    .unwrap();
+    let state = resumed.state();
+    assert_eq!(
+        state.summary.as_ref().unwrap().summary,
+        "- summary of one and two"
+    );
+    // Only the newest turn remains as live history; the rest is the summary.
+    assert!(state.history.iter().all(|e| e.turn_index == 2));
+    assert_eq!(state.next_turn_index, 3);
 }

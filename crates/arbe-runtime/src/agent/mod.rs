@@ -15,6 +15,8 @@
 mod approvals;
 mod compaction;
 mod hooks;
+mod memory;
+mod nested;
 mod skills;
 mod tools;
 mod turn;
@@ -74,6 +76,8 @@ struct Settings {
     project_dir: PathBuf,
     /// The profile's system prompt template, rendered every turn.
     prompt: PromptTemplate,
+    /// Harness home (`~/.arbe`), where persistent memory lives.
+    memory_home: PathBuf,
 }
 
 /// Mutable session state. Only ever locked briefly, never across an
@@ -88,6 +92,8 @@ struct SessionState {
     pipeline: ContextPipeline,
     /// The latest compaction; history holds only the turns after it.
     summary: Option<Compaction>,
+    /// Subdirectories whose nested instruction files were already shown.
+    shown_instruction_dirs: std::collections::HashSet<PathBuf>,
 }
 
 pub struct Agent {
@@ -292,6 +298,7 @@ impl Agent {
                 last_estimated_tokens: 0,
                 calibration: TokenCalibration::default(),
                 summary: parts.summary,
+                shown_instruction_dirs: Default::default(),
                 pipeline: ContextPipeline {
                     skill_instructions: parts.skill_instructions,
                     ..Default::default()
@@ -320,6 +327,13 @@ impl Agent {
         )?;
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
+        registry.register(
+            memory::REMEMBER_TOOL,
+            Arc::new(memory::RememberTool::new(
+                arbe_storage::paths::arbe_home(),
+                config.project_dir.clone(),
+            )),
+        );
         if let Some(allowed) = &config.tools {
             registry.retain(|name| tool_allowed(allowed, name));
         }
@@ -370,6 +384,7 @@ impl Agent {
                 thinking_budget_tokens: config.thinking_budget_tokens,
                 project_dir: config.project_dir.clone(),
                 prompt: config.prompt.clone(),
+                memory_home: arbe_storage::paths::arbe_home(),
             },
             store,
             meta,

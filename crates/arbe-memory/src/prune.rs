@@ -9,7 +9,8 @@
 
 use arbe_core::{ContentBlock, Message, Role};
 
-use crate::tokens::estimate_message_tokens;
+use crate::history::HistoryEntry;
+use crate::tokens::{estimate_block_tokens, estimate_message_tokens};
 
 /// Results smaller than this aren't worth stubbing (the stub itself costs
 /// ~15 tokens, and small results are often the most informative).
@@ -27,7 +28,22 @@ fn stub(tokens: u64) -> String {
 /// the model is about to read for the first time). Returns how many
 /// results were stubbed.
 pub fn prune_tool_results(messages: &mut [Message], budget: u64, protect_last: usize) -> usize {
-    let mut total: u64 = messages.iter().map(estimate_message_tokens).sum();
+    let mut refs: Vec<&mut Message> = messages.iter_mut().collect();
+    prune(&mut refs, budget, protect_last)
+}
+
+/// [`prune_tool_results`] over a session's history, in place. Meant to be
+/// applied to the in-memory history itself: once a result has been stubbed
+/// for lack of room it will never fit again, so there's no point keeping
+/// (and re-copying, every turn) the full text in memory — the full text
+/// stays in `turns.jsonl`.
+pub fn prune_history(history: &mut [HistoryEntry], budget: u64) -> usize {
+    let mut refs: Vec<&mut Message> = history.iter_mut().map(|e| &mut e.message).collect();
+    prune(&mut refs, budget, 0)
+}
+
+fn prune(messages: &mut [&mut Message], budget: u64, protect_last: usize) -> usize {
+    let mut total: u64 = messages.iter().map(|m| estimate_message_tokens(m)).sum();
     if total <= budget {
         return 0;
     }
@@ -48,24 +64,48 @@ pub fn prune_tool_results(messages: &mut [Message], budget: u64, protect_last: u
             let ContentBlock::ToolResult { content, .. } = block else {
                 continue;
             };
-            let cost: u64 = content
-                .iter()
-                .map(|b| {
-                    estimate_message_tokens(&Message::with_blocks(Role::Tool, vec![b.clone()]))
-                })
-                .sum();
+            let cost: u64 = content.iter().map(estimate_block_tokens).sum();
             if cost < MIN_PRUNABLE_TOKENS {
                 continue;
             }
-            let replacement = vec![ContentBlock::text(stub(cost))];
-            let new_cost =
-                estimate_message_tokens(&Message::with_blocks(Role::Tool, replacement.clone()));
-            *content = replacement;
+            let replacement = ContentBlock::text(stub(cost));
+            let new_cost = estimate_block_tokens(&replacement);
+            *content = vec![replacement];
             total = total.saturating_sub(cost) + new_cost;
             pruned += 1;
         }
     }
     pruned
+}
+
+/// When pruning isn't enough, removes whole turns from the start of
+/// `messages[start..end]` (a stretch of earlier history), oldest first,
+/// until the estimate fits `budget` or the stretch is empty. A turn runs
+/// from one user message to the next, so tool calls and their results are
+/// always removed together. Returns how many messages were removed (the
+/// caller's indexes after `start` shift down by that much).
+pub fn drop_oldest_turns(
+    messages: &mut Vec<Message>,
+    start: usize,
+    end: usize,
+    budget: u64,
+) -> usize {
+    let mut total: u64 = messages.iter().map(estimate_message_tokens).sum();
+    let mut end = end.min(messages.len());
+    let mut removed = 0;
+    while total > budget && start < end {
+        let turn_end = (start + 1..end)
+            .find(|&i| messages[i].role == Role::User)
+            .unwrap_or(end);
+        total -= messages[start..turn_end]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<u64>();
+        messages.drain(start..turn_end);
+        removed += turn_end - start;
+        end -= turn_end - start;
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -124,6 +164,25 @@ mod tests {
         prune_tool_results(&mut messages, 0, 1);
         assert!(result_text(&messages[1]).starts_with("[tool output omitted"));
         assert_eq!(result_text(&messages[3]).len(), 8_000);
+    }
+
+    #[test]
+    fn whole_old_turns_are_dropped_when_pruning_is_not_enough() {
+        let mut messages = vec![Message::new(Role::System, "instructions")];
+        for turn in 0..3 {
+            messages.push(Message::new(Role::User, format!("q{turn}")));
+            messages.extend(round(&format!("c{turn}"), 100));
+            messages.push(Message::new(Role::Assistant, "x".repeat(2_000)));
+        }
+        let current_start = messages.len();
+        messages.push(Message::new(Role::User, "now"));
+        let removed = drop_oldest_turns(&mut messages, 1, current_start, 700);
+        // Two old turns went, each as a unit (user, call, result, answer).
+        assert_eq!(removed, 8);
+        assert_eq!(messages[1].text(), "q2");
+        assert_eq!(messages.last().unwrap().text(), "now");
+        // Nothing outside the range is ever touched.
+        assert_eq!(drop_oldest_turns(&mut messages, 1, 1, 0), 0);
     }
 
     #[test]
