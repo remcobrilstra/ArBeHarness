@@ -13,7 +13,7 @@
 
 mod file;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use arbe_core::{ApprovalPolicyMode, ConfigError};
@@ -57,8 +57,11 @@ pub struct RuntimeConfig {
     pub retry: RetryPolicy,
     /// Extended-thinking budget for models that support it.
     pub thinking_budget_tokens: Option<u64>,
-    /// Tools the model may use. `None` = every registered tool.
+    /// Tools the model may use (exact names, or `prefix*`). `None` =
+    /// every registered tool. See [`tool_allowed`].
     pub tools: Option<Vec<String>>,
+    /// MCP servers to connect for each session (enabled ones only).
+    pub mcp_servers: Vec<arbe_mcp::McpServerConfig>,
     /// Which system prompt template to render each turn.
     pub prompt: PromptTemplate,
     /// The directory the agent works *in* (distinct from `ARBE_HOME`, the
@@ -80,6 +83,8 @@ struct Pending {
     model: Option<String>,
     temperature: Option<f32>,
     api_key_env: Option<String>,
+    /// Merged by name across layers; resolved once env is known.
+    mcp_servers: BTreeMap<String, arbe_mcp::McpServerSettings>,
 }
 
 impl RuntimeConfig {
@@ -109,6 +114,7 @@ impl RuntimeConfig {
             retry: RetryPolicy::default(),
             thinking_budget_tokens: None,
             tools: None,
+            mcp_servers: Vec::new(),
             prompt: PromptTemplate::Coding,
             project_dir,
         }
@@ -195,7 +201,7 @@ impl RuntimeConfig {
             config.add_models(layer, path)?;
         }
         config.apply_env(env, &mut pending)?;
-        config.finish(pending, env);
+        config.finish(pending, env)?;
         Ok(config)
     }
 
@@ -249,6 +255,12 @@ impl RuntimeConfig {
         }
         if let Some(h) = &layer.hooks {
             assign(&mut self.hook_timeout_ms, h.timeout_ms);
+        }
+        if let Some(mcp) = &layer.mcp {
+            // A later layer's entry replaces the whole server definition.
+            for (name, settings) in &mcp.servers {
+                pending.mcp_servers.insert(name.clone(), settings.clone());
+            }
         }
         set(&mut self.tools, layer.tools.clone());
         if let Some(prompt) = &layer.prompt {
@@ -325,8 +337,23 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// Resolves the settings whose defaults depend on the final provider.
-    fn finish(&mut self, pending: Pending, env: &dyn Fn(&str) -> Option<String>) {
+    /// Resolves the settings whose defaults depend on the final provider,
+    /// and validates the MCP servers (now that env is known).
+    fn finish(
+        &mut self,
+        pending: Pending,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), ConfigError> {
+        self.mcp_servers = pending
+            .mcp_servers
+            .iter()
+            .filter(|(_, settings)| settings.is_enabled())
+            .map(|(name, settings)| {
+                settings
+                    .resolve(name, env)
+                    .map_err(ConfigError::InvalidSchema)
+            })
+            .collect::<Result<_, _>>()?;
         self.model = pending
             .model
             .unwrap_or_else(|| default_model(&self.provider_name).to_string());
@@ -334,6 +361,7 @@ impl RuntimeConfig {
             .temperature
             .unwrap_or_else(|| default_temperature(&self.provider_name));
         self.api_key = api_key(&self.provider_name, pending.api_key_env.as_deref(), env);
+        Ok(())
     }
 
     /// The context budget to actually use: the explicit
@@ -351,6 +379,16 @@ impl RuntimeConfig {
             }
         })
     }
+}
+
+/// Whether `name` is allowed by a tool allow-set: an exact entry, or an
+/// entry ending in `*` that `name` starts with (e.g. `"github__*"` for all
+/// of one MCP server's tools).
+pub fn tool_allowed(allowed: &[String], name: &str) -> bool {
+    allowed.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => entry == name,
+    })
 }
 
 fn project_dir_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
@@ -656,6 +694,47 @@ mod tests {
             32_768
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mcp_servers_merge_by_name_across_files_and_can_be_disabled() {
+        let dir = temp_dir();
+        let global = write(
+            &dir,
+            "global.toml",
+            "[mcp.servers.github]\ncommand = \"npx\"\n[mcp.servers.docs]\nurl = \"https://x/mcp\"\n",
+        );
+        let project = write(
+            &dir,
+            "project.toml",
+            "[mcp.servers.github]\ncommand = \"gh-mcp\"\n[mcp.servers.docs]\nenabled = false\n",
+        );
+        let c = load(&[global, project], &no_env).unwrap();
+        assert_eq!(c.mcp_servers.len(), 1);
+        assert_eq!(c.mcp_servers[0].name, "github");
+        assert!(matches!(
+            &c.mcp_servers[0].transport,
+            arbe_mcp::TransportConfig::Stdio { command, .. } if command == "gh-mcp"
+        ));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_invalid_mcp_server_is_a_config_error() {
+        let dir = temp_dir();
+        let path = write(&dir, "c.toml", "[mcp.servers.x]\nargs = [\"a\"]\n");
+        let err = load(&[path], &no_env).unwrap_err().to_string();
+        assert!(err.contains("command"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn allow_sets_match_exact_names_and_prefix_wildcards() {
+        let allowed = vec!["read_file".to_string(), "github__*".to_string()];
+        assert!(tool_allowed(&allowed, "read_file"));
+        assert!(tool_allowed(&allowed, "github__search"));
+        assert!(!tool_allowed(&allowed, "read_files"));
+        assert!(!tool_allowed(&allowed, "gitlab__search"));
     }
 
     #[test]

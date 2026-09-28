@@ -55,11 +55,16 @@ dependencies = [
  "arbe-core",
  "arbe-tools",
  "async-trait",
+ "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "toml",
+ "tracing",
 ]
 
 [[package]]

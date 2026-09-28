@@ -13,3 +13,18 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+
+# Test-only MCP server used by tests/client.rs (not part of the harness).
+[[bin]]
+name = "mcp-fixture-server"
+path = "tests/fixture/mcp_fixture_server.rs"
+test = false
+doc = false
+
+[dev-dependencies]
+tempfile = { workspace = true }
+

@@ -44,9 +44,10 @@ use arbe_tools::{
 };
 
 use crate::EventBus;
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, tool_allowed};
 use crate::system_prompt::PromptTemplate;
 use approvals::ToolDecisions;
+use arbe_mcp::{McpManager, ServerStatus, ToolSink};
 
 /// Fixed-for-the-session knobs, copied out of `RuntimeConfig`.
 #[derive(Debug, Clone)]
@@ -92,8 +93,13 @@ pub struct Agent {
     hooks: HookRegistry,
     events: Arc<EventBus>,
     /// Copy-on-write so a running turn works from a stable snapshot while
-    /// `register_tool` can still add tools.
-    registry: RwLock<Arc<ToolRegistry>>,
+    /// `register_tool` (and MCP servers connecting in the background) can
+    /// still change it. Shared with [`RegistrySink`].
+    registry: Arc<RwLock<Arc<ToolRegistry>>>,
+    /// The profile's tool allow-set, applied to tools added later too.
+    allowed_tools: Option<Vec<String>>,
+    /// This session's MCP servers, if any are configured.
+    mcp: Option<Arc<McpManager>>,
     decisions: ToolDecisions,
     /// Held for the duration of a turn (or a manual tool call); `try_lock`
     /// failing is what makes a concurrent submission `Busy`.
@@ -118,6 +124,7 @@ struct Parts {
     history: Vec<HistoryEntry>,
     next_turn_index: u64,
     skill_instructions: Vec<String>,
+    allowed_tools: Option<Vec<String>>,
 }
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
@@ -232,7 +239,9 @@ impl Agent {
             approval_ctx: parts.approval_ctx,
             hooks: parts.hooks,
             events: parts.events,
-            registry: RwLock::new(Arc::new(parts.registry)),
+            registry: Arc::new(RwLock::new(Arc::new(parts.registry))),
+            allowed_tools: parts.allowed_tools,
+            mcp: None,
             decisions: ToolDecisions::default(),
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
@@ -271,7 +280,7 @@ impl Agent {
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
         if let Some(allowed) = &config.tools {
-            registry.retain(|name| allowed.iter().any(|a| a == name));
+            registry.retain(|name| tool_allowed(allowed, name));
         }
         let budget_tokens = config
             .effective_context_budget(provider.capabilities(&config.model).max_context_tokens);
@@ -311,7 +320,62 @@ impl Agent {
             history,
             next_turn_index,
             skill_instructions: load_global_skill_instructions(),
-        }))
+            allowed_tools: config.tools.clone(),
+        })
+        .with_mcp_servers(config.mcp_servers.clone()))
+    }
+
+    /// Starts connecting `servers` in the background (a slow server must
+    /// not hold up the session); each one's tools appear in the registry
+    /// once it's ready, announced by `McpServerConnected`, or its failure
+    /// by `McpServerFailed`. Needs a tokio runtime; without one (plain
+    /// unit tests) MCP is skipped.
+    fn with_mcp_servers(mut self, servers: Vec<arbe_mcp::McpServerConfig>) -> Self {
+        if servers.is_empty() {
+            return self;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no async runtime; MCP servers not started");
+            return self;
+        };
+        let manager = Arc::new(McpManager::new(
+            servers,
+            Some(arbe_storage::paths::logs_dir().join("mcp")),
+        ));
+        let sink = self.registry_sink();
+        let events = self.events.clone();
+        let connecting = manager.clone();
+        runtime.spawn(async move {
+            connecting
+                .connect_all(&sink, &|status| {
+                    events.publish(match status {
+                        ServerStatus::Connected { server, tools } => {
+                            RuntimeEvent::McpServerConnected { server, tools }
+                        }
+                        ServerStatus::Failed { server, error } => RuntimeEvent::McpServerFailed {
+                            server,
+                            reason: error,
+                        },
+                    })
+                })
+                .await;
+        });
+        self.mcp = Some(manager);
+        self
+    }
+
+    fn registry_sink(&self) -> RegistrySink {
+        RegistrySink {
+            registry: self.registry.clone(),
+            allowed: self.allowed_tools.clone(),
+        }
+    }
+
+    /// Picks up MCP tool-list changes announced since the last turn.
+    async fn refresh_mcp_tools(&self) {
+        if let Some(mcp) = &self.mcp {
+            mcp.refresh_changed(&self.registry_sink()).await;
+        }
     }
 
     /// Starts a brand new session.
@@ -495,6 +559,31 @@ impl Agent {
             return Err(HarnessError::Cancelled);
         }
         Ok(outcome.message)
+    }
+}
+
+/// Puts an MCP server's tools into the agent's registry (replacing the
+/// server's previous set), filtered by the profile's allow-set.
+struct RegistrySink {
+    registry: Arc<RwLock<Arc<ToolRegistry>>>,
+    allowed: Option<Vec<String>>,
+}
+
+impl ToolSink for RegistrySink {
+    fn replace_server_tools(&self, server: &str, tools: Vec<(String, Arc<dyn ToolExecutor>)>) {
+        let prefix = arbe_mcp::server_prefix(server);
+        let mut guard = self.registry.write().unwrap_or_else(|p| p.into_inner());
+        let registry = Arc::make_mut(&mut guard);
+        registry.retain(|name| !name.starts_with(&prefix));
+        for (name, executor) in tools {
+            if self
+                .allowed
+                .as_ref()
+                .is_none_or(|allowed| tool_allowed(allowed, &name))
+            {
+                registry.register(name, executor);
+            }
+        }
     }
 }
 

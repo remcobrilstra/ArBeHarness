@@ -200,6 +200,12 @@ fn drain_runtime_events(
             Ok(RuntimeEvent::ToolProgress { update, .. }) => {
                 app.activity = Some(update);
             }
+            Ok(RuntimeEvent::McpServerConnected { server, tools }) => {
+                app.notice = Some(format!("MCP server {server} connected ({tools} tools)"));
+            }
+            Ok(RuntimeEvent::McpServerFailed { server, reason }) => {
+                app.status_message = Some(format!("MCP server {server} unavailable: {reason}"));
+            }
             Ok(RuntimeEvent::UsageUpdated { session, .. }) => {
                 app.session_tokens = session.total_tokens();
             }

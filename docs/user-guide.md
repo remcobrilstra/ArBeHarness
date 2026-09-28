@@ -151,7 +151,7 @@ context_window = 32768
 | Key | Default | Description |
 |---|---|---|
 | `profile` | `coding` | Profile to use. Top level only. |
-| `tools` | all tools | Tools the model may use, by name. Tools not listed are not available at all (not even through `/tool`). |
+| `tools` | all tools | Tools the model may use, by name. An entry ending in `*` matches by prefix, e.g. `"github__*"` for every tool of the `github` [MCP server](#mcp-servers). Tools not listed are not available at all (not even through `/tool`). |
 | `prompt` | per profile | System prompt template: `coding`, `general`, or a path to your own Markdown file (relative paths are relative to the config file). See [Profiles](#profiles). |
 | `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
 | `provider.model` | per provider | Same as `ARBE_MODEL`. |
@@ -172,6 +172,7 @@ context_window = 32768
 | `approval.deny` | `[]` | Tools that are always refused in `denylist_block` mode. |
 | `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` also covers high-risk tools (`execute`). |
 | `hooks.timeout_ms` | `500` | Time limit for each hook. (You can't register hooks yet; see [Not yet active](#not-yet-active).) |
+| `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
 | `[[models]]` | none | Corrects the [context-window table](#providers-and-models) for one model: `provider`, exact `name`, `context_window`, and optionally `tool_calls`, `vision`, `thinking`. For Ollama this also sets the context size the server is asked to allocate. |
 
 ---
@@ -381,6 +382,39 @@ If a tool fails (bad arguments, file not found, unknown tool) or you deny it, th
 
 **Stuck loops.** If the model asks for exactly the same tool calls three rounds in a row, the turn stops (the third round doesn't run). A turn also stops after `ARBE_MAX_TOOL_ROUNDS` rounds, or when `ARBE_MAX_TURN_TOKENS` is set and reached.
 
+### MCP servers
+
+[MCP](https://modelcontextprotocol.io) servers add tools from outside the harness: issue trackers, databases, documentation search, and so on. Add them to a [config file](#configuration-file), one table per server. The name (letters, digits, `-`, `_`) is yours to choose:
+
+```toml
+# The harness starts the server as a process (stdio).
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_API_URL = "https://api.github.com" }   # optional extra variables
+# cwd = "..."                                          # optional working directory
+
+# A server that's already running, reached over HTTP ("streamable HTTP").
+[mcp.servers.docs]
+url = "https://example.com/mcp"
+bearer_token_env = "DOCS_MCP_TOKEN"   # NAME of the env var holding the token
+headers = { "X-Team" = "platform" }
+
+# Optional for either kind:
+# timeout_secs = 60                   # per request
+# enabled = false                     # switch off a server defined in another file
+```
+
+- A stdio server inherits your environment, so secrets such as `GITHUB_PERSONAL_ACCESS_TOKEN` can stay in your shell instead of the config file. On Windows, commands like `npx` and `uvx` work as-is.
+- Servers are connected when a session starts, in the background. The chat is usable immediately, and an `[info]` line reports `MCP server github connected (N tools)`, or an `[error]` line says why a server is unavailable. A failed server doesn't stop the others or the session.
+- Its tools appear to the model as `<server>__<tool>`, e.g. `github__search_issues`, with the descriptions and argument schemas the server provides. You can call them with [`/tool`](#chat-commands) too.
+- They go through the same [approvals](#approvals) as builtin tools. Their risk level comes from the server's own hints: read-only tools are low risk, destructive ones high, everything else medium. Only read-only tools run in parallel with other calls.
+- If a server announces that its tool list changed, the new list is picked up at the start of your next message.
+- If a stdio server crashes, it's restarted automatically the next time one of its tools is called. Cancelling a turn (`Esc`) also cancels the MCP call in progress.
+- Each stdio server's error output is written to `~/.arbe/logs/mcp/<name>.log` — the first place to look when a server won't start.
+- A tool's result is shown to the model as text. Images a tool returns appear as `[image: <type>]`.
+- **HTTP limitation:** the harness only hears from an HTTP server while one of its own requests is open, so an HTTP server's "tool list changed" announcements made at other times are missed until the next session.
+
 ### Approvals
 
 How tool calls are approved is set by `approval.mode` in the [configuration file](#configuration-file):
@@ -480,10 +514,11 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 ├── memory/
 │   ├── global/memory.md       (reserved, not read yet)
 │   └── projects/<id>/memory.md (reserved, not read yet)
-├── mcp/                        (reserved, not read yet)
+├── mcp/                        (unused; MCP servers are configured in config.toml)
 ├── config/
 │   └── config.toml            your global settings (active)
-└── logs/                       (reserved, nothing written yet)
+└── logs/
+    └── mcp/<server>.log       error output of each stdio MCP server (active)
 ```
 
 **Active** entries are read or written today. **Reserved** entries belong to features that exist in the code but aren't connected yet. Files you put there are ignored for now. See [Not yet active](#not-yet-active).
@@ -561,7 +596,7 @@ Markdown with a `---` frontmatter block. See [Skills](#skills). A leading byte-o
 
 ## Logs and troubleshooting
 
-**There are no log files yet.** The `logs/` folder is reserved but nothing writes to it. Internal warnings, such as an unreadable instructions file or a malformed skill, are currently dropped rather than shown. Errors that stop a turn appear in the transcript as `[error] ...` lines. Startup failures are printed to the terminal after the app exits.
+**The only log files are for MCP servers:** `~/.arbe/logs/mcp/<server>.log` holds what each stdio server printed to its error output. The harness's own internal warnings, such as an unreadable instructions file or a malformed skill, are currently dropped rather than shown. Errors that stop a turn appear in the transcript as `[error] ...` lines. Startup failures are printed to the terminal after the app exits.
 
 What you can inspect today:
 
@@ -573,6 +608,8 @@ Common problems:
 | Symptom | Likely cause / fix |
 |---|---|
 | `invalid configuration: ...` at startup | A config file has a typo, an unknown key, or an invalid value, or an `ARBE_*` number variable isn't a number. The message names the file and line or the variable. |
+| `MCP server <name> unavailable: ...` | The server couldn't be started or reached. Check the command/URL, and `~/.arbe/logs/mcp/<name>.log` for its own error output. `failed to start "..."` means the program wasn't found on your `PATH`. |
+| An MCP server's tools don't appear | The server hasn't finished connecting yet (watch for the `connected` line), or a `tools` allow-list is set and doesn't include them — add `"<server>__*"`. |
 | Connection error with the default setup | Ollama isn't running. Start it, or set `ARBE_PROVIDER`. |
 | `... provider requires an api_key` | Set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or `ARBE_API_KEY`). |
 | `openai_compatible provider requires a base_url` | Set `ARBE_BASE_URL`. |
@@ -593,12 +630,11 @@ These have code in the repository but **can't be used yet**. They're listed so y
 
 | Feature | Status |
 |---|---|
-| MCP servers (`~/.arbe/mcp/servers.toml`) | The client and the file parser exist, but servers are not started or offered to the model. |
 | Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
 | Real summarization of old history | `compact_summary` only notes how much was left out; it doesn't summarize it. |
 | Project-local / session-local skills | Only global skills (`~/.arbe/skills/`) are loaded. |
 | Hooks | The hook system exists, but you can't register your own hooks. |
-| Log files (`~/.arbe/logs/`) | Nothing is written. |
+| Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
 | Showing the model's reasoning | Extended thinking is saved in `turns.jsonl`, but the chat screen only shows `thinking…` while it happens, not the text. |
 | Tools returning images | Tool results are text only. |

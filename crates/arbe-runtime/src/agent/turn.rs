@@ -325,6 +325,7 @@ impl TurnRunner<'_> {
         self.record(user_message);
 
         advance(&mut self.machine, LoopPhase::PlanOrDirectRespond)?;
+        agent.refresh_mcp_tools().await;
         let tool_specs = if agent
             .provider
             .capabilities(&agent.settings.model)

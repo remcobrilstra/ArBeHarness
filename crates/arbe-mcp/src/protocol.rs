@@ -1,60 +1,110 @@
+//! JSON-RPC 2.0 framing for MCP: building requests/notifications and
+//! classifying incoming messages. Pure — no I/O — so it's tested without a
+//! process or network.
+
 use serde_json::{Value, json};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+/// The protocol version this client speaks. Servers answer `initialize`
+/// with the version they'll use; this client accepts whatever they choose.
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+#[derive(Debug, Clone, Error)]
 pub enum McpError {
     #[error("failed to parse MCP message: {0}")]
     Parse(String),
     #[error("MCP server returned an error (code {code}): {message}")]
     Rpc { code: i64, message: String },
-    #[error("MCP response id mismatch: expected {expected}, got {got}")]
-    IdMismatch { expected: u64, got: u64 },
     #[error("MCP transport error: {0}")]
     Transport(String),
+    #[error("MCP request timed out after {0:?}")]
+    Timeout(std::time::Duration),
+    #[error("MCP request was cancelled")]
+    Cancelled,
 }
 
-/// Builds a JSON-RPC 2.0 request. MCP's stdio transport frames each message
-/// as one JSON value per line (no `Content-Length` headers like LSP uses).
 pub fn build_request(id: u64, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
 
-/// Builds a JSON-RPC 2.0 notification (no `id`, no response expected) —
-/// used for `notifications/initialized` after the handshake.
 pub fn build_notification(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "method": method, "params": params })
 }
 
-/// Parses one response line and returns its `result`, or an `McpError` if
-/// the server reported an error or the id doesn't match what we sent.
-pub fn parse_response(line: &str, expected_id: u64) -> Result<Value, McpError> {
-    let value: Value = serde_json::from_str(line).map_err(|e| McpError::Parse(e.to_string()))?;
+/// A reply to a request the *server* sent us.
+pub fn build_result(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
 
-    if let Some(error) = value.get("error") {
-        let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        let message = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown MCP error")
-            .to_string();
-        return Err(McpError::Rpc { code, message });
+pub fn build_error(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// JSON-RPC "method not found".
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// One message from the server, classified.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    /// The answer to one of our requests.
+    Response {
+        id: u64,
+        outcome: Result<Value, (i64, String)>,
+    },
+    /// A notification (no reply expected).
+    Notification { method: String, params: Value },
+    /// A request from the server to us (e.g. `ping`); must be answered.
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+}
+
+/// Classifies one JSON-RPC message.
+pub fn classify(text: &str) -> Result<Incoming, McpError> {
+    let value: Value = serde_json::from_str(text).map_err(|e| McpError::Parse(e.to_string()))?;
+    classify_value(value)
+}
+
+pub fn classify_value(value: Value) -> Result<Incoming, McpError> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let id = value.get("id").filter(|id| !id.is_null()).cloned();
+    match (method, id) {
+        (Some(method), Some(id)) => Ok(Incoming::Request {
+            id,
+            method,
+            params: value.get("params").cloned().unwrap_or(Value::Null),
+        }),
+        (Some(method), None) => Ok(Incoming::Notification {
+            method,
+            params: value.get("params").cloned().unwrap_or(Value::Null),
+        }),
+        (None, Some(id)) => {
+            let id = id
+                .as_u64()
+                .ok_or_else(|| McpError::Parse(format!("unexpected response id {id}")))?;
+            let outcome = if let Some(error) = value.get("error") {
+                Err((
+                    error.get("code").and_then(Value::as_i64).unwrap_or(0),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown MCP error")
+                        .to_string(),
+                ))
+            } else {
+                Ok(value.get("result").cloned().ok_or_else(|| {
+                    McpError::Parse("response has neither result nor error".into())
+                })?)
+            };
+            Ok(Incoming::Response { id, outcome })
+        }
+        (None, None) => Err(McpError::Parse("message has neither method nor id".into())),
     }
-
-    let id = value
-        .get("id")
-        .and_then(|i| i.as_u64())
-        .ok_or_else(|| McpError::Parse("response missing id".to_string()))?;
-    if id != expected_id {
-        return Err(McpError::IdMismatch {
-            expected: expected_id,
-            got: id,
-        });
-    }
-
-    value
-        .get("result")
-        .cloned()
-        .ok_or_else(|| McpError::Parse("response missing result".to_string()))
 }
 
 #[cfg(test)]
@@ -62,56 +112,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_a_well_formed_request() {
+    fn builds_well_formed_requests_and_notifications() {
         let req = build_request(1, "tools/list", json!({}));
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["id"], 1);
         assert_eq!(req["method"], "tools/list");
-    }
-
-    #[test]
-    fn builds_a_notification_with_no_id() {
         let notif = build_notification("notifications/initialized", json!({}));
         assert!(notif.get("id").is_none());
-        assert_eq!(notif["method"], "notifications/initialized");
     }
 
     #[test]
-    fn parses_a_successful_response() {
-        let line = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let result = parse_response(line, 1).unwrap();
-        assert_eq!(result, json!({"tools": []}));
-    }
-
-    #[test]
-    fn parses_a_server_side_error() {
-        let line = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"not found"}}"#;
-        let Err(err) = parse_response(line, 1) else {
-            panic!("expected an error");
-        };
-        assert!(matches!(err, McpError::Rpc { code: -32601, .. }));
-    }
-
-    #[test]
-    fn rejects_a_response_with_the_wrong_id() {
-        let line = r#"{"jsonrpc":"2.0","id":2,"result":{}}"#;
-        let Err(err) = parse_response(line, 1) else {
-            panic!("expected an error");
-        };
-        assert!(matches!(
-            err,
-            McpError::IdMismatch {
-                expected: 1,
-                got: 2
+    fn classifies_a_successful_response() {
+        assert_eq!(
+            classify(r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#).unwrap(),
+            Incoming::Response {
+                id: 1,
+                outcome: Ok(json!({"tools": []}))
             }
-        ));
+        );
     }
 
     #[test]
-    fn rejects_malformed_json() {
-        let Err(err) = parse_response("not json", 1) else {
-            panic!("expected an error");
-        };
-        assert!(matches!(err, McpError::Parse(_)));
+    fn classifies_a_server_side_error() {
+        assert_eq!(
+            classify(r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"not found"}}"#)
+                .unwrap(),
+            Incoming::Response {
+                id: 7,
+                outcome: Err((-32601, "not found".into()))
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_notifications_and_server_requests() {
+        assert_eq!(
+            classify(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#).unwrap(),
+            Incoming::Notification {
+                method: "notifications/tools/list_changed".into(),
+                params: Value::Null
+            }
+        );
+        assert_eq!(
+            classify(r#"{"jsonrpc":"2.0","id":"abc","method":"ping"}"#).unwrap(),
+            Incoming::Request {
+                id: json!("abc"),
+                method: "ping".into(),
+                params: Value::Null
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_messages() {
+        assert!(matches!(classify("not json"), Err(McpError::Parse(_))));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0"}"#),
+            Err(McpError::Parse(_))
+        ));
+        assert!(matches!(
+            classify(r#"{"jsonrpc":"2.0","id":1}"#),
+            Err(McpError::Parse(_))
+        ));
     }
 }

@@ -22,7 +22,9 @@ pub struct Layer {
     pub loop_: Option<LoopSection>,
     pub approval: Option<ApprovalSection>,
     pub hooks: Option<HooksSection>,
-    /// Tools the model may use, by name. Absent = every registered tool.
+    pub mcp: Option<McpSection>,
+    /// Tools the model may use, by name (a trailing `*` matches a prefix,
+    /// e.g. `"github__*"`). Absent = every registered tool.
     pub tools: Option<Vec<String>>,
     /// System prompt template: `"coding"`, `"general"`, or a path to a
     /// Markdown file (relative to the config file's directory).
@@ -78,6 +80,14 @@ pub struct ApprovalSection {
     pub allow: Option<Vec<String>>,
     pub deny: Option<Vec<String>>,
     pub session_approval_covers_high_risk: Option<bool>,
+}
+
+/// `[mcp.servers.<name>]` tables.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSection {
+    #[serde(default)]
+    pub servers: BTreeMap<String, arbe_mcp::McpServerSettings>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,6 +156,10 @@ mod tests {
             [hooks]
             timeout_ms = 1000
 
+            [mcp.servers.github]
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-github"]
+
             [profiles.review]
             tools = ["read_file", "grep", "glob"]
             [profiles.review.approval]
@@ -171,6 +185,10 @@ mod tests {
         );
         assert_eq!(layer.profiles["review"].tools.as_ref().unwrap().len(), 3);
         assert_eq!(layer.models[0].context_window, 32_768);
+        assert_eq!(
+            layer.mcp.unwrap().servers["github"].command.as_deref(),
+            Some("npx")
+        );
     }
 
     #[test]

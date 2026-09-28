@@ -266,6 +266,7 @@ fn test_parts(
         history: Vec::new(),
         next_turn_index: 0,
         skill_instructions: Vec::new(),
+        allowed_tools: None,
     }
 }
 
@@ -1090,5 +1091,93 @@ async fn the_general_profile_agent_only_has_its_allowed_tools() {
     let (_, text, is_error) = tool_result_of(&message, 0);
     assert!(is_error);
     assert!(text.contains("no tool registered"), "{text}");
+    std::fs::remove_dir_all(&store_dir).ok();
+}
+
+#[test]
+fn mcp_tools_replace_their_servers_previous_set_and_respect_the_allow_set() {
+    let registry = Arc::new(std::sync::RwLock::new(Arc::new(ToolRegistry::new())));
+    Arc::make_mut(&mut registry.write().unwrap()).register("read_file", Arc::new(EchoExecutor));
+    let sink = RegistrySink {
+        registry: registry.clone(),
+        allowed: Some(vec![
+            "read_file".into(),
+            "gh__*".into(),
+            "docs__search".into(),
+        ]),
+    };
+    let tool = |name: &str| {
+        (
+            name.to_string(),
+            Arc::new(EchoExecutor) as Arc<dyn ToolExecutor>,
+        )
+    };
+
+    use arbe_mcp::ToolSink;
+    sink.replace_server_tools("gh", vec![tool("gh__issues"), tool("gh__prs")]);
+    sink.replace_server_tools("docs", vec![tool("docs__search"), tool("docs__delete")]);
+    let names = |r: &Arc<std::sync::RwLock<Arc<ToolRegistry>>>| r.read().unwrap().names();
+    assert_eq!(
+        names(&registry),
+        vec!["docs__search", "gh__issues", "gh__prs", "read_file"]
+    );
+
+    // A refreshed list replaces only that server's tools.
+    sink.replace_server_tools("gh", vec![tool("gh__issues")]);
+    assert_eq!(
+        names(&registry),
+        vec!["docs__search", "gh__issues", "read_file"]
+    );
+}
+
+/// Full path through the harness: config → `Agent::create` → background
+/// MCP connection → `McpServerConnected` → tool in the registry → call via
+/// the approval gate. Uses the official reference server via `npx`.
+/// Run with: `cargo test -p arbe-runtime reference_mcp -- --ignored`
+#[tokio::test]
+#[ignore = "needs Node/npx and network"]
+async fn reference_mcp_server_tools_are_usable_through_the_agent() {
+    let store_dir = temp_dir("mcp-store");
+    let mut settings = arbe_mcp::McpServerSettings {
+        command: Some("npx".into()),
+        args: vec![
+            "-y".into(),
+            "@modelcontextprotocol/server-everything".into(),
+        ],
+        ..Default::default()
+    };
+    settings.timeout_secs = Some(120);
+    let config = crate::RuntimeConfig {
+        provider_name: "ollama".into(),
+        mcp_servers: vec![settings.resolve("everything", &|_| None).unwrap()],
+        policy_mode: ApprovalPolicyMode::AllowlistAuto,
+        allowlist: vec!["everything__echo".into()],
+        ..crate::RuntimeConfig::defaults(temp_dir("mcp-project"))
+    };
+    let events = Arc::new(EventBus::new(1_024));
+    let mut rx = events.subscribe();
+    let agent = Agent::create(&config, SessionStore::with_root(store_dir.clone()), events).unwrap();
+
+    let tools = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            match rx.recv().await.unwrap().event {
+                RuntimeEvent::McpServerConnected { tools, .. } => return tools,
+                RuntimeEvent::McpServerFailed { reason, .. } => panic!("{reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("server never connected");
+    assert!(tools > 0);
+    assert!(agent.registry_snapshot().contains("everything__echo"));
+
+    let message = agent
+        .invoke_tool("everything__echo", json!({"message": "through the agent"}))
+        .await
+        .unwrap();
+    let (_, text, is_error) = tool_result_of(&message, 0);
+    assert!(!is_error, "{text}");
+    assert!(text.contains("through the agent"));
     std::fs::remove_dir_all(&store_dir).ok();
 }

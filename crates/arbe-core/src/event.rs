@@ -101,6 +101,17 @@ pub enum RuntimeEvent {
         turn: Usage,
         session: Usage,
     },
+    /// An MCP server connected and its tools were registered.
+    McpServerConnected {
+        server: String,
+        tools: usize,
+    },
+    /// An MCP server couldn't be started or reached; its tools are
+    /// unavailable this session.
+    McpServerFailed {
+        server: String,
+        reason: String,
+    },
     /// Older context was compacted to fit the budget.
     CompactionPerformed {
         session_id: SessionId,
