@@ -16,20 +16,21 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 |---|---|---|---|---|
 | P0 | Housekeeping & quick correctness fixes | Done | 6 / 6 | 223 tests, fmt/clippy clean. P0.3 not verified against a live Ollama server (none available) |
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
-| P2 | Provider layer v2 | In progress | 0 / 9 | OpenAI/Ollama already on the new trait with streamed tool calls + usage (see P2.2/P2.3 notes); retry, Anthropic, catalog, registry still open |
+| P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested (296 tests). **Not Done yet:** the exit criterion needs live runs, and there are no API keys or Ollama server here — run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with keys set |
 | P3 | Agent loop v2 | In progress | 0 / 10 | Unified streaming loop and tool-error handling landed with P1; the Session/TurnRunner split is next |
 | P4 | Config, profiles & extension wiring | Not started | 0 / 9 | Depends on P3 |
 | P5 | Context management v2 | Not started | 0 / 6 | Depends on P3 |
 | P6 | Multi-purpose & embedding | Not started | 0 / 8 | Depends on P4 |
-| P7 | Verification, hardening & release | Not started | 0 / 8 | Continuous; closes out at the end |
+| P7 | Verification, hardening & release | In progress | 0 / 8 | Live smoke tests exist (P7.2, partial); CI dispatch workflow still open |
 
-**Current focus:** P2 (provider layer: retry, Anthropic, model catalog)
-**Last updated:** 2026-09-28 · test count: 265
+**Current focus:** P3 (agent loop v2: Session/TurnRunner split, full-trace persistence, cancellation)
+**Last updated:** 2026-09-28 · test count: 296
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — P2 implemented (live verification pending).** Retry/backoff with `Retry-After` + cancellable waits, surfaced as `ProviderRetrying` events; connect/idle-read timeouts; Anthropic adapter (thinking + signatures, redacted thinking, prompt caching, role merging); model catalog; provider registry; `openai_compatible` provider + extra headers; token-estimate calibration from real usage; `#[ignore]`d live smoke tests. Also isolated agent tests from the repo's own `CLAUDE.md`. 265 → 296 tests. Next: P3.1.
 - **2026-09-28 — P1 complete.** Content-block `Message`, `ProviderEvent` stream + `ResponseAccumulator`, single-method `ModelProvider::stream` with shared cancellation, `ToolContext` cancellation, turn schema v2 (v1 still readable), `EventEnvelope` with `seq`, extended error taxonomy. Found and fixed along the way: the `execute` tool leaked the real command as an orphan on timeout (only the shell was killed) — now kills the process tree. 223 → 265 tests. Uncommitted. Next: P2.1 (retry/backoff), then P2.4 (Anthropic).
 - **2026-09-28 — P0 complete.** Session-scoped approvals, Ollama tool calling, derived context budget + configurable tool-round cap, no more loop-transition panics, `RuntimeError` actually published, docs refreshed. 200 → 223 tests; fmt/clippy clean. Uncommitted. Next: P1.1 (content-block `Message`).
 
@@ -156,17 +157,24 @@ Redesign the shared contract in `arbe-core` (plus the provider trait in `arbe-pr
 
 Port adapters to the new trait, add Anthropic, and make the network layer production-grade. Existing pure helpers (`SseDecoder`, `Utf8ChunkBuffer`, `error_map`) are kept.
 
-- [ ] **P2.1 Shared HTTP layer.** One `reqwest::Client` per provider with sensible connect/read timeouts; a `RetryPolicy` (exponential backoff + jitter, honors `retry_after`, retries on 429/5xx/overloaded/transport errors, never on 4xx validation) applied before the first byte of a stream is yielded; mid-stream failures surface as errors, not silent retries.
-- [ ] **P2.2 OpenAI adapter (Chat Completions) port.** Streaming tool calls via `ToolUseStart`/`ToolUseInputDelta`, `stream_options.include_usage` for usage, reasoning-model parameter quirks kept.
-  - *Mostly done in P1.3:* all of the above is implemented and fixture-tested. Remaining: a live smoke run (P7.2).
-- [ ] **P2.3 Ollama adapter port.** Carry P0.3's tool mapping across; usage from `prompt_eval_count`/`eval_count`.
-  - *Mostly done in P1.3:* implemented and fixture-tested, and the "model does not support tools" fallback now works on the streaming path too. Remaining: a live smoke run (P7.2).
-- [ ] **P2.4 Anthropic adapter (Messages API).** Native content blocks, streaming (`message_start`/`content_block_delta`/...), tool use, extended thinking with signature round-tripping, prompt caching via `cache_control` from `CacheHint`, image input.
-- [ ] **P2.5 OpenAI-compatible profile.** Treat "OpenAI-compatible gateway" (vLLM, LM Studio, OpenRouter, Azure-style base URLs, custom headers) as configuration of the OpenAI adapter, not a new adapter.
-- [ ] **P2.6 Model catalog.** A small built-in table of known models → `ModelCapabilities` (context window, max output, tool/vision/thinking support), overridable from config for unknown or custom models.
-- [ ] **P2.7 Token counting.** Keep `estimate_tokens` as the fallback; prefer real `Usage` from the last response to calibrate (track actual input tokens per turn and use the delta for the next estimate). Optional provider-native count endpoint behind the trait where available.
-- [ ] **P2.8 Provider registry.** Replace the `build_provider` match with a registry keyed by provider id, so adding a provider doesn't require editing a central match and third parties can register their own.
-- [ ] **P2.9 Recorded-fixture tests.** For each adapter: request-body golden tests, and replayed recorded streams (SSE / NDJSON fixture files) through the decoder → `ProviderEvent`s → `ResponseAccumulator`. No network.
+- [x] **P2.1 Shared HTTP layer.** One `reqwest::Client` per provider with sensible connect/read timeouts; a `RetryPolicy` (exponential backoff + jitter, honors `retry_after`, retries on 429/5xx/overloaded/transport errors, never on 4xx validation) applied before the first byte of a stream is yielded; mid-stream failures surface as errors, not silent retries.
+  - *Done:* `http::client()` (15 s connect, 5 min idle-read — no total timeout, since long answers are fine as long as they keep arriving). `arbe_providers::stream_with_retry` + `RetryPolicy` (4 retries, 1 s base doubling, 60 s cap, clock-based jitter; a `Retry-After` longer than the cap fails fast). Retrying happens only before the first event, including an error arriving *as* the first event. Waits are cancellable. Each retry is published as `RuntimeEvent::ProviderRetrying` and shown in the TUI activity line. `ARBE_MAX_RETRIES` configures it. New `ProviderError::Unreachable` (connection refused — *not* retried, with a "is the server running?" hint) vs `Network` (dropped mid-request — retried).
+- [x] **P2.2 OpenAI adapter (Chat Completions) port.** Streaming tool calls via `ToolUseStart`/`ToolUseInputDelta`, `stream_options.include_usage` for usage, reasoning-model parameter quirks kept.
+  - *Done in P1.3:* implemented and fixture-tested. **Live run pending** (`openai_live` in `tests/live.rs`).
+- [x] **P2.3 Ollama adapter port.** Carry P0.3's tool mapping across; usage from `prompt_eval_count`/`eval_count`.
+  - *Done in P1.3:* implemented and fixture-tested; the "does not support tools" fallback works on the streaming path; `num_ctx` now comes from the catalog. **Live run pending** (`ollama_live`).
+- [x] **P2.4 Anthropic adapter (Messages API).** Native content blocks, streaming (`message_start`/`content_block_delta`/...), tool use, extended thinking with signature round-tripping, prompt caching via `cache_control` from `CacheHint`, image input.
+  - *Done:* `AnthropicProvider` (`ANTHROPIC_API_KEY`, default model `claude-sonnet-5`). System messages are hoisted into `system`; consecutive same-role messages are merged, with tool results moved first; an assistant-first history gets a placeholder user turn. Only *signed* thinking is echoed back; redacted thinking round-trips as `Opaque`. Non-object tool input is wrapped. Cache breakpoints go on the last system block, on flagged messages, and on the final message (conversation caching across tool rounds). `ModelRequest::thinking_budget_tokens` (`ARBE_THINKING_BUDGET`) is added on top of `max_tokens` and drops `temperature`. The stream translator is tested against the documented event sequence, including mid-stream `error` events. **Live run pending** (`anthropic_live`).
+- [x] **P2.5 OpenAI-compatible profile.** Treat "OpenAI-compatible gateway" (vLLM, LM Studio, OpenRouter, Azure-style base URLs, custom headers) as configuration of the OpenAI adapter, not a new adapter.
+  - *Done:* provider id `openai_compatible` (`OpenAiProvider::compatible`) — `base_url` required, key optional, catalog lookups fall back to OpenAI model names. `with_headers` on OpenAI/Anthropic; `ARBE_HTTP_HEADERS="Name: value; ..."`; `ARBE_API_KEY` is a generic key fallback. Azure's deployment-path/`api-key` scheme is not covered.
+- [x] **P2.6 Model catalog.** A small built-in table of known models → `ModelCapabilities` (context window, max output, tool/vision/thinking support), overridable from config for unknown or custom models.
+  - *Done:* `ModelCatalog` — longest-prefix match (dated snapshots resolve), per-provider defaults, and exact-name overrides via `with_override`. Values are the published limits as of 2026-09 (e.g. gpt-5 400k, gpt-4.1 ~1M, Claude 200k). No `max_output_tokens` yet. Reading overrides from config is part of P4.1.
+- [x] **P2.7 Token counting.** Keep `estimate_tokens` as the fallback; prefer real `Usage` from the last response to calibrate (track actual input tokens per turn and use the delta for the next estimate). Optional provider-native count endpoint behind the trait where available.
+  - *Done (calibration part):* `arbe_memory::TokenCalibration` — an EMA of reported/estimated input tokens, clamped to [0.5, 3.0] per observation. It is learned from each turn's first request, applied to the context budget and to the displayed estimate, and it absorbs tool-definition and formatting overhead too. The provider-native count endpoint is not done (not needed while calibration holds up).
+- [x] **P2.8 Provider registry.** Replace the `build_provider` match with a registry keyed by provider id, so adding a provider doesn't require editing a central match and third parties can register their own.
+  - *Done:* `ProviderRegistry` (`with_builtins`, `register`, `build`, `ids`) + `ProviderSettings { api_key, base_url, extra_headers, catalog }`. `build_provider` remains as shorthand. The agent builds through the registry. Injecting a custom registry into `Agent` comes with the library facade (P6.1).
+- [x] **P2.9 Recorded-fixture tests.** For each adapter: request-body golden tests, and replayed recorded streams (SSE / NDJSON fixture files) through the decoder → `ProviderEvent`s → `ResponseAccumulator`. No network.
+  - *Done, with a caveat:* every adapter has request-body tests and full stream-translation tests folded through the accumulator. The stream payloads are inline and **hand-written from the documented wire formats, not captured from real traffic**. Replace them with real captures once the live tests have been run.
 
 **Exit criteria:** the same agent turn (with a tool call) runs on OpenAI, Anthropic and Ollama by config switch only; all three pass fixture tests; a live smoke test (P7.2) passes for every provider whose credentials are available, with results recorded in the status table.
 
@@ -245,6 +253,7 @@ Start P7.1 to P7.3 alongside P2; they are infrastructure the other phases need.
 
 - [ ] **P7.1 HTTP mock tests.** Add `wiremock` (dev-dep) and cover `stream` end-to-end per adapter: retries, rate limits with `retry_after`, mid-stream disconnects, malformed chunks.
 - [ ] **P7.2 Live smoke tests.** `#[ignore]`d tests (run via `cargo test -- --ignored`) that hit real OpenAI / Anthropic / Ollama when their env vars are present; a manual CI workflow (`workflow_dispatch`) with secrets. Record results in this plan's status table.
+  - *Partly done (with P2):* `crates/arbe-providers/tests/live.rs` — a text round trip plus a tool round trip (incl. echoing the assistant message back) per provider, each skipped without credentials. Remaining: the `workflow_dispatch` CI job, and actually running them.
 - [ ] **P7.3 Reference MCP server.** A tiny stdio MCP server in `tests/fixtures/` (a small Rust test binary) so `McpClient` and the P4.4 wiring get real process-level integration tests — closing v1's untested-client gap.
 - [ ] **P7.4 Gate enforcement.** Make `ToolExecutor::execute` unreachable except via the gate: e.g. executors receive a `GateToken` that only `execute_gated` can construct. Closes the open item from the 2026-08-04 review.
 - [ ] **P7.5 JSONL read performance.** Fix the deferred `list_turns`/`list_events` full re-read (append-aware index or in-memory tail cache in `SessionStore`).

@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::catalog::ModelCatalog;
 use crate::sse::{SseDecoder, SseItem};
 use crate::{
     ModelCapabilities, ModelProvider, ModelRequest, ProviderEvent, ProviderStream, http,
@@ -17,9 +18,14 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// OpenAI Chat Completions adapter. Also the adapter for any
 /// OpenAI-compatible endpoint (via `with_base_url`).
 pub struct OpenAiProvider {
+    /// `"openai"`, or `"openai_compatible"` for other servers speaking the
+    /// same API (which changes catalog lookups and makes the key optional).
+    id: &'static str,
     client: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
     base_url: String,
+    extra_headers: Vec<(String, String)>,
+    catalog: ModelCatalog,
 }
 
 impl OpenAiProvider {
@@ -27,15 +33,40 @@ impl OpenAiProvider {
     /// hardcode or log it.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            id: "openai",
+            client: http::client(),
+            api_key: Some(api_key.into()),
             base_url: DEFAULT_BASE_URL.to_string(),
+            extra_headers: Vec::new(),
+            catalog: ModelCatalog::new(),
+        }
+    }
+
+    /// Any server implementing the Chat Completions API (vLLM, LM Studio,
+    /// llama.cpp, OpenRouter, ...). Local servers often need no key.
+    pub fn compatible(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+        Self {
+            id: "openai_compatible",
+            api_key: api_key.filter(|k| !k.is_empty()),
+            base_url: base_url.into(),
+            ..Self::new("")
         }
     }
 
     /// Overrides the API base URL, e.g. to point at a compatible gateway.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Headers sent on every request (gateway routing, attribution, ...).
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    pub fn with_catalog(mut self, catalog: ModelCatalog) -> Self {
+        self.catalog = catalog;
         self
     }
 }
@@ -418,20 +449,11 @@ fn translate_chunk(
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
     fn id(&self) -> &str {
-        "openai"
+        self.id
     }
 
-    fn capabilities(&self, _model: &str) -> ModelCapabilities {
-        // Per-model values arrive with the model catalog (v2 plan P2.6);
-        // until then, conservative values that hold for current models.
-        ModelCapabilities {
-            streaming: true,
-            tool_calls: true,
-            vision: true,
-            thinking: false,
-            prompt_caching: true,
-            max_context_tokens: 128_000,
-        }
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        self.catalog.lookup(self.id, model)
     }
 
     async fn stream(
@@ -440,11 +462,14 @@ impl ModelProvider for OpenAiProvider {
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
         let body = build_request_body(&req);
-        let request = self
+        let mut request = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
             .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let request = http::with_extra_headers(request, &self.extra_headers);
         let response = http::send(request, &cancel).await?;
 
         let events = async_stream::stream! {
@@ -496,6 +521,7 @@ mod tests {
             temperature: 0.2,
             max_tokens: 100,
             tools: Vec::new(),
+            thinking_budget_tokens: None,
         }
     }
 

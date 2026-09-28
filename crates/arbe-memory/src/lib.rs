@@ -13,7 +13,7 @@ pub mod truncation;
 pub use compact_summary::CompactWithSummaryStrategy;
 pub use history::HistoryEntry;
 pub use pipeline::ContextPipeline;
-pub use tokens::{estimate_message_tokens, estimate_tokens};
+pub use tokens::{TokenCalibration, estimate_message_tokens, estimate_tokens};
 pub use truncation::TruncationStrategy;
 
 use serde::{Deserialize, Serialize};

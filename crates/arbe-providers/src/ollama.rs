@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::catalog::ModelCatalog;
 use crate::{
     ModelCapabilities, ModelProvider, ModelRequest, ProviderEvent, ProviderStream, http,
     next_call_id,
@@ -15,10 +16,12 @@ use crate::{
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
-/// The context window this adapter asks Ollama for (`options.num_ctx`) and
-/// reports in `capabilities()`. Ollama's own default is smaller and varies
-/// by version, so it's set explicitly to keep the two in agreement.
-const CONTEXT_WINDOW: u64 = 8_192;
+/// The context window requested (`options.num_ctx`) for a model the
+/// catalog has no entry for. Ollama's own default is smaller and varies by
+/// version, so it's always set explicitly — and taken from
+/// `capabilities(model)`, so what the harness budgets for and what the
+/// server allocates always agree (override per model via the catalog).
+pub(crate) const CONTEXT_WINDOW: u64 = 8_192;
 
 pub struct OllamaProvider {
     client: reqwest::Client,
@@ -29,15 +32,22 @@ pub struct OllamaProvider {
     /// up front, so this learns it per model: the first rejection is
     /// retried without tools, and later requests for that model skip them.
     tools_unsupported: Mutex<HashSet<String>>,
+    catalog: ModelCatalog,
 }
 
 impl OllamaProvider {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http::client(),
             base_url: DEFAULT_BASE_URL.to_string(),
             tools_unsupported: Mutex::new(HashSet::new()),
+            catalog: ModelCatalog::new(),
         }
+    }
+
+    pub fn with_catalog(mut self, catalog: ModelCatalog) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -235,7 +245,7 @@ fn tool_name_for(messages: &[Message], tool_use_id: &str) -> Option<String> {
         })
 }
 
-fn build_request_body(req: &ModelRequest) -> ChatRequest {
+fn build_request_body(req: &ModelRequest, context_window: u64) -> ChatRequest {
     ChatRequest {
         model: req.model.clone(),
         messages: req
@@ -259,7 +269,7 @@ fn build_request_body(req: &ModelRequest) -> ChatRequest {
         options: ChatOptions {
             temperature: req.temperature,
             num_predict: req.max_tokens,
-            num_ctx: CONTEXT_WINDOW,
+            num_ctx: context_window,
         },
     }
 }
@@ -368,14 +378,9 @@ impl ModelProvider for OllamaProvider {
     }
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
-        ModelCapabilities {
-            streaming: true,
-            tool_calls: !self.model_lacks_tools(model),
-            vision: false,
-            thinking: false,
-            prompt_caching: false,
-            max_context_tokens: CONTEXT_WINDOW,
-        }
+        let mut caps = self.catalog.lookup("ollama", model);
+        caps.tool_calls &= !self.model_lacks_tools(model);
+        caps
     }
 
     async fn stream(
@@ -383,7 +388,8 @@ impl ModelProvider for OllamaProvider {
         req: ModelRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
-        let mut body = build_request_body(&req);
+        let context_window = self.capabilities(&req.model).max_context_tokens;
+        let mut body = build_request_body(&req, context_window);
         if self.model_lacks_tools(&req.model) {
             body.tools.clear();
         }
@@ -450,11 +456,12 @@ mod tests {
             temperature: 0.2,
             max_tokens: 100,
             tools,
+            thinking_budget_tokens: None,
         }
     }
 
     fn body_json(req: &ModelRequest) -> serde_json::Value {
-        serde_json::to_value(build_request_body(req)).unwrap()
+        serde_json::to_value(build_request_body(req, CONTEXT_WINDOW)).unwrap()
     }
 
     #[test]

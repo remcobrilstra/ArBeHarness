@@ -8,19 +8,27 @@
 //! [`http::cancellable`], not per adapter.
 
 pub mod accumulator;
+pub mod anthropic;
+pub mod catalog;
 pub mod error_map;
 pub mod event;
 pub mod http;
 pub mod ollama;
 pub mod openai;
+pub mod registry;
+pub mod retry;
 pub mod sse;
 pub mod utf8_buffer;
 
 pub use accumulator::{AccumulatedResponse, ResponseAccumulator};
+pub use anthropic::AnthropicProvider;
 pub use arbe_core::{StopReason, Usage};
+pub use catalog::ModelCatalog;
 pub use event::ProviderEvent;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
+pub use registry::{ProviderFactory, ProviderRegistry, ProviderSettings};
+pub use retry::{RetryNotice, RetryPolicy, stream_with_retry};
 pub use tokio_util::sync::CancellationToken;
 
 use arbe_core::{Message, ProviderError, RequestedToolCall};
@@ -53,6 +61,11 @@ pub struct ModelRequest {
     /// Tools the model may call (empty when none are offered).
     #[serde(default)]
     pub tools: Vec<arbe_core::ToolSpec>,
+    /// Extended-thinking budget, for models that support it
+    /// (`ModelCapabilities::thinking`). `None` = no extended thinking;
+    /// adapters for providers without the feature ignore it.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u64>,
 }
 
 /// A provider's event stream. Ends after the provider's last event, or
@@ -130,39 +143,23 @@ pub async fn infer(
     Ok(acc.finish().into())
 }
 
-/// Config-driven construction so swapping providers is a config change,
-/// not a code change (overall design §7, implementation plan Phase 2 exit
-/// criteria: "same prompt runs on both adapters by config switch only").
-///
-/// `api_key` is required for `"openai"` and ignored for `"ollama"`; per
-/// NFR-4 it must come from env/config indirection, never a literal in code.
+/// Builds one of the builtin providers by id with just a key and base URL
+/// — shorthand for [`ProviderRegistry::with_builtins`] + `build`. Keeps
+/// swapping providers a config change, not a code change (overall design
+/// §7). Keys must come from env/config indirection, never a literal (NFR-4).
 pub fn build_provider(
     provider_name: &str,
     api_key: Option<String>,
     base_url: Option<String>,
 ) -> Result<Box<dyn ModelProvider>, ProviderError> {
-    match provider_name {
-        "openai" => {
-            let api_key = api_key.ok_or_else(|| {
-                ProviderError::Auth("openai provider requires an api_key".to_string())
-            })?;
-            let mut provider = OpenAiProvider::new(api_key);
-            if let Some(base_url) = base_url {
-                provider = provider.with_base_url(base_url);
-            }
-            Ok(Box::new(provider))
-        }
-        "ollama" => {
-            let mut provider = OllamaProvider::new();
-            if let Some(base_url) = base_url {
-                provider = provider.with_base_url(base_url);
-            }
-            Ok(Box::new(provider))
-        }
-        other => Err(ProviderError::InvalidRequest(format!(
-            "unknown provider: {other}"
-        ))),
-    }
+    ProviderRegistry::with_builtins().build(
+        provider_name,
+        ProviderSettings {
+            api_key,
+            base_url,
+            ..Default::default()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -175,6 +172,17 @@ mod tests {
         let provider = build_provider("openai", Some("sk-test".to_string()), None).unwrap();
         assert_eq!(provider.id(), "openai");
         assert!(provider.capabilities("gpt-5").tool_calls);
+    }
+
+    #[test]
+    fn builds_anthropic_provider_with_api_key_and_requires_one() {
+        let provider = build_provider("anthropic", Some("sk-ant".to_string()), None).unwrap();
+        assert_eq!(provider.id(), "anthropic");
+        assert!(provider.capabilities("claude-sonnet-5").thinking);
+        assert!(matches!(
+            build_provider("anthropic", None, None),
+            Err(ProviderError::Auth(_))
+        ));
     }
 
     #[test]
@@ -241,6 +249,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 10,
             tools: vec![],
+            thinking_budget_tokens: None,
         }
     }
 

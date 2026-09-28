@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use arbe_core::ApprovalPolicyMode;
+use arbe_providers::RetryPolicy;
 
 /// Runtime configuration for one `Agent` (overall design §7 config schema
 /// draft). `from_env` provides sane, no-network-required defaults
@@ -13,6 +14,9 @@ pub struct RuntimeConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Extra HTTP headers for every provider request, e.g. for a gateway
+    /// (`ARBE_HTTP_HEADERS="Name: value; Other: value"`).
+    pub extra_headers: Vec<(String, String)>,
     pub temperature: f32,
     pub max_tokens: u64,
     /// Total token budget for an assembled context. `None` (the default)
@@ -35,6 +39,12 @@ pub struct RuntimeConfig {
     /// (`ARBE_MAX_TOOL_ROUNDS`, default 50). Real multi-step work routinely
     /// needs dozens of tool calls; this is a runaway guard, not a budget.
     pub max_tool_rounds: u32,
+    /// Retry/backoff for transient provider failures. `ARBE_MAX_RETRIES`
+    /// overrides the retry count (0 disables retrying).
+    pub retry: RetryPolicy,
+    /// Extended-thinking budget for models that support it (Anthropic).
+    /// `None` (default) disables extended thinking.
+    pub thinking_budget_tokens: Option<u64>,
     /// The directory the agent operates *in* — usually the repo it's
     /// working on. This is distinct from `ARBE_HOME`/`~/.arbe/`, which is
     /// where the harness's own persistent state (sessions, skills, memory)
@@ -46,10 +56,11 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     /// Reasonable defaults, overridable via env vars so the TUI is usable
-    /// without editing code: `ARBE_PROVIDER` (default `ollama`),
-    /// `ARBE_MODEL` (default `llama3.1` — tool-capable; for OpenAI `gpt-5-mini`), `ARBE_BASE_URL`, `OPENAI_API_KEY`
-    /// (only consulted when `ARBE_PROVIDER=openai` — NFR-4: keys come from
-    /// env, never a literal in code), and `ARBE_WORKDIR` (default: the
+    /// without editing code: `ARBE_PROVIDER` (`ollama` default, `openai`,
+    /// `anthropic`), `ARBE_MODEL` (per-provider default, see
+    /// `default_model`), `ARBE_BASE_URL`, the provider's API key (see
+    /// `api_key_from_env` — NFR-4: keys come from env, never a literal in
+    /// code), `ARBE_THINKING_BUDGET`, and `ARBE_WORKDIR` (default: the
     /// process's current directory) for the project the agent works on.
     /// Note this is separate from `ARBE_HOME`, which relocates the
     /// harness's *own* storage root (`~/.arbe/`) and is a dev/test-only
@@ -57,7 +68,6 @@ impl RuntimeConfig {
     pub fn from_env() -> Self {
         let provider_name = std::env::var("ARBE_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
         let is_openai = provider_name == "openai";
-        let default_model = if is_openai { "gpt-5-mini" } else { "llama3.1" };
         // OpenAI's newer reasoning-family models (o1/o3/gpt-5) reject any
         // temperature other than the default (1) with a 400 error; older
         // chat models tolerate a lower temperature fine, but 1 is a safe
@@ -66,9 +76,13 @@ impl RuntimeConfig {
         let default_temperature = if is_openai { 1.0 } else { 0.2 };
         Self {
             profile: "default".to_string(),
-            model: std::env::var("ARBE_MODEL").unwrap_or_else(|_| default_model.to_string()),
-            api_key: std::env::var("OPENAI_API_KEY").ok(),
+            model: std::env::var("ARBE_MODEL")
+                .unwrap_or_else(|_| default_model(&provider_name).to_string()),
+            api_key: api_key_from_env(&provider_name),
             base_url: std::env::var("ARBE_BASE_URL").ok(),
+            extra_headers: std::env::var("ARBE_HTTP_HEADERS")
+                .map(|v| parse_headers(&v))
+                .unwrap_or_default(),
             temperature: env_parse("ARBE_TEMPERATURE").unwrap_or(default_temperature),
             max_tokens: 4096,
             context_budget_tokens: env_parse("ARBE_CONTEXT_BUDGET"),
@@ -79,6 +93,12 @@ impl RuntimeConfig {
             hook_timeout_ms: 500,
             session_approval_covers_high_risk: false,
             max_tool_rounds: env_parse("ARBE_MAX_TOOL_ROUNDS").unwrap_or(DEFAULT_MAX_TOOL_ROUNDS),
+            retry: RetryPolicy {
+                max_retries: env_parse("ARBE_MAX_RETRIES")
+                    .unwrap_or(RetryPolicy::default().max_retries),
+                ..RetryPolicy::default()
+            },
+            thinking_budget_tokens: env_parse("ARBE_THINKING_BUDGET"),
             provider_name,
             project_dir: std::env::var("ARBE_WORKDIR")
                 .map(PathBuf::from)
@@ -105,6 +125,41 @@ impl RuntimeConfig {
 
 const DEFAULT_MAX_TOOL_ROUNDS: u32 = 50;
 
+/// Parses `"Name: value; Other: value"`. Entries without a `:` or with an
+/// empty name are ignored rather than failing startup.
+fn parse_headers(raw: &str) -> Vec<(String, String)> {
+    raw.split(';')
+        .filter_map(|entry| {
+            let (name, value) = entry.split_once(':')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The model used when `ARBE_MODEL` isn't set.
+fn default_model(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "gpt-5-mini",
+        "anthropic" => "claude-sonnet-5",
+        // Tool-capable, unlike the original `llama3`.
+        _ => "llama3.1",
+    }
+}
+
+/// The provider's conventional key variable, falling back to the generic
+/// `ARBE_API_KEY` (e.g. for an OpenAI-compatible gateway).
+fn api_key_from_env(provider: &str) -> Option<String> {
+    let specific = match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    };
+    specific
+        .and_then(|var| std::env::var(var).ok())
+        .or_else(|| std::env::var("ARBE_API_KEY").ok())
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok().and_then(|v| v.parse().ok())
 }
@@ -119,6 +174,17 @@ mod tests {
             max_tokens,
             ..RuntimeConfig::from_env()
         }
+    }
+
+    #[test]
+    fn parses_header_lists_and_skips_malformed_entries() {
+        assert_eq!(
+            parse_headers("HTTP-Referer: https://x.dev; X-Title:ArBe ;junk; :empty"),
+            vec![
+                ("HTTP-Referer".to_string(), "https://x.dev".to_string()),
+                ("X-Title".to_string(), "ArBe".to_string()),
+            ]
+        );
     }
 
     #[test]

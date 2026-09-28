@@ -48,7 +48,15 @@ Phase 7 (hardening) is done: cross-crate integration coverage was added at the `
 - `ToolExecutor::execute(invocation, &ToolContext)` — `ToolContext` carries a `CancellationToken` and optional progress sink; `execute` kills its whole process tree on cancel/timeout. Tool unit tests use the test-only `ExecuteWithDefaultContext::execute_default`.
 - `Turn` (schema v2) stores the turn's full `messages` list plus `usage`/`stop_reason`; v1 records are converted on read. `SessionMeta` has cumulative `usage` and a `title`.
 - `EventBus` publishes `EventEnvelope { seq, event }` (gap-free `seq`). New events: `ThinkingDelta`, `ToolUseStarted`, `ToolUseInputDelta`, `ToolProgress`, `UsageUpdated`, `CompactionPerformed`, `TurnCancelled`; new command `CancelTurn`.
-- Errors: `ProviderError` gained `RateLimit { retry_after }`, `Overloaded`, `ContextLengthExceeded`, `Cancelled` (+ `is_retryable()`); `HarnessError` gained `Internal`/`Cancelled`; `UserFacing` is implemented.
+- Errors: `ProviderError` gained `RateLimit { retry_after }`, `Overloaded`, `ContextLengthExceeded`, `Unreachable` (not retried), `Network`, `Cancelled` (+ `is_retryable()`); `HarnessError` gained `Internal`/`Cancelled`; `UserFacing` is implemented.
+
+**v2 provider layer** (v2 plan P2, implemented; live runs pending):
+- Providers: `openai`, `openai_compatible` (any Chat Completions server; `base_url` required, key optional), `anthropic`, `ollama` — built via `ProviderRegistry::with_builtins().build(id, ProviderSettings)`. Keys: `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`, falling back to `ARBE_API_KEY`.
+- `ModelCatalog` gives per-model capabilities (context window, vision, thinking) by longest name prefix; adapters answer `capabilities(model)` from it.
+- The agent calls providers through `stream_with_retry` (`RetryPolicy`; retries only before the first event; each retry → `RuntimeEvent::ProviderRetrying`). `http::client()` has connect + idle-read timeouts.
+- `TokenCalibration` (arbe-memory) corrects the chars/4 estimate from reported input tokens; the context budget and the displayed estimate go through it.
+- Live smoke tests: `cargo test -p arbe-providers --test live -- --ignored --nocapture` (each provider skips without credentials). Stream fixtures in unit tests are hand-written from documented formats, not captured traffic.
+- Env knobs added: `ARBE_MAX_RETRIES`, `ARBE_THINKING_BUDGET`, `ARBE_HTTP_HEADERS`, `ARBE_CONTEXT_BUDGET`, `ARBE_MAX_TOOL_ROUNDS`.
 
 v1 is a real, working, tested product core — not a finished release. Work now follows `docs/v2-implementation-plan.md`; its status table is the source of truth for what's done.
 

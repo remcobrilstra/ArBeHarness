@@ -36,6 +36,14 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         delta: String,
     },
+    /// A model request failed transiently (rate limit, overload, timeout)
+    /// and will be retried after `delay_ms`.
+    ProviderRetrying {
+        turn_id: TurnId,
+        attempt: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     /// A fragment of the model's reasoning, for UIs that show it.
     ThinkingDelta {
         turn_id: TurnId,

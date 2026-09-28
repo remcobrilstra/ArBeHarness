@@ -2,6 +2,8 @@
 //! cancellation and status checking, turning a response body into a
 //! line/chunk stream, and making any event stream cancellable.
 
+use std::time::Duration;
+
 use arbe_core::ProviderError;
 use futures_util::StreamExt;
 use futures_util::stream::{BoxStream, Stream};
@@ -10,6 +12,28 @@ use tokio_util::sync::CancellationToken;
 use crate::ProviderEvent;
 use crate::error_map::{map_http_response, map_transport_error};
 use crate::utf8_buffer::Utf8ChunkBuffer;
+
+/// Time allowed to establish a connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Longest a response may go *silent* (between bytes, not in total).
+/// Generous because reasoning models can think for minutes before their
+/// first token; without it, a stalled connection would hang a turn forever.
+pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The HTTP client every adapter uses: connect and idle-read timeouts,
+/// no overall request timeout (a long answer is fine as long as it keeps
+/// arriving).
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_IDLE_TIMEOUT)
+        .build()
+        // Only fails if the TLS backend can't initialize, which would make
+        // every provider unusable anyway; the default client has the same
+        // failure mode (it panics too).
+        .expect("failed to initialize the HTTP client")
+}
 
 /// Sends `request`, racing it against `cancel`. A non-2xx status is read
 /// and mapped into the `ProviderError` taxonomy here, so an adapter only
@@ -34,6 +58,17 @@ pub async fn send(
         body = response.text() => body.map_err(map_transport_error)?,
     };
     Err(map_http_response(status, &headers, &body))
+}
+
+/// Applies configured extra headers to a request.
+pub(crate) fn with_extra_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    request
 }
 
 /// A response body as a stream of UTF-8 text chunks. Multi-byte characters

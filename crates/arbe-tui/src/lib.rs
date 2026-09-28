@@ -172,6 +172,17 @@ fn drain_runtime_events(
                     "calling model (~{estimated_tokens} tokens context)…"
                 ));
             }
+            Ok(RuntimeEvent::ProviderRetrying {
+                attempt,
+                delay_ms,
+                reason,
+                ..
+            }) => {
+                let secs = delay_ms.div_ceil(1000);
+                app.activity = Some(format!(
+                    "{reason} — retrying in {secs}s (attempt {attempt})…"
+                ));
+            }
             Ok(RuntimeEvent::ModelStreamChunk { delta, .. }) => {
                 app.activity = None;
                 app.append_assistant_delta(&delta);

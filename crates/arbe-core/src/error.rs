@@ -26,6 +26,16 @@ pub enum ProviderError {
     Overloaded(String),
     #[error("provider request timed out: {0}")]
     Timeout(String),
+    /// Couldn't connect at all (connection refused, DNS failure). Not
+    /// retried: this almost always means a wrong base URL or a local
+    /// server (Ollama) that isn't running, and backing off just delays
+    /// telling the user.
+    #[error("could not reach provider: {0}")]
+    Unreachable(String),
+    /// The connection failed after it was established (reset, closed
+    /// mid-request). Transient; safe to retry.
+    #[error("network error talking to provider: {0}")]
+    Network(String),
     /// The request's prompt doesn't fit the model's context window.
     #[error("request exceeds the model's context window: {0}")]
     ContextLengthExceeded(String),
@@ -50,7 +60,7 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimit { .. } | Self::Overloaded(_) | Self::Timeout(_)
+            Self::RateLimit { .. } | Self::Overloaded(_) | Self::Timeout(_) | Self::Network(_)
         )
     }
 }
@@ -69,8 +79,11 @@ impl UserFacing for ProviderError {
                 Self::RateLimit { .. } | Self::Overloaded(_) => {
                     "wait a moment and retry, or switch to a different model/provider"
                 }
-                Self::Timeout(_) => {
+                Self::Timeout(_) | Self::Network(_) => {
                     "check network connectivity and that the provider endpoint is reachable"
+                }
+                Self::Unreachable(_) => {
+                    "check the base URL, and that the server is running (for Ollama: `ollama serve`)"
                 }
                 Self::ContextLengthExceeded(_) => {
                     "lower the context budget or compact the conversation"
@@ -202,6 +215,8 @@ mod tests {
         assert!(ProviderError::rate_limit("slow down").is_retryable());
         assert!(ProviderError::Overloaded("busy".into()).is_retryable());
         assert!(ProviderError::Timeout("t".into()).is_retryable());
+        assert!(ProviderError::Network("reset".into()).is_retryable());
+        assert!(!ProviderError::Unreachable("refused".into()).is_retryable());
         assert!(!ProviderError::Auth("bad".into()).is_retryable());
         assert!(!ProviderError::InvalidRequest("bad".into()).is_retryable());
         assert!(!ProviderError::Cancelled.is_retryable());

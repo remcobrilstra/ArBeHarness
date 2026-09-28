@@ -10,11 +10,12 @@ use arbe_core::{
 };
 use arbe_hooks::{HookPhase, HookRegistry};
 use arbe_memory::{
-    CompactWithSummaryStrategy, ContextPipeline, ContextStrategy, HistoryEntry, TruncationStrategy,
+    CompactWithSummaryStrategy, ContextPipeline, ContextStrategy, HistoryEntry, TokenCalibration,
+    TruncationStrategy,
 };
 use arbe_providers::{
     AccumulatedResponse, CancellationToken, ModelProvider, ModelRequest, ProviderEvent,
-    ResponseAccumulator, build_provider,
+    ProviderRegistry, ProviderSettings, ResponseAccumulator, RetryPolicy, stream_with_retry,
 };
 use arbe_skills::SkillScope;
 use arbe_storage::SessionStore;
@@ -181,8 +182,11 @@ pub struct Agent {
     pipeline: ContextPipeline,
     strategy: Box<dyn ContextStrategy>,
     budget_tokens: u64,
-    /// Runaway guard for `run_tool_loop` — see `RuntimeConfig::max_tool_rounds`.
+    /// Runaway guard for `run_model_loop` — see `RuntimeConfig::max_tool_rounds`.
     max_tool_rounds: u32,
+    retry: RetryPolicy,
+    /// See `RuntimeConfig::thinking_budget_tokens`.
+    thinking_budget_tokens: Option<u64>,
     temperature: f32,
     max_tokens: u64,
     registry: ToolRegistry,
@@ -199,6 +203,9 @@ pub struct Agent {
     /// just be a plain field reached through `&mut self`.
     tool_decisions: ToolDecisions,
     last_estimated_tokens: u64,
+    /// Corrects the chars/4 token estimate from provider-reported input
+    /// counts; budgets and displayed estimates go through it.
+    token_calibration: TokenCalibration,
     /// The repo/project this agent works on — see `RuntimeConfig::project_dir`.
     /// This is the sandbox root every builtin filesystem/execute tool is
     /// registered against in `assemble`.
@@ -213,10 +220,14 @@ impl Agent {
         events: Arc<EventBus>,
         history: Vec<HistoryEntry>,
     ) -> Result<Self, ProviderError> {
-        let provider = build_provider(
+        let provider = ProviderRegistry::with_builtins().build(
             &config.provider_name,
-            config.api_key.clone(),
-            config.base_url.clone(),
+            ProviderSettings {
+                api_key: config.api_key.clone(),
+                base_url: config.base_url.clone(),
+                extra_headers: config.extra_headers.clone(),
+                ..Default::default()
+            },
         )?;
 
         let mut registry = ToolRegistry::new();
@@ -236,6 +247,8 @@ impl Agent {
             strategy: build_strategy(&config.memory_strategy),
             budget_tokens,
             max_tool_rounds: config.max_tool_rounds,
+            retry: config.retry,
+            thinking_budget_tokens: config.thinking_budget_tokens,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             registry,
@@ -256,6 +269,7 @@ impl Agent {
             pending_tool_calls: HashMap::new(),
             tool_decisions: ToolDecisions::default(),
             last_estimated_tokens: 0,
+            token_calibration: TokenCalibration::default(),
             project_dir: config.project_dir.clone(),
         })
     }
@@ -415,12 +429,15 @@ impl Agent {
             &self.history,
             &self.pinned_turn_indices,
             user_message.clone(),
-            self.budget_tokens,
+            // The pipeline budgets in estimator units; convert so the
+            // *real* prompt lands inside the budget.
+            self.token_calibration
+                .budget_in_estimate_units(self.budget_tokens),
         );
-        self.last_estimated_tokens = context.estimated_tokens;
+        self.last_estimated_tokens = self.token_calibration.calibrate(context.estimated_tokens);
         self.events.publish(RuntimeEvent::ContextBuilt {
             turn_id,
-            estimated_tokens: context.estimated_tokens,
+            estimated_tokens: self.last_estimated_tokens,
         });
 
         advance(&mut machine, LoopPhase::PlanOrDirectRespond)?;
@@ -432,7 +449,14 @@ impl Agent {
         };
 
         let outcome = self
-            .run_model_loop(turn_id, context.messages, tool_specs, &mut machine, &cancel)
+            .run_model_loop(
+                turn_id,
+                context.messages,
+                context.estimated_tokens,
+                tool_specs,
+                &mut machine,
+                &cancel,
+            )
             .await?;
 
         let assistant_message = Message::new(Role::Assistant, outcome.text.clone());
@@ -486,19 +510,33 @@ impl Agent {
         Ok(outcome.text)
     }
 
-    /// Streams one inference call, forwarding deltas as `RuntimeEvent`s as
-    /// they arrive, and returns the accumulated response.
+    /// Streams one inference call (retrying transient failures per
+    /// `self.retry`, each announced as `ProviderRetrying`), forwarding
+    /// deltas as `RuntimeEvent`s as they arrive, and returns the
+    /// accumulated response.
     async fn stream_inference(
         &self,
         turn_id: TurnId,
         request: ModelRequest,
         cancel: &CancellationToken,
     ) -> Result<AccumulatedResponse, HarnessError> {
-        let mut stream = self
-            .provider
-            .stream(request, cancel.clone())
-            .await
-            .map_err(provider_error)?;
+        let events = &self.events;
+        let mut stream = stream_with_retry(
+            self.provider.as_ref(),
+            request,
+            cancel,
+            &self.retry,
+            |notice| {
+                events.publish(RuntimeEvent::ProviderRetrying {
+                    turn_id,
+                    attempt: notice.attempt,
+                    delay_ms: notice.delay.as_millis() as u64,
+                    reason: notice.reason.clone(),
+                })
+            },
+        )
+        .await
+        .map_err(provider_error)?;
         let mut acc = ResponseAccumulator::new();
         while let Some(event) = stream.next().await {
             let event = event.map_err(provider_error)?;
@@ -546,6 +584,7 @@ impl Agent {
         &mut self,
         turn_id: TurnId,
         mut messages: Vec<Message>,
+        estimated_prompt_tokens: u64,
         tool_specs: Vec<ToolSpec>,
         machine: &mut LoopMachine,
         cancel: &CancellationToken,
@@ -566,9 +605,19 @@ impl Agent {
                 temperature: self.temperature,
                 max_tokens: self.max_tokens,
                 tools: tool_specs.clone(),
+                thinking_budget_tokens: self.thinking_budget_tokens,
             };
             let response = self.stream_inference(turn_id, request, cancel).await?;
             usage += response.usage;
+            if round == 0 {
+                // Only the first round's prompt is exactly what was
+                // estimated; later rounds add the tool trace.
+                let actual = response.usage.input_tokens
+                    + response.usage.cache_read_tokens
+                    + response.usage.cache_write_tokens;
+                self.token_calibration
+                    .observe(estimated_prompt_tokens, actual);
+            }
             let tool_calls = response.message.tool_uses();
 
             self.hooks
@@ -995,7 +1044,7 @@ mod tests {
         (SessionStore::with_root(dir.clone()), dir)
     }
 
-    // build_provider() only knows "openai"/"ollama", so tests construct the
+    // The registry only knows real providers, so tests construct the
     // Agent's pieces directly rather than through Agent::create/resume
     // (those exist to wire a real provider from config).
     fn agent_with_fake_provider(
@@ -1011,6 +1060,8 @@ mod tests {
             strategy: Box::new(TruncationStrategy),
             budget_tokens: 8_000,
             max_tool_rounds: 50,
+            retry: RetryPolicy::none(),
+            thinking_budget_tokens: None,
             temperature: 0.2,
             max_tokens: 100,
             registry: ToolRegistry::new(),
@@ -1024,7 +1075,13 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             tool_decisions: ToolDecisions::default(),
             last_estimated_tokens: 0,
-            project_dir: std::path::PathBuf::from("."),
+            token_calibration: TokenCalibration::default(),
+            // A directory that doesn't exist: no project instruction files,
+            // so tests don't depend on this repo's own CLAUDE.md.
+            project_dir: std::env::temp_dir().join(format!(
+                "arbe-agent-test-no-project-{}",
+                uuid::Uuid::new_v4()
+            )),
         }
     }
 
@@ -1498,6 +1555,58 @@ mod tests {
                 .text()
                 .contains("no tool registered")
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Answers "ok" and reports a fixed, very large input token count.
+    struct BigInputProvider;
+
+    #[async_trait]
+    impl ModelProvider for BigInputProvider {
+        fn id(&self) -> &str {
+            "big-input"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            fake_capabilities(false)
+        }
+
+        async fn stream(
+            &self,
+            _req: ModelRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            Ok(scripted(vec![
+                ProviderEvent::TextDelta("ok".to_string()),
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 10_000_000,
+                    output_tokens: 1,
+                    ..Default::default()
+                }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_input_tokens_calibrate_later_estimates() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.provider = Box::new(BigInputProvider);
+
+        agent.submit_message("hi".to_string()).await.unwrap();
+        // Far more real tokens than estimated: the factor moves up
+        // (clamped per observation, smoothed across them).
+        let factor = agent.token_calibration.factor();
+        assert!(factor > 1.0, "factor {factor}");
+
+        agent.submit_message("hi".to_string()).await.unwrap();
+        // Each turn's first request is another observation.
+        assert!(agent.token_calibration.factor() > factor);
 
         std::fs::remove_dir_all(&dir).ok();
     }

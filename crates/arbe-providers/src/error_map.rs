@@ -58,12 +58,33 @@ fn is_context_length_error(body: &str) -> bool {
     .any(|needle| body.contains(needle))
 }
 
+/// Transport-level failures: timeouts and mid-request drops are
+/// transient; failing to connect at all is not (see
+/// `ProviderError::Unreachable`). `{:#}`-style source chains are included
+/// because reqwest's top-level message alone ("error sending request") is
+/// rarely enough to act on.
 pub fn map_transport_error(err: reqwest::Error) -> ProviderError {
+    let message = error_chain(&err);
     if err.is_timeout() {
-        ProviderError::Timeout(err.to_string())
+        ProviderError::Timeout(message)
+    } else if err.is_connect() {
+        ProviderError::Unreachable(message)
+    } else if err.is_request() || err.is_body() {
+        ProviderError::Network(message)
     } else {
-        ProviderError::Internal(err.to_string())
+        ProviderError::Internal(message)
     }
+}
+
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 #[cfg(test)]
