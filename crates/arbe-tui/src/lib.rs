@@ -89,9 +89,18 @@ pub fn run(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    // Stop any in-flight turn (it persists what it has) and flush session
-    // state (TUI-FR-3: "exit safely with state flush").
-    agent.cancel_turn();
+    // Stop any in-flight turn and give it a moment to persist what it has
+    // before the process exits (TUI-FR-3: "exit safely with state flush").
+    // If it doesn't finish in time, the in-flight log still lets the next
+    // resume recover it.
+    if agent.cancel_turn() {
+        for _ in 0..40 {
+            if !agent.is_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     let _ = agent.close();
 
     result
@@ -534,10 +543,16 @@ fn submit_input(
     handle: &Handle,
     outcome_tx: &Sender<AgentOutcome>,
 ) {
-    let content = app.take_input();
-    if content.is_empty() {
+    if app.input.trim().is_empty() {
         return;
     }
+    if agent.is_busy() {
+        // Keep what was typed; nothing is sent until the turn ends.
+        app.notice =
+            Some("a turn is in progress — wait for it, or press Esc to cancel".to_string());
+        return;
+    }
+    let content = app.take_input();
     app.status_message = None;
     app.notice = None;
 

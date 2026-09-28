@@ -7,6 +7,7 @@ Full specs live in `/docs` — read them before making architectural decisions, 
 - `docs/v1-harness-spec.md` — functional/non-functional requirements, core trait signatures, persistence + error taxonomy
 - `docs/v1-implementation-plan.md` — phase-by-phase delivery plan, per-crate backlog, config schema, risk register
 - `docs/v1-tui-spec.md` — TUI requirements, event contract, keybindings
+- `docs/user-guide.md` — the end-user guide (keep in sync with behavior, see Working conventions)
 - `docs/v2-implementation-plan.md` — **the active plan.** Phased v2 roadmap (P0–P7) with a status table and per-task checkboxes; read this first to know what's in progress and what's next, and keep it updated as work lands
 - `docs/v1-status.md` — frozen v1 acceptance-criteria checklist (historical; superseded by the v2 plan's status table)
 - `docs/user-guide.md` — **end-user documentation** (CLI args, env vars, providers, keybindings, chat commands, tools/approvals, instruction & skill files, sessions, `~/.arbe/` layout, file formats, logs). See the doc-maintenance rule under "Working conventions".
@@ -91,4 +92,5 @@ cargo run
 - Prefer adding to the existing crate/module structure implied by the current phase over introducing new crates ahead of schedule.
 - Config-first: new strategies/behaviors should be selectable via config (see the `[profile]`/`[memory]`/`[tools]`/`[hooks]`/`[mcp]` schema draft in the implementation plan), not hardcoded branches.
 - When a phase's exit criteria aren't met yet, say so explicitly rather than marking it done.
+- `docs/user-guide.md` describes what the harness does *today* for end users. Any change to CLI flags, env vars, keybindings, chat commands, tools, file locations/formats, or visible behavior updates it in the same commit; features that exist but aren't connected go under its "Not yet active" section.
 - **Keep `docs/user-guide.md` in sync — part of Definition of Done.** Any change that affects what an end user sees or configures must update the guide in the same change: CLI flags (`src/main.rs`), env vars/defaults (`RuntimeConfig::from_env`), providers/default models/context windows (`arbe-providers` registry/catalog), keybindings or chat commands (`arbe-tui`), builtin tools, their args, limits, or risk levels (`arbe-tools::builtin`), approval behavior, files read/written under `~/.arbe/` or the workdir, and on-disk formats (`meta.json`, `turns.jsonl`, skill/instruction files). When a feature listed in the guide's "Not yet active" table gets wired up, move it into the relevant section. Describe only what actually works — never document planned behavior as current.
