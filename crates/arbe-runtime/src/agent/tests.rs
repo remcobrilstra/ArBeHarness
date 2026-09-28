@@ -267,6 +267,7 @@ fn test_parts(
         next_turn_index: 0,
         skill_instructions: Vec::new(),
         allowed_tools: None,
+        startup_warnings: Vec::new(),
     }
 }
 
@@ -1179,5 +1180,46 @@ async fn reference_mcp_server_tools_are_usable_through_the_agent() {
     let (_, text, is_error) = tool_result_of(&message, 0);
     assert!(!is_error, "{text}");
     assert!(text.contains("through the agent"));
+    std::fs::remove_dir_all(&store_dir).ok();
+}
+
+#[tokio::test]
+async fn project_skills_are_indexed_on_demand_or_inlined_always() {
+    let project = temp_dir("skills-project");
+    let skill_dir = project.join(".arbe").join("skills");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("deploy.md"),
+        "---\nname: arbe-test-deploy\ndescription: How to ship\n---\nRun make release.",
+    )
+    .unwrap();
+    let store_dir = temp_dir("skills-store");
+    let make = |mode: crate::SkillsMode| {
+        let config = crate::RuntimeConfig {
+            provider_name: "ollama".into(),
+            skills_mode: mode,
+            ..crate::RuntimeConfig::defaults(project.clone())
+        };
+        Agent::create(
+            &config,
+            SessionStore::with_root(store_dir.clone()),
+            Arc::new(EventBus::default()),
+        )
+        .unwrap()
+    };
+
+    let on_demand = make(crate::SkillsMode::OnDemand);
+    let instructions = on_demand.state().pipeline.skill_instructions.join("\n");
+    assert!(instructions.contains("- arbe-test-deploy: How to ship"));
+    assert!(!instructions.contains("Run make release."));
+    // (The tool's behavior is covered in `skills.rs`.)
+    assert!(on_demand.registry_snapshot().contains("load_skill"));
+
+    let always = make(crate::SkillsMode::Always);
+    let instructions = always.state().pipeline.skill_instructions.join("\n");
+    assert!(instructions.contains("Run make release."));
+    assert!(!always.registry_snapshot().contains("load_skill"));
+
+    std::fs::remove_dir_all(&project).ok();
     std::fs::remove_dir_all(&store_dir).ok();
 }

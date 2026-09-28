@@ -35,7 +35,7 @@ pub fn parse_manifest(
         });
     };
     let frontmatter = &rest[..end];
-    let body = rest[end + "\n---".len()..].trim_start_matches('\n');
+    let body = rest[end + "\n---".len()..].trim_start_matches(['\r', '\n']);
 
     let mut name = None;
     let mut description = None;
@@ -118,6 +118,19 @@ mod tests {
         let err =
             parse_manifest("---\nname: x\n---\nbody", SkillScope::Global, "test.md").unwrap_err();
         assert!(matches!(err, SkillError::Malformed { .. }));
+    }
+
+    #[test]
+    fn windows_line_endings_are_accepted() {
+        let manifest = parse_manifest(
+            "---\r\nname: x\r\ndescription: y\r\n---\r\nbody\r\n",
+            SkillScope::Global,
+            "test.md",
+        )
+        .unwrap();
+        assert_eq!(manifest.name, "x");
+        assert_eq!(manifest.description, "y");
+        assert_eq!(manifest.instructions, "body\r\n");
     }
 
     #[test]

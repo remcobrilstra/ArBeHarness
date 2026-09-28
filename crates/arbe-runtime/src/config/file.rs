@@ -23,6 +23,7 @@ pub struct Layer {
     pub approval: Option<ApprovalSection>,
     pub hooks: Option<HooksSection>,
     pub mcp: Option<McpSection>,
+    pub skills: Option<SkillsSection>,
     /// Tools the model may use, by name (a trailing `*` matches a prefix,
     /// e.g. `"github__*"`). Absent = every registered tool.
     pub tools: Option<Vec<String>>,
@@ -80,6 +81,13 @@ pub struct ApprovalSection {
     pub allow: Option<Vec<String>>,
     pub deny: Option<Vec<String>>,
     pub session_approval_covers_high_risk: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsSection {
+    /// `"on_demand"` (default) or `"always"`.
+    pub mode: Option<String>,
 }
 
 /// `[mcp.servers.<name>]` tables.

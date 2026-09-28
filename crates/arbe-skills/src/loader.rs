@@ -9,32 +9,51 @@ use crate::{SkillManifest, SkillScope};
 /// missing directory is not an error — an empty scope is a normal starting
 /// state (mirrors `arbe_storage::memory_files` treating a missing memory
 /// file as `None`, not a failure).
-pub fn load_dir(dir: &Path, scope: SkillScope) -> Result<Vec<SkillManifest>, SkillError> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+/// What loading a directory found: the skills that parsed, and a
+/// problem for each file that didn't (so one bad file is reported, not
+/// fatal to the rest).
+#[derive(Debug, Default)]
+pub struct Loaded {
+    pub skills: Vec<SkillManifest>,
+    pub problems: Vec<SkillError>,
+}
 
-    let mut manifests = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|source| SkillError::Io {
-        path: dir.display().to_string(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| SkillError::Io {
-            path: dir.display().to_string(),
-            source,
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let text = fs::read_to_string(&path).map_err(|source| SkillError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        manifests.push(parse_manifest(&text, scope, &path.display().to_string())?);
+/// Loads every `*.md` skill directly in `dir` (not subdirectories). A
+/// missing directory is simply empty. Files are read in name order, so
+/// results are stable.
+pub fn load_dir(dir: &Path, scope: SkillScope) -> Loaded {
+    let mut loaded = Loaded::default();
+    if !dir.exists() {
+        return loaded;
     }
-    Ok(manifests)
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            loaded.problems.push(SkillError::Io {
+                path: dir.display().to_string(),
+                source,
+            });
+            return loaded;
+        }
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let parsed = fs::read_to_string(&path)
+            .map_err(|source| SkillError::Io {
+                path: path.display().to_string(),
+                source,
+            })
+            .and_then(|text| parse_manifest(&text, scope, &path.display().to_string()));
+        match parsed {
+            Ok(skill) => loaded.skills.push(skill),
+            Err(problem) => loaded.problems.push(problem),
+        }
+    }
+    loaded
 }
 
 #[cfg(test)]
@@ -45,8 +64,9 @@ mod tests {
     fn missing_directory_yields_no_skills() {
         let dir =
             std::env::temp_dir().join(format!("arbe-skills-missing-{}", uuid::Uuid::new_v4()));
-        let manifests = load_dir(&dir, SkillScope::Global).unwrap();
-        assert!(manifests.is_empty());
+        let loaded = load_dir(&dir, SkillScope::Global);
+        assert!(loaded.skills.is_empty());
+        assert!(loaded.problems.is_empty());
     }
 
     #[test]
@@ -65,12 +85,35 @@ mod tests {
         .unwrap();
         fs::write(dir.join("ignore.txt"), "not a skill").unwrap();
 
-        let mut manifests = load_dir(&dir, SkillScope::ProjectLocal).unwrap();
-        manifests.sort_by(|a, b| a.name.cmp(&b.name));
+        let manifests = load_dir(&dir, SkillScope::ProjectLocal).skills;
 
         assert_eq!(manifests.len(), 2);
         assert_eq!(manifests[0].name, "a");
         assert_eq!(manifests[1].name, "b");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_file_is_reported_and_the_rest_still_load() {
+        let dir = std::env::temp_dir().join(format!("arbe-skills-bad-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("good.md"),
+            "---\nname: good\ndescription: ok\n---\nbody",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("bad.md"),
+            "---\nname: missing-description\n---\nbody",
+        )
+        .unwrap();
+
+        let loaded = load_dir(&dir, SkillScope::Global);
+        assert_eq!(loaded.skills.len(), 1);
+        assert_eq!(loaded.skills[0].name, "good");
+        assert_eq!(loaded.problems.len(), 1);
+        assert!(loaded.problems[0].to_string().contains("bad.md"));
 
         fs::remove_dir_all(&dir).ok();
     }

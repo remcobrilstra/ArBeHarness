@@ -63,6 +63,7 @@ pub fn run(
         agent.model().to_string(),
         agent.project_dir().display().to_string(),
     );
+    show_startup_warnings(&mut app, &agent);
     let mut agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -487,7 +488,21 @@ fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
     app.activity = None;
     app.scroll = 0;
     app.follow_tail = true;
+    show_startup_warnings(app, &new_agent);
     *agent = Arc::new(new_agent);
+}
+
+/// Surfaces problems found while setting up a session (e.g. skipped skill
+/// files) in the status line.
+fn show_startup_warnings(app: &mut App, agent: &Agent) {
+    if let Some(first) = agent.startup_warnings().first() {
+        let more = agent.startup_warnings().len() - 1;
+        app.status_message = Some(if more == 0 {
+            first.clone()
+        } else {
+            format!("{first} (and {more} more)")
+        });
+    }
 }
 
 fn new_session(

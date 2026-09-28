@@ -22,6 +22,17 @@ use arbe_providers::{ModelCatalog, RetryPolicy, catalog};
 pub use crate::system_prompt::PromptTemplate;
 use file::Layer;
 
+/// How skills reach the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsMode {
+    /// Only each skill's name and description go in the prompt; the model
+    /// reads a skill's instructions with the `load_skill` tool when it's
+    /// relevant. Falls back to `Always` for models without tool calling.
+    OnDemand,
+    /// Every skill's full instructions go in every request.
+    Always,
+}
+
 /// Runtime configuration for one `Agent` (overall design §7).
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -60,6 +71,8 @@ pub struct RuntimeConfig {
     /// Tools the model may use (exact names, or `prefix*`). `None` =
     /// every registered tool. See [`tool_allowed`].
     pub tools: Option<Vec<String>>,
+    /// How skills reach the model — see [`SkillsMode`].
+    pub skills_mode: SkillsMode,
     /// MCP servers to connect for each session (enabled ones only).
     pub mcp_servers: Vec<arbe_mcp::McpServerConfig>,
     /// Which system prompt template to render each turn.
@@ -115,6 +128,7 @@ impl RuntimeConfig {
             thinking_budget_tokens: None,
             tools: None,
             mcp_servers: Vec::new(),
+            skills_mode: SkillsMode::OnDemand,
             prompt: PromptTemplate::Coding,
             project_dir,
         }
@@ -255,6 +269,20 @@ impl RuntimeConfig {
         }
         if let Some(h) = &layer.hooks {
             assign(&mut self.hook_timeout_ms, h.timeout_ms);
+        }
+        if let Some(skills) = &layer.skills
+            && let Some(mode) = &skills.mode
+        {
+            self.skills_mode = match mode.as_str() {
+                "on_demand" => SkillsMode::OnDemand,
+                "always" => SkillsMode::Always,
+                other => {
+                    return Err(invalid(
+                        path,
+                        &format!("skills.mode {other:?} is not one of: on_demand, always"),
+                    ));
+                }
+            };
         }
         if let Some(mcp) = &layer.mcp {
             // A later layer's entry replaces the whole server definition.
@@ -735,6 +763,23 @@ mod tests {
         assert!(tool_allowed(&allowed, "github__search"));
         assert!(!tool_allowed(&allowed, "read_files"));
         assert!(!tool_allowed(&allowed, "gitlab__search"));
+    }
+
+    #[test]
+    fn skills_mode_is_configurable_and_validated() {
+        assert_eq!(
+            load(&[], &no_env).unwrap().skills_mode,
+            SkillsMode::OnDemand
+        );
+        let dir = temp_dir();
+        let always = write(&dir, "a.toml", "[skills]\nmode = \"always\"\n");
+        assert_eq!(
+            load(&[always], &no_env).unwrap().skills_mode,
+            SkillsMode::Always
+        );
+        let bad = write(&dir, "b.toml", "[skills]\nmode = \"sometimes\"\n");
+        assert!(load(&[bad], &no_env).is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

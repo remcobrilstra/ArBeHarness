@@ -171,6 +171,7 @@ context_window = 32768
 | `approval.allow` | `[]` | Tools that run without asking in `allowlist_auto` mode. |
 | `approval.deny` | `[]` | Tools that are always refused in `denylist_block` mode. |
 | `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` also covers high-risk tools (`execute`). |
+| `skills.mode` | `on_demand` | `on_demand` or `always`. See [Skills](#skills). |
 | `hooks.timeout_ms` | `500` | Time limit for each hook. (You can't register hooks yet; see [Not yet active](#not-yet-active).) |
 | `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
 | `[[models]]` | none | Corrects the [context-window table](#providers-and-models) for one model: `provider`, exact `name`, `context_window`, and optionally `tool_calls`, `vision`, `thinking`. For Ollama this also sets the context size the server is asked to allocate. |
@@ -453,7 +454,12 @@ The model gets a system prompt made from a built-in template plus up to two inst
 
 ### Skills
 
-A skill is a reusable block of instructions. Put skill files in `~/.arbe/skills/`: one `.md` file per skill, directly in that folder (subfolders are ignored). Every skill found there is added to the context of every request.
+A skill is a reusable block of instructions for a particular kind of work. One `.md` file per skill, directly in one of these folders (subfolders are ignored):
+
+| Folder | Scope |
+|---|---|
+| `~/.arbe/skills/` | Global: every project. |
+| `<workdir>/.arbe/skills/` | Project: this workdir only. A project skill replaces a global skill with the same `name`. |
 
 ```markdown
 ---
@@ -468,7 +474,16 @@ Prefer `thiserror` for error types.
 - `name` and `description` are required. `tags` is an optional comma-separated list.
 - Everything after the second `---` is the instruction text given to the model.
 - Skills load once, when a session starts. Start a new session (`Ctrl+N`) after changing them.
-- **One malformed skill file (missing `name`/`description`, unclosed frontmatter) disables all skills for that session**, and no message is shown. If your skills seem to be ignored, check every file in the folder.
+- A file that can't be loaded (missing `name` or `description`, frontmatter not closed with a second `---`) is skipped, and an `[error]` line names it when the session starts. The other skills still load.
+
+**How the model gets them** is set by `skills.mode` in the [configuration file](#configuration-file):
+
+| `skills.mode` | Behavior |
+|---|---|
+| `on_demand` (default) | Only each skill's name and description go into the system prompt. When the model decides a skill is relevant, it reads the full instructions with the `load_skill` tool (low risk; asks for approval like any tool under `always_prompt`). Keeps the prompt small with many skills. |
+| `always` | Every skill's full instructions are included in every request. |
+
+`on_demand` needs a model that can call tools; with one that can't, skills are always included in full. `load_skill` is available whenever skills are loaded on demand, even if a profile's `tools` list doesn't mention it.
 
 ---
 
@@ -497,7 +512,7 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 | Linux / macOS | `~/.arbe/` (from `$HOME`) |
 | Windows | `%USERPROFILE%\.arbe\`, e.g. `C:\Users\you\.arbe\` |
 
-`--dev-home` / `ARBE_HOME` moves the whole tree. In the workdir, the harness only *reads* `agent.md`/`CLAUDE.md` and `.arbe/config.toml`. It never writes there itself. Only the tools the model calls (and you approve) change files there.
+`--dev-home` / `ARBE_HOME` moves the whole tree. In the workdir, the harness only *reads* `agent.md`/`CLAUDE.md`, `.arbe/config.toml`, and `.arbe/skills/`. It never writes there itself. Only the tools the model calls (and you approve) change files there.
 
 ```text
 ~/.arbe/
@@ -619,7 +634,8 @@ Common problems:
 | `[info] stopped: ...` after a turn | A loop guard ended it: too many tool rounds, the same calls repeated three times, or `ARBE_MAX_TURN_TOKENS` reached. Rephrase, or raise the limit. |
 | `a turn is in progress — ...` | You pressed `Enter` while the agent was working. Your text is kept; send it once the turn ends, or press `Esc` to cancel the turn. |
 | Temperature error from OpenAI | Reasoning models only accept `ARBE_TEMPERATURE=1` (the OpenAI default). |
-| Skills ignored | One skill file is malformed, which disables all of them. See [Skills](#skills). |
+| `skill skipped — malformed skill manifest at ...` | That file is missing `name`/`description` or its closing `---`. The other skills still work. See [Skills](#skills). |
+| A skill seems ignored | With `skills.mode = "on_demand"` the model only reads a skill when it judges it relevant; make the `description` say clearly when to use it, or set `skills.mode = "always"`. |
 | Garbled screen after a crash | The terminal was left in raw mode. Run `reset` (Unix) or open a new terminal window. |
 
 ---
@@ -632,7 +648,7 @@ These have code in the repository but **can't be used yet**. They're listed so y
 |---|---|
 | Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
 | Real summarization of old history | `compact_summary` only notes how much was left out; it doesn't summarize it. |
-| Project-local / session-local skills | Only global skills (`~/.arbe/skills/`) are loaded. |
+| Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
 | Hooks | The hook system exists, but you can't register your own hooks. |
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |

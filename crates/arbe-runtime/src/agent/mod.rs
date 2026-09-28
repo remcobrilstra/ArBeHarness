@@ -14,6 +14,7 @@
 
 mod approvals;
 mod hooks;
+mod skills;
 mod tools;
 mod turn;
 
@@ -37,14 +38,13 @@ use arbe_memory::{
 use arbe_providers::{
     CancellationToken, ModelProvider, ProviderRegistry, ProviderSettings, RetryPolicy,
 };
-use arbe_skills::SkillScope;
 use arbe_storage::SessionStore;
 use arbe_tools::{
     ApprovalContext, ApprovalPolicy, StandardApprovalPolicy, ToolExecutor, ToolRegistry,
 };
 
 use crate::EventBus;
-use crate::config::{RuntimeConfig, tool_allowed};
+use crate::config::{RuntimeConfig, SkillsMode, tool_allowed};
 use crate::system_prompt::PromptTemplate;
 use approvals::ToolDecisions;
 use arbe_mcp::{McpManager, ServerStatus, ToolSink};
@@ -107,6 +107,9 @@ pub struct Agent {
     /// The running turn's cancellation token, if a turn is running.
     active_cancel: Mutex<Option<CancellationToken>>,
     state: Mutex<SessionState>,
+    /// Problems found while setting up the session that the user should
+    /// hear about (e.g. skill files that couldn't be loaded).
+    startup_warnings: Vec<String>,
 }
 
 /// Everything needed to build an `Agent`, however it was obtained (config
@@ -125,6 +128,7 @@ struct Parts {
     next_turn_index: u64,
     skill_instructions: Vec<String>,
     allowed_tools: Option<Vec<String>>,
+    startup_warnings: Vec<String>,
 }
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
@@ -164,21 +168,6 @@ async fn build_system_prompt_async(template: &PromptTemplate, project_dir: &Path
             tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
             crate::system_prompt::render_system_prompt(None, None)
         })
-}
-
-/// Loads global skills from `~/.arbe/skills/` (harness spec FR-6). A
-/// missing/unreadable directory degrades to no skills.
-fn load_global_skill_instructions() -> Vec<String> {
-    match arbe_skills::load_dir(&arbe_storage::paths::skills_dir(), SkillScope::Global) {
-        Ok(global) => arbe_skills::merge_skills(Vec::new(), Vec::new(), global)
-            .into_iter()
-            .map(|m| m.instructions)
-            .collect(),
-        Err(err) => {
-            tracing::warn!(%err, "failed to load global skills; continuing without them");
-            Vec::new()
-        }
-    }
 }
 
 /// Every message of every persisted turn, tagged with its turn index — the
@@ -242,6 +231,7 @@ impl Agent {
             registry: Arc::new(RwLock::new(Arc::new(parts.registry))),
             allowed_tools: parts.allowed_tools,
             mcp: None,
+            startup_warnings: parts.startup_warnings,
             decisions: ToolDecisions::default(),
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
@@ -282,8 +272,29 @@ impl Agent {
         if let Some(allowed) = &config.tools {
             registry.retain(|name| tool_allowed(allowed, name));
         }
-        let budget_tokens = config
-            .effective_context_budget(provider.capabilities(&config.model).max_context_tokens);
+        let capabilities = provider.capabilities(&config.model);
+        let budget_tokens = config.effective_context_budget(capabilities.max_context_tokens);
+
+        let (skills, startup_warnings) =
+            skills::load_session_skills(&arbe_storage::paths::skills_dir(), &config.project_dir);
+        for warning in &startup_warnings {
+            tracing::warn!("{warning}");
+        }
+        // On demand needs tool calling; otherwise every skill goes in the
+        // prompt. The loader is registered after the allow-set is applied:
+        // it's part of how skills work, not a tool a profile opts into.
+        let skill_instructions = if skills.is_empty() {
+            Vec::new()
+        } else if config.skills_mode == SkillsMode::OnDemand && capabilities.tool_calls {
+            let index = skills.index(skills::LOAD_SKILL_TOOL);
+            registry.register(
+                skills::LOAD_SKILL_TOOL,
+                Arc::new(skills::LoadSkillTool::new(skills)),
+            );
+            vec![index]
+        } else {
+            skills.instructions()
+        };
 
         Ok(Self::from_parts(Parts {
             settings: Settings {
@@ -319,8 +330,9 @@ impl Agent {
             registry,
             history,
             next_turn_index,
-            skill_instructions: load_global_skill_instructions(),
+            skill_instructions,
             allowed_tools: config.tools.clone(),
+            startup_warnings,
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }
@@ -470,6 +482,12 @@ impl Agent {
     /// Provider-reported token usage over the whole session.
     pub fn usage(&self) -> Usage {
         self.state().meta.usage
+    }
+
+    /// Problems found while setting up the session (e.g. skill files that
+    /// couldn't be loaded), for the UI to show once.
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.startup_warnings
     }
 
     /// Whether a turn (or manual tool call) is running.
