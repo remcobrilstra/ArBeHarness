@@ -144,10 +144,12 @@ pub(super) async fn run_round(
                     true,
                 )
             });
+            // Redacted before anything else sees it: the model, the
+            // persisted trace, and the transcript.
             ContentBlock::ToolResult {
                 tool_use_id: call.id.clone(),
                 content: vec![ContentBlock::text(truncate_middle(
-                    text,
+                    agent.redactor.redact(&text),
                     agent.settings.max_tool_output_chars,
                 ))],
                 is_error,
@@ -304,7 +306,7 @@ fn publish_executed(
         tool_name: tool_name.to_string(),
         result: ToolResult {
             id,
-            output,
+            output: agent.redactor.redact_value(output),
             is_error,
         },
     });

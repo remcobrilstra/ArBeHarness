@@ -45,6 +45,7 @@ use arbe_tools::{
 
 use crate::EventBus;
 use crate::config::{RuntimeConfig, SkillsMode, tool_allowed};
+use crate::redact::Redactor;
 use crate::system_prompt::PromptTemplate;
 use approvals::ToolDecisions;
 use arbe_mcp::{McpManager, ServerStatus, ToolSink};
@@ -110,6 +111,8 @@ pub struct Agent {
     /// Problems found while setting up the session that the user should
     /// hear about (e.g. skill files that couldn't be loaded).
     startup_warnings: Vec<String>,
+    /// Scrubs known secrets from tool output before it's used anywhere.
+    redactor: Redactor,
 }
 
 /// Everything needed to build an `Agent`, however it was obtained (config
@@ -129,6 +132,7 @@ struct Parts {
     skill_instructions: Vec<String>,
     allowed_tools: Option<Vec<String>>,
     startup_warnings: Vec<String>,
+    redactor: Redactor,
 }
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
@@ -168,6 +172,43 @@ async fn build_system_prompt_async(template: &PromptTemplate, project_dir: &Path
             tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
             crate::system_prompt::render_system_prompt(None, None)
         })
+}
+
+/// Everything this session knows to be secret: the provider key, MCP
+/// bearer tokens, and header values whose *name* says they're credentials
+/// (`Authorization`, `X-Api-Key`, ...), plus secret-looking environment
+/// variables (see `Redactor`). Other configured values (URLs, plain
+/// headers, MCP `env` entries) are left alone: redacting them would hide
+/// ordinary output for no benefit, and any secret among a stdio server's
+/// variables is caught by the environment-name rule anyway.
+fn redactor_for(config: &RuntimeConfig) -> Redactor {
+    fn credential_headers<'a>(
+        headers: impl IntoIterator<Item = (&'a String, &'a String)>,
+    ) -> impl Iterator<Item = String> {
+        headers.into_iter().filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            ["auth", "key", "token", "secret", "cookie"]
+                .iter()
+                .any(|marker| name.contains(marker))
+                .then(|| value.clone())
+        })
+    }
+    let mut explicit: Vec<String> = config.api_key.clone().into_iter().collect();
+    explicit.extend(credential_headers(
+        config.extra_headers.iter().map(|(k, v)| (k, v)),
+    ));
+    for server in &config.mcp_servers {
+        if let arbe_mcp::TransportConfig::Http {
+            headers,
+            bearer_token,
+            ..
+        } = &server.transport
+        {
+            explicit.extend(credential_headers(headers));
+            explicit.extend(bearer_token.clone());
+        }
+    }
+    Redactor::from_process_env(explicit)
 }
 
 /// Every message of every persisted turn, tagged with its turn index — the
@@ -232,6 +273,7 @@ impl Agent {
             allowed_tools: parts.allowed_tools,
             mcp: None,
             startup_warnings: parts.startup_warnings,
+            redactor: parts.redactor,
             decisions: ToolDecisions::default(),
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
@@ -349,6 +391,7 @@ impl Agent {
             skill_instructions,
             allowed_tools: config.tools.clone(),
             startup_warnings,
+            redactor: redactor_for(config),
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }

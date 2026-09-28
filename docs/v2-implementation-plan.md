@@ -18,18 +18,19 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested (296 tests). **Not Done yet:** the exit criterion needs live runs, and there are no API keys or Ollama server here — run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with keys set |
 | P3 | Agent loop v2 | In progress | 8 / 10 | 322 tests, fmt/clippy clean. Open: P3.7 image/block tool results, P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
-| P4 | Config, profiles & extension wiring | In progress | 8 / 9 | Everything but P4.9 (secrets: keychain + redaction) done |
+| P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Not started | 0 / 6 | Depends on P3 |
 | P6 | Multi-purpose & embedding | Not started | 0 / 8 | Depends on P4 |
 | P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; live provider smoke tests exist (P7.2, partial) |
 
-**Current focus:** P4.9 (secrets handling)
-**Last updated:** 2026-09-28 · test count: 392 (+4 ignored live tests)
+**Current focus:** P5 (context management: async strategies, LLM compaction, tool-output pruning)
+**Last updated:** 2026-09-28 · test count: 399 (+4 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — P4.9 done; P4 complete.** `provider.api_key_command` (password-manager CLIs; runs once at startup, trust-gated) instead of an OS-keychain dependency. `Redactor` scrubs the API key, MCP bearer tokens, credential-named header values and secret-named env vars from tool output before the model, `turns.jsonl` and the TUI see it. First cut over-redacted (every MCP `env` value and header value, hiding URLs); narrowed to credential-looking names before committing. 392 → 399 tests. Next: P5.
 - **2026-09-28 — P4.8 done (permission rules).** `tool(pattern)` rules (`*` wildcard) for `approval.allow`/`deny`, matched against each tool's *subject* (`ToolExecutor::subject`: path for file tools, command line for `execute`). Deny rules now apply in every mode. High-risk tools auto-approve only via a *specific* rule (`execute(cargo test*)`), never a bare name. Pressing `a` on a high-risk call now approves that exact call for the session (compared literally — a `*` in an approved command can't widen it; caught while writing it) instead of doing nothing special. Rules are validated at config load. 386 → 392 tests.
 - **2026-09-28 — P4.7 done (command hooks).** `[[hooks.commands]]` run a shell command per phase with the JSON payload on stdin; `before_tool_execute` output can rewrite arguments or veto. Per-hook timeouts, `HookFailed` events (a broken hook is visible, not silent), project hooks only when trusted. Found and fixed along the way: the `execute` tool mangled any command containing quotes on Windows (Rust's argument escaping vs. `cmd /C`) — e.g. `git commit -m "msg"`; now passed verbatim via `raw_arg`, with a regression test confirmed to fail on the old code. 373 → 386 tests.
 - **2026-09-28 — Security fix: project-config trust gate.** Found in my own P4.1/P4.4 work: a repository's `.arbe/config.toml` could set `provider.base_url` (sending your API key to an attacker's server), switch approvals to `denylist_block`, or define MCP servers whose `command` runs on session start. Untrusted project configs now lose those settings (`Layer::strip_sensitive`, incl. inside `[profiles.*]`) with a startup warning; `trusted_projects` in the *global* config opts a folder in (a project can't trust itself). Also fixed a Windows bug in the trust check itself (canonical `\\?\` vs as-written paths never matched for not-yet-existing subfolders). 369 → 373 tests.
@@ -236,9 +237,12 @@ Make the harness configurable from files and connect the parts v1 built but neve
   - *Done:* `arbe_hooks::CommandHook` (stdin = payload + `phase`; empty stdout = unchanged, JSON object = replacement, anything else or non-zero exit = failure with stderr). `Hook::name()`/`timeout()` (per-hook limits, default 10 s for commands); `HookRegistry::run_phase_reporting` → `RuntimeEvent::HookFailed`. Veto semantics are the existing `BeforeToolExecute` ones (runs before the gate). Hooks accumulate across config files; untrusted projects' hooks are stripped.
 - [x] **P4.8 Permission rules.** Extend the allow/deny lists from bare tool names to argument-aware patterns (e.g. `execute(cargo test*)`, `write_file(src/**)`), stored in config and in session approvals.
   - *Done:* `arbe_tools::ToolRule` (`rules.rs`, wildcard matcher without recursion), `ToolExecutor::subject`, `ApprovalPolicy::decide(invocation, subject, ctx)`, `SessionApprovals` storing rules (exact, literal rule for high-risk session approvals). Glob semantics are deliberately simple — `*` crosses `/` — and documented as such.
-- [ ] **P4.9 Secrets handling.** API keys from env or an OS keychain reference in config (never plain text in `config.toml`), and redaction of known secret values from events, logs and persisted tool outputs.
+- [x] **P4.9 Secrets handling.** API keys from env or an OS keychain reference in config (never plain text in `config.toml`), and redaction of known secret values from events, logs and persisted tool outputs.
+  - *Done, with a deviation:* instead of an OS keychain crate (native deps — D-Bus on Linux — risky for the 3-OS CI), `provider.api_key_command` runs any credential CLI (1Password, macOS `security`, `pass`, ...), like git credential helpers; its failure message never includes stdout. Redaction: `arbe_runtime::redact::Redactor` over tool results (model input, persisted trace) and `ToolExecuted` events. Not redacted: model-generated text (the model can't see secrets it wasn't given, except via tools, which are covered).
 
 **Exit criteria:** switching between the `coding` and `general` profiles changes tools/prompt/policy with no code change (test-verified); a real MCP server's tools are callable by the model (verified against the in-tree reference server from P7.3); a command hook can veto a tool call.
+
+*Status:* all met — `the_general_profile_agent_only_has_its_allowed_tools`; the official `server-everything` driven through `Agent::create` → registry → gate (`reference_mcp_server_tools_are_usable_through_the_agent`, ignored/live, passing) plus the fixture tests; `command_hooks_can_veto_tool_calls_and_their_failures_are_reported`.
 
 ---
 

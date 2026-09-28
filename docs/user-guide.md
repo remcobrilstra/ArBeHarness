@@ -108,7 +108,7 @@ Unknown keys are errors on purpose, so a typo can't silently do nothing.
 
 A project's `.arbe/config.toml` arrives with whatever repository you open, so by default it **can't** change settings that could leak your API key, weaken approvals, or start programs. In an untrusted project these keys are ignored:
 
-- `provider.base_url`, `provider.api_key_env`, `provider.headers` (where requests, and your key, are sent)
+- `provider.base_url`, `provider.api_key_env`, `provider.api_key_command`, `provider.headers` (where requests, and your key, are sent, and programs that fetch it)
 - everything under `[approval]`
 - `[mcp.servers.*]` and `[[hooks.commands]]` (programs the harness would start)
 - the same keys inside `[profiles.*]`
@@ -176,6 +176,7 @@ context_window = 32768
 | `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
 | `provider.model` | per provider | Same as `ARBE_MODEL`. |
 | `provider.base_url` | provider's endpoint | Same as `ARBE_BASE_URL`. |
+| `provider.api_key_command` | none | A command that prints the API key, run once at startup — for keys kept in a password manager, e.g. `"op read op://Private/OpenAI/key"` (1Password), `"security find-generic-password -s openai -w"` (macOS Keychain), `"pass show openai"`. Takes precedence over the environment. If it fails, the app stops with its error output. |
 | `provider.api_key_env` | the provider's usual variable | The **name** of the environment variable that holds the API key, e.g. `"WORK_OPENAI_KEY"`. Keys themselves never go in a config file: an `api_key` key is rejected. |
 | `provider.headers` | none | Extra HTTP headers, as a table. Same as `ARBE_HTTP_HEADERS`. |
 | `generation.temperature` | `1.0` openai, else `0.2` | Same as `ARBE_TEMPERATURE`. |
@@ -245,7 +246,15 @@ Environment variables override the [configuration file](#configuration-file). Th
 | `ARBE_API_KEY` | none | Fallback key, used when the provider-specific variable is not set. Convenient for `openai_compatible` gateways. |
 | `ARBE_HTTP_HEADERS` | none | Extra HTTP headers for every provider request, written as `Name: value; Other-Name: value`. Malformed entries are skipped. |
 
-API keys are only ever read from the environment. They are never written to disk by the harness.
+API keys are only ever read from the environment or from `provider.api_key_command`. They are never written to disk by the harness.
+
+**Secrets in tool output are hidden.** If a tool prints a secret — say the model runs `env`, or reads a `.env` file — every occurrence is replaced with `[REDACTED]` before the model sees it, before it's saved in `turns.jsonl`, and before it's shown on screen. What counts as a secret:
+
+- the provider API key, and MCP bearer tokens;
+- values of configured headers whose name contains `auth`, `key`, `token`, `secret` or `cookie`;
+- values (8+ characters) of environment variables whose name ends in `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`, e.g. `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`.
+
+This is a safety net, not a guarantee: a secret the harness doesn't know about, or one that's been transformed (e.g. base64-encoded), isn't recognized.
 
 ### Generation and context
 

@@ -59,6 +59,9 @@ impl Layer {
             if provider.api_key_env.take().is_some() {
                 removed.push("provider.api_key_env");
             }
+            if provider.api_key_command.take().is_some() {
+                removed.push("provider.api_key_command");
+            }
             if provider.headers.take().is_some() {
                 removed.push("provider.headers");
             }
@@ -95,6 +98,8 @@ pub struct ProviderSection {
     /// Name of the environment variable holding the API key. The key
     /// itself never goes in a config file.
     pub api_key_env: Option<String>,
+    /// A command that prints the API key (e.g. a password manager's CLI).
+    pub api_key_command: Option<String>,
     pub headers: Option<BTreeMap<String, String>>,
 }
 

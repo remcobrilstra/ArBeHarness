@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod config;
 pub mod event_bus;
+pub mod redact;
 pub mod system_prompt;
 
 pub use agent::Agent;

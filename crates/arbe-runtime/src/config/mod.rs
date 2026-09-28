@@ -119,6 +119,7 @@ struct Pending {
     model: Option<String>,
     temperature: Option<f32>,
     api_key_env: Option<String>,
+    api_key_command: Option<String>,
     /// Merged by name across layers; resolved once env is known.
     mcp_servers: BTreeMap<String, arbe_mcp::McpServerSettings>,
 }
@@ -306,6 +307,7 @@ impl RuntimeConfig {
             set(&mut pending.model, p.model.clone());
             set(&mut self.base_url, p.base_url.clone());
             set(&mut pending.api_key_env, p.api_key_env.clone());
+            set(&mut pending.api_key_command, p.api_key_command.clone());
             if let Some(headers) = &p.headers {
                 self.extra_headers = headers
                     .iter()
@@ -490,7 +492,10 @@ impl RuntimeConfig {
         self.temperature = pending
             .temperature
             .unwrap_or_else(|| default_temperature(&self.provider_name));
-        self.api_key = api_key(&self.provider_name, pending.api_key_env.as_deref(), env);
+        self.api_key = match &pending.api_key_command {
+            Some(command) => Some(run_key_command(command)?),
+            None => api_key(&self.provider_name, pending.api_key_env.as_deref(), env),
+        };
         Ok(())
     }
 
@@ -509,6 +514,38 @@ impl RuntimeConfig {
             }
         })
     }
+}
+
+/// Runs `provider.api_key_command` and returns what it printed (trimmed).
+/// Runs through the platform shell, like hooks; on Windows the command
+/// line is passed to `cmd` verbatim so quoting survives.
+fn run_key_command(command: &str) -> Result<String, ConfigError> {
+    let mut shell = if cfg!(windows) {
+        std::process::Command::new("cmd")
+    } else {
+        std::process::Command::new("sh")
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        shell.raw_arg(format!("/S /C \"{command}\""));
+    }
+    #[cfg(not(windows))]
+    shell.arg("-c").arg(command);
+    let output = shell
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| ConfigError::InvalidSchema(format!("provider.api_key_command: {e}")))?;
+    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || key.is_empty() {
+        // Never include stdout in the message: it may be (part of) a key.
+        return Err(ConfigError::InvalidSchema(format!(
+            "provider.api_key_command failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(key)
 }
 
 /// Whether `name` is allowed by a tool allow-set: an exact entry, or an
@@ -1054,6 +1091,26 @@ deny = [\"execute(git push\"]
         );
         let err = load(&[bad], &no_env).unwrap_err().to_string();
         assert!(err.contains("closing"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn api_key_command_output_becomes_the_key() {
+        let dir = temp_dir();
+        let path = write(
+            &dir,
+            "c.toml",
+            "[provider]\nname = \"openai\"\napi_key_command = \"echo sk-from-command\"\n",
+        );
+        let env = env_of(&[("OPENAI_API_KEY", "sk-from-env")]);
+        assert_eq!(
+            load(&[path], &env).unwrap().api_key.as_deref(),
+            Some("sk-from-command")
+        );
+
+        let failing = write(&dir, "f.toml", "[provider]\napi_key_command = \"exit 1\"\n");
+        let err = load(&[failing], &no_env).unwrap_err().to_string();
+        assert!(err.contains("api_key_command failed"), "{err}");
         std::fs::remove_dir_all(dir).ok();
     }
 

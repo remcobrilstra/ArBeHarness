@@ -268,6 +268,7 @@ fn test_parts(
         skill_instructions: Vec::new(),
         allowed_tools: None,
         startup_warnings: Vec::new(),
+        redactor: crate::redact::Redactor::default(),
     }
 }
 
@@ -1265,4 +1266,57 @@ async fn command_hooks_can_veto_tool_calls_and_their_failures_are_reported() {
         "{hook}"
     );
     assert!(reason.contains('4'), "{reason}");
+}
+
+#[tokio::test]
+async fn secrets_in_tool_output_never_reach_the_model_the_log_or_the_screen() {
+    let provider = ScriptedProvider::new(
+        vec![tool_calls(&[(
+            "c1",
+            "echo",
+            json!({"leak": "sk-live-abcdef123456"}),
+        )])],
+        answer("done"),
+    );
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.redactor =
+            crate::redact::Redactor::new(["sk-live-abcdef123456".to_string()], Vec::new());
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    t.agent.submit_message("go".into()).await.unwrap();
+
+    // What the model saw.
+    let requests = requests.lock().unwrap();
+    let (_, sent, _) = tool_result_of(requests[1].messages.last().unwrap(), 0);
+    assert!(!sent.contains("sk-live-abcdef123456"), "{sent}");
+    assert!(sent.contains("[REDACTED]"));
+    // What was persisted.
+    let turns = t.store.list_turns(t.session_id).unwrap();
+    let persisted = serde_json::to_string(&turns[0].messages[2]).unwrap();
+    assert!(!persisted.contains("sk-live-abcdef123456"));
+    // What the UI was told.
+    for event in drain(&mut rx) {
+        if let RuntimeEvent::ToolExecuted { result, .. } = event {
+            assert!(!result.output.to_string().contains("sk-live-abcdef123456"));
+        }
+    }
+}
+
+#[test]
+fn only_credential_looking_configured_values_are_redacted() {
+    let config = crate::RuntimeConfig {
+        api_key: Some("sk-config-key-000111".into()),
+        extra_headers: vec![
+            ("X-Api-Key".into(), "gateway-secret-999".into()),
+            ("HTTP-Referer".into(), "https://example.dev".into()),
+        ],
+        ..crate::RuntimeConfig::defaults(temp_dir("redact"))
+    };
+    let r = redactor_for(&config);
+    assert_eq!(
+        r.redact("sk-config-key-000111 gateway-secret-999 https://example.dev"),
+        "[REDACTED] [REDACTED] https://example.dev"
+    );
 }
