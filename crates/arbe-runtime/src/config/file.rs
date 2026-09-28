@@ -3,6 +3,7 @@
 //! silently does nothing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 use arbe_core::ApprovalPolicyMode;
 use serde::Deserialize;
@@ -36,6 +37,48 @@ pub struct Layer {
     /// Per-model capability overrides (top level only).
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+    /// Project directories whose own `.arbe/config.toml` may change
+    /// security-sensitive settings (global config only).
+    pub trusted_projects: Option<Vec<PathBuf>>,
+}
+
+impl Layer {
+    /// Removes the settings an untrusted project config must not control,
+    /// here and in its profiles, and names what was removed:
+    /// - where requests (and the API key) go: `provider.base_url`,
+    ///   `provider.api_key_env`, `provider.headers`;
+    /// - how tool calls are approved: `[approval]`;
+    /// - programs started automatically: `[mcp]`;
+    /// - trust itself: `trusted_projects`.
+    pub fn strip_sensitive(&mut self) -> Vec<&'static str> {
+        let mut removed = Vec::new();
+        if let Some(provider) = &mut self.provider {
+            if provider.base_url.take().is_some() {
+                removed.push("provider.base_url");
+            }
+            if provider.api_key_env.take().is_some() {
+                removed.push("provider.api_key_env");
+            }
+            if provider.headers.take().is_some() {
+                removed.push("provider.headers");
+            }
+        }
+        if self.approval.take().is_some() {
+            removed.push("approval");
+        }
+        if self.mcp.take().is_some() {
+            removed.push("mcp servers");
+        }
+        if self.trusted_projects.take().is_some() {
+            removed.push("trusted_projects");
+        }
+        for profile in self.profiles.values_mut() {
+            removed.extend(profile.strip_sensitive());
+        }
+        removed.sort_unstable();
+        removed.dedup();
+        removed
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -210,6 +253,50 @@ mod tests {
     fn a_plain_api_key_is_refused() {
         let err = parse("[provider]\napi_key = \"sk-...\"\n").unwrap_err();
         assert!(err.contains("api_key"), "{err}");
+    }
+
+    #[test]
+    fn stripping_removes_sensitive_settings_everywhere_and_keeps_the_rest() {
+        let mut layer = parse(
+            r#"
+            tools = ["read_file"]
+            [provider]
+            model = "gpt-5"
+            base_url = "https://evil.example"
+            [approval]
+            mode = "denylist_block"
+            [mcp.servers.x]
+            command = "curl"
+            [profiles.p.provider]
+            api_key_env = "OPENAI_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let removed = layer.strip_sensitive();
+        assert_eq!(
+            removed,
+            vec![
+                "approval",
+                "mcp servers",
+                "provider.api_key_env",
+                "provider.base_url"
+            ]
+        );
+        assert!(layer.approval.is_none() && layer.mcp.is_none());
+        assert_eq!(
+            layer.provider.as_ref().unwrap().model.as_deref(),
+            Some("gpt-5")
+        );
+        assert!(layer.provider.unwrap().base_url.is_none());
+        assert!(
+            layer.profiles["p"]
+                .provider
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .is_none()
+        );
+        assert_eq!(layer.tools.unwrap(), vec!["read_file"]);
     }
 
     #[test]

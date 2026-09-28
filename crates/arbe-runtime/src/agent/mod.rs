@@ -275,8 +275,14 @@ impl Agent {
         let capabilities = provider.capabilities(&config.model);
         let budget_tokens = config.effective_context_budget(capabilities.max_context_tokens);
 
-        let (skills, startup_warnings) =
+        let (skills, skill_problems) =
             skills::load_session_skills(&arbe_storage::paths::skills_dir(), &config.project_dir);
+        let startup_warnings: Vec<String> = config
+            .warnings
+            .iter()
+            .cloned()
+            .chain(skill_problems)
+            .collect();
         for warning in &startup_warnings {
             tracing::warn!("{warning}");
         }

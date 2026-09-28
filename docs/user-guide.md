@@ -103,6 +103,24 @@ invalid configuration: C:\Users\you\.arbe\config\config.toml: TOML parse error a
 
 Unknown keys are errors on purpose, so a typo can't silently do nothing.
 
+### Trusted projects
+
+A project's `.arbe/config.toml` arrives with whatever repository you open, so by default it **can't** change settings that could leak your API key, weaken approvals, or start programs. In an untrusted project these keys are ignored:
+
+- `provider.base_url`, `provider.api_key_env`, `provider.headers` (where requests, and your key, are sent)
+- everything under `[approval]`
+- `[mcp.servers.*]` (programs the harness would start)
+- the same keys inside `[profiles.*]`
+
+An `[error]` line when the session starts lists what was ignored. Everything else in a project config (model, limits, `tools`, `prompt`, skills mode, …) still applies.
+
+To trust a project, list it in your **global** config (a project can't trust itself):
+
+```toml
+# ~/.arbe/config/config.toml
+trusted_projects = ["C:/code/my-app", "/home/me/work"]   # a folder and everything inside it
+```
+
 ### Example
 
 ```toml
@@ -151,6 +169,7 @@ context_window = 32768
 | Key | Default | Description |
 |---|---|---|
 | `profile` | `coding` | Profile to use. Top level only. |
+| `trusted_projects` | `[]` | Folders whose project config may change security-sensitive settings. Global config only. See [Trusted projects](#trusted-projects). |
 | `tools` | all tools | Tools the model may use, by name. An entry ending in `*` matches by prefix, e.g. `"github__*"` for every tool of the `github` [MCP server](#mcp-servers). Tools not listed are not available at all (not even through `/tool`). |
 | `prompt` | per profile | System prompt template: `coding`, `general`, or a path to your own Markdown file (relative paths are relative to the config file). See [Profiles](#profiles). |
 | `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
@@ -406,6 +425,7 @@ headers = { "X-Team" = "platform" }
 # enabled = false                     # switch off a server defined in another file
 ```
 
+- Servers defined in a project's `.arbe/config.toml` only start if the project is [trusted](#trusted-projects); servers in your global config always start.
 - A stdio server inherits your environment, so secrets such as `GITHUB_PERSONAL_ACCESS_TOKEN` can stay in your shell instead of the config file. On Windows, commands like `npx` and `uvx` work as-is.
 - Servers are connected when a session starts, in the background. The chat is usable immediately, and an `[info]` line reports `MCP server github connected (N tools)`, or an `[error]` line says why a server is unavailable. A failed server doesn't stop the others or the session.
 - Its tools appear to the model as `<server>__<tool>`, e.g. `github__search_issues`, with the descriptions and argument schemas the server provides. You can call them with [`/tool`](#chat-commands) too.
@@ -622,6 +642,7 @@ Common problems:
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `...config.toml: ignored ... (this project isn't trusted ...)` | The project's config tried to change a [security-sensitive setting](#trusted-projects). Add the project to `trusted_projects` in your global config if you trust it. |
 | `invalid configuration: ...` at startup | A config file has a typo, an unknown key, or an invalid value, or an `ARBE_*` number variable isn't a number. The message names the file and line or the variable. |
 | `MCP server <name> unavailable: ...` | The server couldn't be started or reached. Check the command/URL, and `~/.arbe/logs/mcp/<name>.log` for its own error output. `failed to start "..."` means the program wasn't found on your `PATH`. |
 | An MCP server's tools don't appear | The server hasn't finished connecting yet (watch for the `connected` line), or a `tools` allow-list is set and doesn't include them — add `"<server>__*"`. |
