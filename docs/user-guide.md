@@ -38,7 +38,7 @@ cargo run --release
 
 The binary is called `arbeharness` (`target/release/arbeharness`, or `arbeharness.exe` on Windows); you can run it directly instead of going through `cargo run`.
 
-With no configuration it talks to a local [Ollama](https://ollama.com) server at `http://localhost:11434` using model `llama3.1`. No API key is needed to start it, but Ollama must be running and have the model pulled (`ollama pull llama3.1`) before you get a reply.
+With no configuration it talks to a local [Ollama](https://ollama.com) server at `http://localhost:11434` using model `qwen2.5-coder:3b` (or `llama3.2:3b` with the [`general` profile](#profiles)). No API key is needed to start it, but Ollama must be running and have the model pulled (`ollama pull qwen2.5-coder:3b`, and `ollama pull llama3.2:3b` for the general profile) before you get a reply.
 
 To use a hosted provider, set environment variables first:
 
@@ -239,7 +239,7 @@ Environment variables override the [configuration file](#configuration-file). Th
 |---|---|---|
 | `ARBE_PROFILE` | `coding` | Same as `--profile`. See [Profiles](#profiles). |
 | `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`. See [Providers and models](#providers-and-models). |
-| `ARBE_MODEL` | per provider: `llama3.1` (ollama), `gpt-5-mini` (openai), `claude-sonnet-5` (anthropic) | The model ID sent to the provider. |
+| `ARBE_MODEL` | ollama: `qwen2.5-coder:3b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5` | The model ID sent to the provider. |
 | `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. |
 | `OPENAI_API_KEY` | none | API key for `openai`. |
 | `ANTHROPIC_API_KEY` | none | API key for `anthropic`. |

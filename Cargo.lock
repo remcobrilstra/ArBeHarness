@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "arbe-core",
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -105,6 +106,7 @@ dependencies = [
  "arbe-storage",
  "arbe-tools",
  "async-trait",
+ "chrono",
  "futures-util",
  "serde",
  "serde_json",
@@ -130,6 +132,7 @@ name = "arbe-storage"
 version = "0.1.0"
 dependencies = [
  "arbe-core",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror",

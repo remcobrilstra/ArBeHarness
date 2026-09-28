@@ -13,7 +13,7 @@
 //! - Anthropic: `ANTHROPIC_API_KEY` (model: `ARBE_LIVE_ANTHROPIC_MODEL`,
 //!   default `claude-haiku-4-5-20251001`)
 //! - Ollama: `ARBE_LIVE_OLLAMA=1` with a local server (model:
-//!   `ARBE_LIVE_OLLAMA_MODEL`, default `llama3.1`; `ARBE_BASE_URL` overrides
+//!   `ARBE_LIVE_OLLAMA_MODEL`, default `qwen2.5-coder:3b`; `ARBE_BASE_URL` overrides
 //!   the server address)
 
 use arbe_core::{Message, Role, StopReason, ToolSpec};
@@ -40,7 +40,7 @@ fn target(name: &str) -> Option<Target> {
             env("ARBE_LIVE_OLLAMA")?;
             (
                 None,
-                env("ARBE_LIVE_OLLAMA_MODEL").unwrap_or_else(|| "llama3.1".into()),
+                env("ARBE_LIVE_OLLAMA_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into()),
             )
         }
         _ => unreachable!(),

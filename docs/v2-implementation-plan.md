@@ -24,12 +24,13 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; live provider smoke tests exist (P7.2, partial) |
 
 **Current focus:** P6 (library facade, headless mode, subagents)
-**Last updated:** 2026-09-28 · test count: 423 (+4 ignored live tests)
+**Last updated:** 2026-09-28 · test count: 424 (+4 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — Default models changed.** With no model configured, Ollama now uses `qwen2.5-coder:3b` for the coding profile (and custom prompt files) and `llama3.2:3b` for the `general` prompt, both small and tool-capable (was `llama3.1` for everything); openai/anthropic defaults unchanged. The default follows the resolved prompt template, so `ARBE_PROFILE=general` alone switches it. Live-test default is now `qwen2.5-coder:3b`. 423 → 424 tests.
 - **2026-09-28 — P5 complete.** Cache-aware assembly (memory notes moved into the stable prefix; truncation cut quantized to multiples of 4 turns on long histories so the prefix stays stable), nested `AGENTS.md`/`agent.md`/`CLAUDE.md` shown with the first tool call touching their folder, persistent memory read every turn plus a `remember` tool. The 200-turn exit test found two real problems, both fixed: (1) a round could overflow the budget when a new, must-keep result arrived on a full context — the loop now drops the oldest earlier turns from the request as a last resort; (2) truncation kept every full tool output in memory forever and re-copied it every turn (42 s → 2 s) — history is now pruned in place (full text stays on disk). 413 → 423 tests. Next: P6.
 - **2026-09-28 — P5.1–P5.3 done (pruning + compaction).** Old tool results are stubbed before any turn is dropped — in history and within a long tool loop (newest results protected, persisted trace untouched). `compact_summary` now really summarizes: past ~80% of the budget the model summarizes the oldest whole turns (down to ~40%) into `compactions.jsonl`, chained onto the previous summary, restored on resume; `/compact` forces it; failure falls back to trimming. 399 → 413 tests. Next: P5.4.
 - **2026-09-28 — P4.9 done; P4 complete.** `provider.api_key_command` (password-manager CLIs; runs once at startup, trust-gated) instead of an OS-keychain dependency. `Redactor` scrubs the API key, MCP bearer tokens, credential-named header values and secret-named env vars from tool output before the model, `turns.jsonl` and the TUI see it. First cut over-redacted (every MCP `env` value and header value, hiding URLs); narrowed to credential-looking names before committing. 392 → 399 tests. Next: P5.

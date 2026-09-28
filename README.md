@@ -25,7 +25,7 @@ crates/
 ## Running
 
 ```bash
-cargo run --release                          # local Ollama (llama3.1), no API key needed
+cargo run --release                          # local Ollama (qwen2.5-coder:3b), no API key needed
 ARBE_PROVIDER=anthropic ANTHROPIC_API_KEY=... cargo run --release
 cargo run --release -- --workdir ../some-repo
 ```

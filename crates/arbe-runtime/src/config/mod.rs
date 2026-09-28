@@ -131,7 +131,7 @@ impl RuntimeConfig {
         Self {
             profile: "coding".to_string(),
             provider_name: "ollama".to_string(),
-            model: default_model("ollama").to_string(),
+            model: default_model("ollama", &PromptTemplate::Coding).to_string(),
             api_key: None,
             base_url: None,
             extra_headers: Vec::new(),
@@ -488,7 +488,7 @@ impl RuntimeConfig {
             .collect::<Result<_, _>>()?;
         self.model = pending
             .model
-            .unwrap_or_else(|| default_model(&self.provider_name).to_string());
+            .unwrap_or_else(|| default_model(&self.provider_name, &self.prompt).to_string());
         self.temperature = pending
             .temperature
             .unwrap_or_else(|| default_temperature(&self.provider_name));
@@ -669,13 +669,16 @@ fn parse_headers(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The model used when none is configured.
-fn default_model(provider: &str) -> &'static str {
-    match provider {
-        "openai" => "gpt-5-mini",
-        "anthropic" => "claude-sonnet-5",
-        // Tool-capable, unlike the original `llama3`.
-        _ => "llama3.1",
+/// The model used when none is configured. For Ollama it depends on the
+/// profile's prompt: small local models chosen for the job — a coding
+/// model for coding work, a general model for the `general` prompt. Both
+/// support tool calling.
+fn default_model(provider: &str, prompt: &PromptTemplate) -> &'static str {
+    match (provider, prompt) {
+        ("openai", _) => "gpt-5-mini",
+        ("anthropic", _) => "claude-sonnet-5",
+        (_, PromptTemplate::General) => "llama3.2:3b",
+        _ => "qwen2.5-coder:3b",
     }
 }
 
@@ -746,7 +749,7 @@ mod tests {
         let c = load(&[], &no_env).unwrap();
         assert_eq!(c.profile, "coding");
         assert_eq!(c.provider_name, "ollama");
-        assert_eq!(c.model, "llama3.1");
+        assert_eq!(c.model, "qwen2.5-coder:3b");
         assert_eq!(c.temperature, 0.2);
         assert_eq!(c.policy_mode, ApprovalPolicyMode::AlwaysPrompt);
         assert_eq!(c.tools, None);
@@ -809,6 +812,16 @@ mod tests {
             Some(vec!["todo_write".to_string(), "remember".to_string()])
         );
         assert_eq!(c.prompt, PromptTemplate::General);
+        assert_eq!(c.model, "llama3.2:3b");
+    }
+
+    #[test]
+    fn an_explicit_model_wins_over_the_profile_default() {
+        let env = env_of(&[("ARBE_PROFILE", "general"), ("ARBE_MODEL", "mistral")]);
+        assert_eq!(load(&[], &env).unwrap().model, "mistral");
+        // Hosted providers keep their own default in either profile.
+        let env = env_of(&[("ARBE_PROFILE", "general"), ("ARBE_PROVIDER", "openai")]);
+        assert_eq!(load(&[], &env).unwrap().model, "gpt-5-mini");
     }
 
     #[test]
