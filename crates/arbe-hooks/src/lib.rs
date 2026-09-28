@@ -27,6 +27,9 @@ pub enum HookPhase {
     AfterToolExecute,
     OnError,
     OnTurnComplete,
+    /// A tool call is waiting for the user's approval. Notification only:
+    /// what the hook returns is ignored.
+    OnApprovalRequested,
 }
 
 impl HookPhase {
@@ -40,10 +43,11 @@ impl HookPhase {
             Self::AfterToolExecute => "after_tool_execute",
             Self::OnError => "on_error",
             Self::OnTurnComplete => "on_turn_complete",
+            Self::OnApprovalRequested => "on_approval_requested",
         }
     }
 
-    pub const ALL: [HookPhase; 7] = [
+    pub const ALL: [HookPhase; 8] = [
         Self::BeforeContextAssembly,
         Self::BeforeModelCall,
         Self::AfterModelCall,
@@ -51,6 +55,7 @@ impl HookPhase {
         Self::AfterToolExecute,
         Self::OnError,
         Self::OnTurnComplete,
+        Self::OnApprovalRequested,
     ];
 
     /// Parses a config name.

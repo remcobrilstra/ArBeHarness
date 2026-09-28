@@ -122,7 +122,13 @@ pub(super) async fn run_turn(
     cancel: &CancellationToken,
 ) -> Result<String, HarnessError> {
     let turn = {
-        let state = agent.state();
+        let mut state = agent.state();
+        if state.meta.title.is_none() {
+            state.meta.title = super::title_from(&content);
+            if let Err(err) = agent.store.save_meta(&state.meta) {
+                tracing::warn!(%err, "failed to save session title");
+            }
+        }
         Turn::new(state.meta.id, state.next_turn_index)
     };
     let turn_id = turn.id;
@@ -147,8 +153,7 @@ pub(super) async fn run_turn(
             });
             advance(&mut runner.machine, LoopPhase::Idle)?;
             hooks::run(
-                &agent.hooks,
-                &agent.events,
+                agent,
                 HookPhase::OnTurnComplete,
                 &TurnPayload {
                     turn_id: turn_id.to_string(),
@@ -180,8 +185,7 @@ pub(super) async fn run_turn(
                 reason: err.to_string(),
             });
             hooks::run(
-                &agent.hooks,
-                &agent.events,
+                agent,
                 HookPhase::OnError,
                 &ErrorPayload {
                     turn_id: turn_id.to_string(),
@@ -289,8 +293,7 @@ impl TurnRunner<'_> {
             turn_id,
         });
         hooks::run(
-            &agent.hooks,
-            &agent.events,
+            agent,
             HookPhase::BeforeContextAssembly,
             &TurnPayload {
                 turn_id: turn_id.to_string(),
@@ -307,10 +310,14 @@ impl TurnRunner<'_> {
                 Err(err) => tracing::warn!(%err, "compaction failed; trimming history instead"),
             }
         }
-        let system_prompt =
-            build_system_prompt_async(&agent.settings.prompt, &agent.settings.project_dir).await;
+        let system_prompt = build_system_prompt_async(
+            &agent.settings.prompt,
+            &agent.settings.project_dir,
+            &agent.settings.home,
+        )
+        .await;
         let memory_notes = {
-            let home = agent.settings.memory_home.clone();
+            let home = agent.settings.home.clone();
             let project = agent.settings.project_dir.clone();
             tokio::task::spawn_blocking(move || memory::load_notes(&home, &project))
                 .await
@@ -397,8 +404,7 @@ impl TurnRunner<'_> {
 
             advance(&mut self.machine, LoopPhase::ModelInference)?;
             hooks::run(
-                &agent.hooks,
-                &agent.events,
+                agent,
                 HookPhase::BeforeModelCall,
                 &ModelCallPayload {
                     turn_id: turn_id.to_string(),
@@ -457,8 +463,7 @@ impl TurnRunner<'_> {
             let tool_calls = response.message.tool_uses();
 
             hooks::run(
-                &agent.hooks,
-                &agent.events,
+                agent,
                 HookPhase::AfterModelCall,
                 &ModelResultPayload {
                     turn_id: turn_id.to_string(),

@@ -97,6 +97,10 @@ pub struct RuntimeConfig {
     /// The directory the agent works *in* (distinct from `ARBE_HOME`, the
     /// harness's own storage root).
     pub project_dir: PathBuf,
+    /// The harness's own storage root (`~/.arbe`, or `ARBE_HOME`): global
+    /// instructions, skills, memory and logs are read from and written
+    /// under it. Sessions live wherever the `SessionStore` points.
+    pub home: PathBuf,
     /// Whether the project's own config may change security-sensitive
     /// settings (it's listed in `trusted_projects`).
     pub project_trusted: bool,
@@ -156,6 +160,7 @@ impl RuntimeConfig {
             skills_mode: SkillsMode::OnDemand,
             prompt: PromptTemplate::Coding,
             project_dir,
+            home: arbe_storage::paths::arbe_home(),
             project_trusted: false,
             warnings: Vec::new(),
         }
@@ -164,11 +169,26 @@ impl RuntimeConfig {
     /// The real configuration: every layer, reading the process
     /// environment and the global/project config files.
     pub fn load() -> Result<Self, ConfigError> {
-        let env = |key: &str| std::env::var(key).ok();
-        let project_dir = project_dir_from(&env);
-        let global = [arbe_storage::paths::config_dir().join("config.toml")];
+        Self::load_with(&|key: &str| std::env::var(key).ok(), &[])
+    }
+
+    /// [`load`](Self::load) with the environment looked up through `env`
+    /// (so `ARBE_HOME`/`ARBE_WORKDIR` there choose which files are read),
+    /// plus `extra_files` applied right after the global config file, with
+    /// the same trust — config owned by whoever launched the harness.
+    pub fn load_with(
+        env: &dyn Fn(&str) -> Option<String>,
+        extra_files: &[PathBuf],
+    ) -> Result<Self, ConfigError> {
+        let project_dir = project_dir_from(env);
+        let home = env("ARBE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(arbe_storage::paths::arbe_home);
+        let global: Vec<PathBuf> = std::iter::once(home.join("config").join("config.toml"))
+            .chain(extra_files.iter().cloned())
+            .collect();
         let project = [project_dir.join(".arbe").join("config.toml")];
-        Self::load_from_sources(&global, &project, &env, project_dir)
+        Self::load_from_sources(&global, &project, env, project_dir)
     }
 
     /// Defaults + environment only, no files. For tests and embedders
@@ -476,6 +496,9 @@ impl RuntimeConfig {
         pending: Pending,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), ConfigError> {
+        if let Some(home) = env("ARBE_HOME") {
+            self.home = PathBuf::from(home);
+        }
         self.mcp_servers = pending
             .mcp_servers
             .iter()

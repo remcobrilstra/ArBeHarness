@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use arbe_core::{
-    ApprovalDecision, ContentBlock, Message, RequestedToolCall, Role, RuntimeEvent, ToolCallId,
-    ToolError, ToolInvocation, ToolResult, TurnId,
+    ApprovalDecision, ContentBlock, Message, RequestedToolCall, Role, RuntimeEvent,
+    SessionActivity, ToolCallId, ToolError, ToolInvocation, ToolResult, TurnId,
 };
 use arbe_hooks::HookPhase;
 use arbe_providers::CancellationToken;
@@ -14,7 +14,7 @@ use arbe_tools::{Authorization, Authorized, ToolContext, authorize};
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
-use super::hooks::{self, ToolCallPayload, ToolCallVerdict, ToolResultPayload};
+use super::hooks::{self, ApprovalPayload, ToolCallPayload, ToolCallVerdict, ToolResultPayload};
 use super::{Agent, nested};
 
 /// What one call in the round turned into, before execution.
@@ -205,8 +205,7 @@ async fn approve_call(
     cancel: &CancellationToken,
 ) -> Option<Slot> {
     let hook_result = hooks::run(
-        &agent.hooks,
-        &agent.events,
+        agent,
         HookPhase::BeforeToolExecute,
         &ToolCallPayload {
             turn_id: turn_id.to_string(),
@@ -260,11 +259,24 @@ async fn approve_call(
     };
     let (authorization, decided_by_human) = match gate(invocation, None) {
         Ok(Authorization::NeedsHuman(invocation)) => {
+            let rx = agent.decisions.register(id);
+            agent.set_activity(SessionActivity::AwaitingApproval);
             agent.events.publish(RuntimeEvent::ToolApprovalRequested {
                 turn_id,
                 tool_call_id: id,
             });
-            let rx = agent.decisions.register(id);
+            hooks::run(
+                agent,
+                HookPhase::OnApprovalRequested,
+                &ApprovalPayload {
+                    turn_id: turn_id.to_string(),
+                    tool_call_id: id.to_string(),
+                    tool_name: &call.name,
+                    arguments: &invocation.arguments,
+                    risk,
+                },
+            )
+            .await;
             let decision = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -273,6 +285,7 @@ async fn approve_call(
                 }
                 decision = rx => decision.unwrap_or(ApprovalDecision::DeniedOnce),
             };
+            agent.set_activity(SessionActivity::Running);
             (gate(invocation, Some(decision)), true)
         }
         other => (other, false),
@@ -408,8 +421,7 @@ async fn run_batch(
             }
         };
         hooks::run(
-            &agent.hooks,
-            &agent.events,
+            agent,
             HookPhase::AfterToolExecute,
             &ToolResultPayload {
                 turn_id: turn_id.to_string(),

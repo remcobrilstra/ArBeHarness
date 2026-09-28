@@ -18,9 +18,8 @@ use arbe_runtime::arbe_core::{
     ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, StopReason, ToolCallId,
     ToolResult,
 };
-use arbe_runtime::arbe_storage::SessionStore;
 use arbe_runtime::arbe_tools::ToolExecutor;
-use arbe_runtime::{Agent, EventBus, RuntimeConfig};
+use arbe_runtime::{Agent, EventBus, Harness};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -48,13 +47,15 @@ enum AgentOutcome {
 ///
 /// The agent is shared as a plain `Arc` (all of its methods take `&self`),
 /// so answering an approval or cancelling a turn works while a turn is
-/// running. `config`/`events` are the values `agent` was built with; they
-/// are needed to start new sessions or resume old ones (TUI-FR-3).
+/// running. `agent` must publish to `events`; `harness` starts new
+/// sessions and resumes old ones on that same bus (TUI-FR-3).
+/// `initial_prompt`, if any, is sent as the first message.
 pub fn run(
+    harness: Harness,
     agent: Agent,
     handle: Handle,
-    config: RuntimeConfig,
     events: Arc<EventBus>,
+    initial_prompt: Option<String>,
 ) -> io::Result<()> {
     let mut events_rx = agent.subscribe_events();
     let mut app = App::new(
@@ -65,6 +66,7 @@ pub fn run(
         agent.project_dir().display().to_string(),
     );
     show_startup_warnings(&mut app, &agent);
+    show_history(&mut app, &harness, agent.session_id());
     let mut agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -75,12 +77,18 @@ pub fn run(
 
     let (outcome_tx, outcome_rx) = channel::<AgentOutcome>();
 
+    if let Some(prompt) = initial_prompt.filter(|p| !p.trim().is_empty()) {
+        app.input = prompt;
+        app.input_cursor = app.input.len();
+        submit_input(&mut app, &agent, &handle, &outcome_tx);
+    }
+
     let result = event_loop(
         &mut terminal,
         &mut app,
         &mut agent,
         &handle,
-        &config,
+        &harness,
         &events,
         &mut events_rx,
         &outcome_tx,
@@ -119,7 +127,7 @@ fn event_loop(
     app: &mut App,
     agent: &mut Arc<Agent>,
     handle: &Handle,
-    config: &RuntimeConfig,
+    harness: &Harness,
     events: &Arc<EventBus>,
     events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
     outcome_tx: &Sender<AgentOutcome>,
@@ -140,7 +148,7 @@ fn event_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(key, app, agent, handle, config, events, outcome_tx);
+            handle_key(key, app, agent, handle, harness, events, outcome_tx);
         }
     }
 }
@@ -398,7 +406,7 @@ fn handle_key(
     app: &mut App,
     agent: &mut Arc<Agent>,
     handle: &Handle,
-    config: &RuntimeConfig,
+    harness: &Harness,
     events: &Arc<EventBus>,
     outcome_tx: &Sender<AgentOutcome>,
 ) {
@@ -442,7 +450,7 @@ fn handle_key(
                     .as_ref()
                     .and_then(|p| p.selected_session());
                 if let Some(session_id) = selected {
-                    resume_session(app, agent, config, events, session_id);
+                    resume_session(app, agent, harness, events, session_id);
                 } else {
                     app.session_picker = None;
                 }
@@ -464,8 +472,8 @@ fn handle_key(
             app.scroll = 0;
             app.follow_tail = true;
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, config, events),
-        (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app),
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, harness, events),
+        (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app, harness),
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.scroll_up((app.last_viewport_height / 2).max(1))
         }
@@ -529,13 +537,8 @@ fn show_startup_warnings(app: &mut App, agent: &Agent) {
     }
 }
 
-fn new_session(
-    app: &mut App,
-    agent: &mut Arc<Agent>,
-    config: &RuntimeConfig,
-    events: &Arc<EventBus>,
-) {
-    match Agent::create(config, SessionStore::new(), events.clone()) {
+fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events: &Arc<EventBus>) {
+    match harness.create_agent(events.clone()) {
         Ok(new_agent) => {
             swap_in_agent(app, agent, new_agent);
             app.notice = Some("started a new session".to_string());
@@ -544,8 +547,8 @@ fn new_session(
     }
 }
 
-fn open_session_picker(app: &mut App) {
-    match SessionStore::new().list_sessions() {
+fn open_session_picker(app: &mut App, harness: &Harness) {
+    match harness.sessions() {
         Ok(sessions) => app.session_picker = Some(SessionPicker::new(sessions)),
         Err(err) => app.status_message = Some(format!("failed to list sessions: {err}")),
     }
@@ -554,32 +557,37 @@ fn open_session_picker(app: &mut App) {
 fn resume_session(
     app: &mut App,
     agent: &mut Arc<Agent>,
-    config: &RuntimeConfig,
+    harness: &Harness,
     events: &Arc<EventBus>,
     session_id: SessionId,
 ) {
-    let store = SessionStore::new();
-    match Agent::resume(config, store.clone(), session_id, events.clone()) {
+    match harness.resume_agent(session_id, events.clone()) {
         Ok(new_agent) => {
-            let turns = store.list_turns(session_id).unwrap_or_default();
             swap_in_agent(app, agent, new_agent);
-            for turn in turns {
-                if let Some(m) = turn.user_message() {
-                    app.push_line(Role::User, m.text());
-                }
-                let tool_calls: usize = turn.messages.iter().map(|m| m.tool_uses().len()).sum();
-                if tool_calls > 0 {
-                    app.push_line(Role::Tool, format!("({tool_calls} tool call(s))"));
-                }
-                if let Some(m) = turn.final_assistant_message() {
-                    app.push_line(Role::Assistant, m.text());
-                }
-            }
+            show_history(app, harness, session_id);
             app.notice = Some(format!("resumed session {session_id}"));
         }
         Err(err) => app.status_message = Some(format!("failed to resume session: {err}")),
     }
     app.session_picker = None;
+}
+
+/// Replays a session's saved turns into the transcript (condensed: tool
+/// calls are counted, not shown).
+fn show_history(app: &mut App, harness: &Harness, session_id: SessionId) {
+    let turns = harness.store().list_turns(session_id).unwrap_or_default();
+    for turn in turns {
+        if let Some(m) = turn.user_message() {
+            app.push_line(Role::User, m.text());
+        }
+        let tool_calls: usize = turn.messages.iter().map(|m| m.tool_uses().len()).sum();
+        if tool_calls > 0 {
+            app.push_line(Role::Tool, format!("({tool_calls} tool call(s))"));
+        }
+        if let Some(m) = turn.final_assistant_message() {
+            app.push_line(Role::Assistant, m.text());
+        }
+    }
 }
 
 fn submit_input(

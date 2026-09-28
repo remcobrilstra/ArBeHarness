@@ -5,12 +5,15 @@
 pub mod agent;
 pub mod config;
 pub mod event_bus;
+pub mod git;
+pub mod harness;
 pub mod redact;
 pub mod system_prompt;
 
 pub use agent::Agent;
 pub use config::{HookCommand, PromptTemplate, RuntimeConfig, SkillsMode};
 pub use event_bus::EventBus;
+pub use harness::{Harness, HarnessBuilder, Session};
 
 pub use arbe_core;
 pub use arbe_storage;

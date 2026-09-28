@@ -19,7 +19,7 @@ pub use event::{EventEnvelope, RuntimeCommand, RuntimeEvent};
 pub use ids::{SessionId, ToolCallId, TurnId};
 pub use loop_state::{IllegalTransition, LoopMachine, LoopPhase};
 pub use message::{ContentBlock, ImageSource, Message, Role};
-pub use session::{SessionMeta, SessionStatus};
+pub use session::{SessionActivity, SessionMeta, SessionStatus};
 pub use tool::{
     ApprovalDecision, ApprovalPolicyMode, RequestedToolCall, RiskLevel, ToolInvocation, ToolResult,
     ToolSpec,

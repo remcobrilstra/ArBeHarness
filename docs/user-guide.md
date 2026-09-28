@@ -10,21 +10,22 @@ This guide is for people **using** ArBeHarness: how to start it, how to configur
 
 1. [Quick start](#quick-start)
 2. [Command-line arguments](#command-line-arguments)
-3. [Configuration file](#configuration-file)
-4. [Profiles](#profiles)
-5. [Environment variables](#environment-variables)
-6. [Providers and models](#providers-and-models)
-7. [The chat screen](#the-chat-screen)
-8. [Keybindings](#keybindings)
-9. [Chat commands](#chat-commands)
-10. [Tools and approvals](#tools-and-approvals)
-11. [Instructions and skills](#instructions-and-skills)
-12. [Hooks](#hooks)
-13. [Sessions](#sessions)
-14. [Where files are stored](#where-files-are-stored)
-15. [File formats](#file-formats)
-16. [Logs and troubleshooting](#logs-and-troubleshooting)
-17. [Not yet active](#not-yet-active)
+3. [Headless mode](#headless-mode)
+4. [Configuration file](#configuration-file)
+5. [Profiles](#profiles)
+6. [Environment variables](#environment-variables)
+7. [Providers and models](#providers-and-models)
+8. [The chat screen](#the-chat-screen)
+9. [Keybindings](#keybindings)
+10. [Chat commands](#chat-commands)
+11. [Tools and approvals](#tools-and-approvals)
+12. [Instructions and skills](#instructions-and-skills)
+13. [Hooks](#hooks)
+14. [Sessions](#sessions)
+15. [Where files are stored](#where-files-are-stored)
+16. [File formats](#file-formats)
+17. [Logs and troubleshooting](#logs-and-troubleshooting)
+18. [Not yet active](#not-yet-active)
 
 ---
 
@@ -62,11 +63,22 @@ The agent works on the directory you start it in. To point it somewhere else, us
 
 | Argument | Equivalent env var | Description |
 |---|---|---|
-| `--workdir <path>` | `ARBE_WORKDIR` | The project/repository the agent works on. File tools are sandboxed to it and shell commands run in it. Defaults to the current directory. |
+| `--workdir <path>` | `ARBE_WORKDIR` | The project/repository the agent works on. File tools are sandboxed to it and shell commands run in it. Defaults to the current directory — or, with `--resume`, to the directory the session was working in. |
+| `--resume <id>` | | Continue a saved session (its id is its folder name under `~/.arbe/sessions/`, and the `id` in its `meta.json`). |
+| `--name <title>` | | Name the session (its `title` in `meta.json`). Without it, a session is named after the first line of its first message. |
+| `--prompt <text>` | | Send `<text>` as the first message, then carry on interactively. |
+| `--print <text>` | | Run `<text>` as a single turn without the chat screen, print the answer, and exit. See [Headless mode](#headless-mode). |
+| `--approve <policy>` | | With `--print` only: `none`, `reads` or `all`. See [Headless mode](#headless-mode). |
+| `--output <format>` | | With `--print` only: `text` or `json`. See [Headless mode](#headless-mode). |
 | `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, or one defined in a config file. |
+| `--provider <id>` | `ARBE_PROVIDER` | The model provider. See [Providers and models](#providers-and-models). |
+| `--model <id>` | `ARBE_MODEL` | The model. |
+| `--config <file>` | | An extra [configuration file](#configuration-file), applied right after the global one and trusted like it. Can be given more than once. Meant for a program that launches ArBeHarness and keeps its own settings (for example [hooks](#hooks)) without editing yours. The file must exist. |
 | `--dev-home <path>` | `ARBE_HOME` | **For development and testing only.** Moves the harness's own storage (normally `~/.arbe/`) to another directory so experiments don't touch your real sessions and settings. |
+| `-h`, `--help` | | Print the list of options and exit. |
+| `-V`, `--version` | | Print the version (`arbeharness 0.1.0`) and exit. |
 
-Both accept `--flag value` or `--flag=value`. If you pass both a flag and its env var, the flag wins.
+Options take `--flag value` or `--flag=value`. If you pass both a flag and its env var, the flag wins. An unknown option, a stray argument, or an option given twice is an error (exit status 2) rather than being ignored.
 
 When running through Cargo, put the arguments after `--`:
 
@@ -74,7 +86,35 @@ When running through Cargo, put the arguments after `--`:
 cargo run --release -- --workdir ../my-project
 ```
 
-There is no `--help`, `--version`, or other flag right now. Unknown arguments are silently ignored. Everything else is configured with a [configuration file](#configuration-file) or [environment variables](#environment-variables).
+Everything else is configured with a [configuration file](#configuration-file) or [environment variables](#environment-variables).
+
+## Headless mode
+
+`--print` runs one turn without the chat screen — for scripts and for programs that use ArBeHarness in the background:
+
+```bash
+arbeharness --workdir ../my-repo --print "Which tests cover the parser?" --approve reads
+```
+
+The answer goes to stdout. Tool activity goes to stderr, as `[tool] name {arguments}` and `[denied] name: reason` lines. The session is saved like any other, so `--resume <id> --print "..."` continues it, and it can be resumed later in the chat screen.
+
+**Approvals.** Nobody is there to answer approval prompts, so `--approve` answers them up front:
+
+| `--approve` | Tool calls that need approval are |
+|---|---|
+| `none` (default) | denied. The model is told, and answers without them. |
+| `reads` | approved if low risk (`read_file`, `list_dir`, `glob`, `grep`, `todo_write`), denied otherwise. |
+| `all` | approved. Only use this where the agent can't do harm, since it includes running commands. |
+
+Calls your [approval settings](#approvals) already allow or deny are unaffected: `--approve` only answers what would otherwise be asked.
+
+**Output.** With `--output json`, stdout gets one JSON object per line: every event of the turn as it happens (the same events the chat screen shows, each with a `type`), then a final result:
+
+```json
+{"type":"result","session_id":"cfcdb9ed-…","exit_code":0,"stop_reason":{"kind":"end_turn"},"answer":"4","error":null}
+```
+
+**Exit status.** `0` the model answered; `1` the turn failed (for example the provider couldn't be reached); `2` invalid arguments or configuration; `3` stopped before answering (a [loop limit](#generation-and-context)); `130` interrupted with Ctrl+C (what the turn did so far is saved).
 
 ### Workdir vs. harness home
 
@@ -92,9 +132,10 @@ Settings can live in TOML files instead of (or as well as) environment variables
 | File | Scope |
 |---|---|
 | `~/.arbe/config/config.toml` | Global: every project. |
+| each `--config <file>` | Extra files named on the command line, trusted like the global file. |
 | `<workdir>/.arbe/config.toml` | Project: only when working in this directory. |
 
-**Precedence**, lowest to highest: built-in defaults → the built-in profile → global file → project file → the selected profile's section in the global file, then in the project file → environment variables → command-line flags. Each layer only changes what it sets.
+**Precedence**, lowest to highest: built-in defaults → the built-in profile → global file → `--config` files → project file → the selected profile's section in the global file, then in the project file → environment variables → command-line flags. Each layer only changes what it sets.
 
 Files are read once at startup; restart after editing. A mistake stops the app before the chat opens, with a message naming the file and line, for example:
 
@@ -568,7 +609,7 @@ command = "notify-send 'ArBe finished'"
 
 Hooks from the global and the project config both run (global first). Project hooks only run if the project is [trusted](#trusted-projects), since they're programs. Commands run in the workdir.
 
-**What a hook receives.** The phase's details as one JSON object on stdin, with a `phase` field added:
+**What a hook receives.** The phase's details as one JSON object on stdin, with `phase` and the session's `session_id` added:
 
 | `phase` | Fields |
 |---|---|
@@ -579,8 +620,9 @@ Hooks from the global and the project config both run (global first). Project ho
 | `after_tool_execute` | `turn_id`, `tool_name`, `is_error`, `output_chars` |
 | `on_error` | `turn_id`, `error` |
 | `on_turn_complete` | `turn_id` |
+| `on_approval_requested` | `turn_id`, `tool_call_id`, `tool_name`, `arguments`, `risk` — a tool call is now waiting for your decision |
 
-**What it can change.** Only `before_tool_execute` hooks affect anything; the others are notifications. A `before_tool_execute` hook can print a JSON object to stdout:
+**What it can change.** Only `before_tool_execute` hooks affect anything; the others are notifications. `on_approval_requested` is useful for "needs your attention" notifications; the call waits for your answer, not for the hook. A `before_tool_execute` hook can print a JSON object to stdout:
 
 - the same object with different `arguments`: the tool call is rewritten (the approval dialog then shows the rewritten arguments);
 - an object with `"veto": "reason"`: the call is refused, and the model is told `blocked by hook: reason`.
@@ -604,7 +646,8 @@ if call["tool_name"] == "execute" and "git push" in call["arguments"].get("comma
 
 Each launch starts a **new session**. Everything a turn produces is saved as it happens: your message, each assistant reply, every tool call and its result. If the app crashes or is killed mid-turn, the next time you resume that session the unfinished turn is recovered (marked as interrupted, with any tool calls that hadn't run yet recorded as "not executed"). At most the reply that was streaming at that moment is lost.
 
-- **Resume**: press `Ctrl+R`, pick a session, press `Enter`. The transcript is reloaded and the conversation continues where it left off. Current environment settings apply, so you can resume a session with a different model.
+- **Resume**: press `Ctrl+R`, pick a session, press `Enter` — or start with `--resume <id>`. The transcript is reloaded and the conversation continues where it left off. Current settings apply, so you can resume a session with a different model. Without `--workdir`, `--resume` works in the session's own directory, wherever you start it from.
+- **Name**: `--name <title>` names a new or resumed session; otherwise the first line of its first message becomes its name.
 - **New**: `Ctrl+N` starts a fresh session without quitting.
 - **Clear view**: `Ctrl+L` only clears the screen. The session on disk is unchanged.
 
@@ -679,12 +722,26 @@ Rewritten atomically (temp file + rename) whenever the session changes.
   "model": "claude-sonnet-5",
   "created_at": "2026-09-28T10:00:00Z",
   "updated_at": "2026-09-28T10:05:12Z",
-  "title": "optional, may be absent",
-  "usage": { "input_tokens": 5120, "output_tokens": 830, "cache_read_tokens": 0, "cache_write_tokens": 0 }
+  "title": "fix the flaky parser test",
+  "usage": { "input_tokens": 5120, "output_tokens": 830, "cache_read_tokens": 0, "cache_write_tokens": 0 },
+  "workdir": "C:\\work\\my-repo",
+  "branch": "fix/parser",
+  "activity": "running",
+  "pid": 41236
 }
 ```
 
-`status` is one of `created`, `active`, `closed`, `failed`. `usage` is the running total for the session.
+| Field | Meaning |
+|---|---|
+| `status` | `created`, `active`, `closed` or `failed`. |
+| `title` | The session's name: from `--name`, else the first line of the first message (up to 60 characters). Absent until one of those happens. |
+| `usage` | Token totals for the session. |
+| `workdir` | Absolute path of the project directory the session works in (updated when it's resumed). |
+| `branch` | The git branch checked out in `workdir` when the session was last opened. Absent outside a repository or on a detached HEAD. |
+| `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress) or `awaiting_approval` (a tool call is waiting for your decision). Absent once closed. |
+| `pid` | The process that has the session open. Absent once closed; if it's present but that process no longer exists, the process ended without closing the session (for example it crashed or was killed). |
+
+Other programs can watch this file to show a session's state; every change is written atomically. Sessions saved before a field existed simply don't have it.
 
 ### `sessions/<id>/turns.jsonl`
 
@@ -778,4 +835,3 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
 | Showing the model's reasoning | Extended thinking is saved in `turns.jsonl`, but the chat screen only shows `thinking…` while it happens, not the text. |
 | Tools returning images | Tool results are text only. |
-| `--help` / `--version` | Not implemented. |

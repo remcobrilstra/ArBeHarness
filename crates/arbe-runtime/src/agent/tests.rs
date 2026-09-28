@@ -255,7 +255,7 @@ fn test_parts(
             // depend on this repo's own CLAUDE.md.
             project_dir: temp_dir("no-project"),
             prompt: crate::system_prompt::PromptTemplate::Coding,
-            memory_home: temp_dir("no-home"),
+            home: temp_dir("no-home"),
         },
         store,
         meta,
@@ -1648,4 +1648,115 @@ async fn a_compaction_survives_resume() {
     // Only the newest turn remains as live history; the rest is the summary.
     assert!(state.history.iter().all(|e| e.turn_index == 2));
     assert_eq!(state.next_turn_index, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Session metadata other programs read (workdir, branch, activity, title)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_new_session_records_where_it_works_and_that_it_is_open() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::defaults(project.path().to_path_buf());
+    config.home = home.path().to_path_buf();
+    let store = SessionStore::with_root(home.path().join("sessions"));
+
+    let agent = Agent::create(&config, store.clone(), Arc::new(EventBus::new(16))).unwrap();
+    let meta = store.load_meta(agent.session_id()).unwrap();
+    assert_eq!(meta.workdir.as_deref(), Some(project.path()));
+    assert_eq!(meta.branch.as_deref(), Some("main"));
+    assert_eq!(meta.pid, Some(std::process::id()));
+    assert_eq!(meta.activity, Some(arbe_core::SessionActivity::Idle));
+    assert_eq!(meta.title, None);
+
+    agent.set_title("conflict fix").unwrap();
+    agent.close().unwrap();
+    let meta = store.load_meta(agent.session_id()).unwrap();
+    assert_eq!(meta.title.as_deref(), Some("conflict fix"));
+    assert_eq!((meta.activity, meta.pid), (None, None));
+    assert_eq!(meta.status, SessionStatus::Closed);
+
+    // Resuming reopens it.
+    let resumed =
+        Agent::resume(&config, store.clone(), meta.id, Arc::new(EventBus::new(16))).unwrap();
+    let meta = store.load_meta(resumed.session_id()).unwrap();
+    assert_eq!(meta.activity, Some(arbe_core::SessionActivity::Idle));
+    assert_eq!(meta.pid, Some(std::process::id()));
+}
+
+struct RecordHook {
+    phase: HookPhase,
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+#[async_trait]
+impl Hook for RecordHook {
+    fn phase(&self) -> HookPhase {
+        self.phase
+    }
+    async fn run(&self, payload: Value) -> Result<Value, HookError> {
+        self.seen.lock().unwrap().push(payload.clone());
+        Ok(payload)
+    }
+}
+
+#[tokio::test]
+async fn activity_and_title_are_kept_current_and_approval_waits_fire_a_hook() {
+    let provider = ScriptedProvider::new(
+        vec![tool_calls(&[("c1", "echo", json!({"x": 1}))])],
+        answer("final answer"),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (t, mut rx) = test_agent_with(provider, |parts| {
+        for phase in [HookPhase::OnApprovalRequested, HookPhase::OnTurnComplete] {
+            parts.hooks.register(Arc::new(RecordHook {
+                phase,
+                seen: seen.clone(),
+            }));
+        }
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    let meta = || t.store.load_meta(t.session_id).unwrap();
+
+    let agent = t.agent.clone();
+    let turn =
+        tokio::spawn(async move { agent.submit_message("\n  use echo \nplease".into()).await });
+    let id = wait_for(&mut rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        meta().activity,
+        Some(arbe_core::SessionActivity::AwaitingApproval)
+    );
+    assert_eq!(meta().title.as_deref(), Some("use echo"));
+
+    t.agent
+        .supply_tool_decision(id, ApprovalDecision::ApprovedOnce);
+    turn.await.unwrap().unwrap();
+    assert_eq!(meta().activity, Some(arbe_core::SessionActivity::Idle));
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let session_id = t.session_id.to_string();
+    assert_eq!(seen[0]["tool_name"], "echo");
+    assert_eq!(seen[0]["arguments"], json!({"x": 1}));
+    assert_eq!(seen[0]["tool_call_id"], id.to_string());
+    // Every payload carries the session id.
+    assert!(seen.iter().all(|p| p["session_id"] == session_id.as_str()));
+}
+
+#[test]
+fn titles_come_from_the_first_non_empty_line_shortened() {
+    assert_eq!(
+        title_from("\n\n  fix the build \nsecond"),
+        Some("fix the build".into())
+    );
+    assert_eq!(title_from("   \n"), None);
+    let long = title_from(&"word ".repeat(40)).unwrap();
+    assert!(long.ends_with('…') && long.chars().count() <= 60);
 }

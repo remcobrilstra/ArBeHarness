@@ -4,12 +4,12 @@
 //! assembled ad hoc at each call site, so a hook author has one place to
 //! read what each phase sends.
 
-use arbe_core::RuntimeEvent;
-use arbe_hooks::{HookPhase, HookRegistry};
+use arbe_core::{RiskLevel, RuntimeEvent};
+use arbe_hooks::HookPhase;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::EventBus;
+use super::Agent;
 
 #[derive(Debug, Serialize)]
 pub(super) struct TurnPayload {
@@ -50,34 +50,50 @@ pub(super) struct ToolResultPayload<'a> {
     pub output_chars: usize,
 }
 
+/// `OnApprovalRequested`: the call the user is being asked about.
+#[derive(Debug, Serialize)]
+pub(super) struct ApprovalPayload<'a> {
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: &'a str,
+    pub arguments: &'a Value,
+    pub risk: RiskLevel,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct ErrorPayload {
     pub turn_id: String,
     pub error: String,
 }
 
-/// Runs `phase`'s hooks over `payload` and returns the (possibly
-/// transformed) result. Hooks are isolated by `HookRegistry` (timeouts,
-/// panics), so this never fails; each hook that was skipped is published
-/// as `HookFailed` so a broken hook doesn't fail silently.
-pub(super) async fn run(
-    hooks: &HookRegistry,
-    events: &EventBus,
-    phase: HookPhase,
-    payload: &impl Serialize,
-) -> Value {
-    if hooks.is_empty() {
-        return serde_json::to_value(payload).unwrap_or(Value::Null);
+/// Runs `phase`'s hooks over `payload` (plus the session's `session_id`,
+/// added to every payload) and returns the (possibly transformed) result.
+/// Hooks are isolated by `HookRegistry` (timeouts, panics), so this never
+/// fails; each hook that was skipped is published as `HookFailed` so a
+/// broken hook doesn't fail silently.
+pub(super) async fn run(agent: &Agent, phase: HookPhase, payload: &impl Serialize) -> Value {
+    let value = with_session_id(
+        serde_json::to_value(payload).unwrap_or(Value::Null),
+        agent.session_id(),
+    );
+    if agent.hooks.is_empty() {
+        return value;
     }
-    let value = serde_json::to_value(payload).unwrap_or(Value::Null);
-    let (result, failures) = hooks.run_phase_reporting(phase, value).await;
+    let (result, failures) = agent.hooks.run_phase_reporting(phase, value).await;
     for failure in failures {
-        events.publish(RuntimeEvent::HookFailed {
+        agent.events.publish(RuntimeEvent::HookFailed {
             hook: failure.hook,
             reason: failure.reason,
         });
     }
     result
+}
+
+fn with_session_id(mut value: Value, session_id: arbe_core::SessionId) -> Value {
+    if let Value::Object(map) = &mut value {
+        map.insert("session_id".into(), Value::String(session_id.to_string()));
+    }
+    value
 }
 
 /// How a `BeforeToolExecute` result changes the call.

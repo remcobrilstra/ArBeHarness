@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,19 @@ pub enum SessionStatus {
     Active,
     Closed,
     Failed,
+}
+
+/// What a live session is doing right now, kept current in `meta.json`
+/// so another program can show it without subscribing to events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivity {
+    /// Open, waiting for the user's next message.
+    Idle,
+    /// A turn (or manual tool call) is in progress.
+    Running,
+    /// A turn is paused on a tool-approval decision.
+    AwaitingApproval,
 }
 
 /// Session-level metadata persisted as `~/.arbe/sessions/<session-id>/meta.json`.
@@ -31,6 +46,22 @@ pub struct SessionMeta {
     /// Provider-reported token usage summed over every turn.
     #[serde(default)]
     pub usage: Usage,
+    /// Absolute path of the project directory the session works in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
+    /// The project's git branch when the session was last opened (`None`
+    /// outside a repository or on a detached HEAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// What the session is doing, while a process has it open; `None` once
+    /// closed. See [`SessionActivity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivity>,
+    /// The process that has the session open; `None` once closed. If it's
+    /// set but that process is gone, the process ended without closing
+    /// the session (e.g. it crashed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 impl SessionMeta {
@@ -50,6 +81,10 @@ impl SessionMeta {
             updated_at: now,
             title: None,
             usage: Usage::default(),
+            workdir: None,
+            branch: None,
+            activity: None,
+            pid: None,
         }
     }
 

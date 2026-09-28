@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use arbe_core::{
     ApprovalDecision, Compaction, EventEnvelope, HarnessError, Message, ProviderError,
-    RequestedToolCall, RuntimeEvent, SessionId, SessionMeta, SessionStatus, StopReason, ToolCallId,
-    Turn, TurnId, Usage,
+    RequestedToolCall, RuntimeEvent, SessionActivity, SessionId, SessionMeta, SessionStatus,
+    StopReason, ToolCallId, Turn, TurnId, Usage,
 };
 use arbe_hooks::HookRegistry;
 use arbe_memory::{
@@ -76,8 +76,8 @@ struct Settings {
     project_dir: PathBuf,
     /// The profile's system prompt template, rendered every turn.
     prompt: PromptTemplate,
-    /// Harness home (`~/.arbe`), where persistent memory lives.
-    memory_home: PathBuf,
+    /// Harness home (`~/.arbe`): global instructions and persistent memory.
+    home: PathBuf,
 }
 
 /// Mutable session state. Only ever locked briefly, never across an
@@ -148,6 +148,32 @@ struct Parts {
     redactor: Redactor,
 }
 
+/// Records in `meta.json` where the session works and that this process
+/// has it open (idle), so other programs can find and track it.
+fn mark_open(meta: &mut SessionMeta, config: &RuntimeConfig, store: &SessionStore) {
+    let workdir =
+        std::path::absolute(&config.project_dir).unwrap_or_else(|_| config.project_dir.clone());
+    meta.branch = crate::git::current_branch(&workdir);
+    meta.workdir = Some(workdir);
+    meta.activity = Some(SessionActivity::Idle);
+    meta.pid = Some(std::process::id());
+    if let Err(err) = store.save_meta(meta) {
+        tracing::warn!(%err, "failed to update session metadata");
+    }
+}
+
+/// A session title from its first message: the first line, shortened.
+fn title_from(message: &str) -> Option<String> {
+    const MAX_CHARS: usize = 60;
+    let line = message.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(if line.chars().count() > MAX_CHARS {
+        let cut: String = line.chars().take(MAX_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        line.to_string()
+    })
+}
+
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
     match name {
         "compact_summary" => Box::new(CompactWithSummaryStrategy),
@@ -161,11 +187,12 @@ fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
 /// than cached, so edits take effect on the next turn without restarting.
 /// A read error degrades to an absent section — instructions are additive,
 /// not load-bearing, so a transient error can't take down a turn.
-fn build_system_prompt(template: &PromptTemplate, project_dir: &Path) -> String {
-    let global = arbe_storage::instructions::read_global_instructions().unwrap_or_else(|err| {
-        tracing::warn!(%err, "failed to read global instructions; continuing without them");
-        None
-    });
+fn build_system_prompt(template: &PromptTemplate, project_dir: &Path, home: &Path) -> String {
+    let global =
+        arbe_storage::instructions::read_global_instructions_at(home).unwrap_or_else(|err| {
+            tracing::warn!(%err, "failed to read global instructions; continuing without them");
+            None
+        });
     let project = arbe_storage::instructions::read_project_instructions(project_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(%err, "failed to read project instructions; continuing without them");
@@ -176,10 +203,15 @@ fn build_system_prompt(template: &PromptTemplate, project_dir: &Path) -> String 
 
 /// [`build_system_prompt`] off the async executor: `arbe_storage`'s readers
 /// (and a custom template file) are synchronous `std::fs` reads.
-async fn build_system_prompt_async(template: &PromptTemplate, project_dir: &Path) -> String {
+async fn build_system_prompt_async(
+    template: &PromptTemplate,
+    project_dir: &Path,
+    home: &Path,
+) -> String {
     let template = template.clone();
     let project_dir = project_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || build_system_prompt(&template, &project_dir))
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || build_system_prompt(&template, &project_dir, &home))
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
@@ -307,8 +339,10 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         config: &RuntimeConfig,
+        providers: &ProviderRegistry,
         store: SessionStore,
         meta: SessionMeta,
         events: Arc<EventBus>,
@@ -316,7 +350,7 @@ impl Agent {
         next_turn_index: u64,
         summary: Option<Compaction>,
     ) -> Result<Self, ProviderError> {
-        let provider = ProviderRegistry::with_builtins().build(
+        let provider = providers.build(
             &config.provider_name,
             ProviderSettings {
                 api_key: config.api_key.clone(),
@@ -330,7 +364,7 @@ impl Agent {
         registry.register(
             memory::REMEMBER_TOOL,
             Arc::new(memory::RememberTool::new(
-                arbe_storage::paths::arbe_home(),
+                config.home.clone(),
                 config.project_dir.clone(),
             )),
         );
@@ -341,7 +375,7 @@ impl Agent {
         let budget_tokens = config.effective_context_budget(capabilities.max_context_tokens);
 
         let (skills, skill_problems) =
-            skills::load_session_skills(&arbe_storage::paths::skills_dir(), &config.project_dir);
+            skills::load_session_skills(&config.home.join("skills"), &config.project_dir);
         let startup_warnings: Vec<String> = config
             .warnings
             .iter()
@@ -384,7 +418,7 @@ impl Agent {
                 thinking_budget_tokens: config.thinking_budget_tokens,
                 project_dir: config.project_dir.clone(),
                 prompt: config.prompt.clone(),
-                memory_home: arbe_storage::paths::arbe_home(),
+                home: config.home.clone(),
             },
             store,
             meta,
@@ -437,7 +471,7 @@ impl Agent {
         };
         let manager = Arc::new(McpManager::new(
             servers,
-            Some(arbe_storage::paths::logs_dir().join("mcp")),
+            Some(self.settings.home.join("logs").join("mcp")),
         ));
         let sink = self.registry_sink();
         let events = self.events.clone();
@@ -481,17 +515,29 @@ impl Agent {
         store: SessionStore,
         events: Arc<EventBus>,
     ) -> Result<Self, ProviderError> {
-        let meta = store
+        Self::create_with(config, store, events, &ProviderRegistry::with_builtins())
+    }
+
+    /// [`create`](Self::create), building the provider from `providers`
+    /// (e.g. one with an embedder's own provider registered).
+    pub fn create_with(
+        config: &RuntimeConfig,
+        store: SessionStore,
+        events: Arc<EventBus>,
+        providers: &ProviderRegistry,
+    ) -> Result<Self, ProviderError> {
+        let mut meta = store
             .create_session(
                 config.profile.clone(),
                 config.provider_name.clone(),
                 config.model.clone(),
             )
             .map_err(|e| ProviderError::Internal(format!("failed to create session: {e}")))?;
+        mark_open(&mut meta, config, &store);
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
         });
-        Self::assemble(config, store, meta, events, Vec::new(), 0, None)
+        Self::assemble(config, providers, store, meta, events, Vec::new(), 0, None)
     }
 
     /// Resumes a session from disk (harness spec FR-1): recovers a turn the
@@ -503,9 +549,27 @@ impl Agent {
         session_id: SessionId,
         events: Arc<EventBus>,
     ) -> Result<Self, ProviderError> {
-        let meta = store
+        Self::resume_with(
+            config,
+            store,
+            session_id,
+            events,
+            &ProviderRegistry::with_builtins(),
+        )
+    }
+
+    /// [`resume`](Self::resume), building the provider from `providers`.
+    pub fn resume_with(
+        config: &RuntimeConfig,
+        store: SessionStore,
+        session_id: SessionId,
+        events: Arc<EventBus>,
+        providers: &ProviderRegistry,
+    ) -> Result<Self, ProviderError> {
+        let mut meta = store
             .resume_session(session_id)
             .map_err(|e| ProviderError::Internal(format!("failed to resume session: {e}")))?;
+        mark_open(&mut meta, config, &store);
         recover_interrupted_turn(&store, session_id).map_err(|e| {
             ProviderError::Internal(format!("failed to recover interrupted turn: {e}"))
         })?;
@@ -527,6 +591,7 @@ impl Agent {
         });
         Self::assemble(
             config,
+            providers,
             store,
             meta,
             events,
@@ -608,7 +673,33 @@ impl Agent {
     pub fn close(&self) -> Result<(), arbe_storage::StorageError> {
         let mut state = self.state();
         state.meta.touch(SessionStatus::Closed);
+        state.meta.activity = None;
+        state.meta.pid = None;
         self.store.save_meta(&state.meta)
+    }
+
+    /// The session's title (`meta.json`), if it has one.
+    pub fn title(&self) -> Option<String> {
+        self.state().meta.title.clone()
+    }
+
+    /// Names the session. Without this, the first message sets a title.
+    pub fn set_title(&self, title: impl Into<String>) -> Result<(), arbe_storage::StorageError> {
+        let mut state = self.state();
+        state.meta.title = Some(title.into());
+        self.store.save_meta(&state.meta)
+    }
+
+    /// Records what the session is doing in `meta.json`.
+    fn set_activity(&self, activity: SessionActivity) {
+        let mut state = self.state();
+        if state.meta.activity == Some(activity) {
+            return;
+        }
+        state.meta.activity = Some(activity);
+        if let Err(err) = self.store.save_meta(&state.meta) {
+            tracing::warn!(%err, "failed to record session activity");
+        }
     }
 
     /// Cancels the running turn, if any: streaming stops, running tools are
@@ -635,6 +726,7 @@ impl Agent {
     /// duration of the returned guard.
     fn begin_exclusive(&self) -> Result<ActiveTurn<'_>, HarnessError> {
         let lock = self.turn_lock.try_lock().map_err(|_| HarnessError::Busy)?;
+        self.set_activity(SessionActivity::Running);
         let cancel = CancellationToken::new();
         *self.active_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
         Ok(ActiveTurn {
@@ -730,5 +822,6 @@ impl Drop for ActiveTurn<'_> {
             .active_cancel
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
+        self.agent.set_activity(SessionActivity::Idle);
     }
 }
