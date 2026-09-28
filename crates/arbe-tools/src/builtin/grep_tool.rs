@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
 use regex::{Regex, RegexBuilder};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use walkdir::WalkDir;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Caps how many matching lines a single `grep` call returns.
 const MAX_MATCHES: usize = 500;
@@ -18,11 +19,14 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 /// Same noisy-directory skip list `glob` uses.
 const SKIPPED_DIR_NAMES: &[&str] = &[".git", "target", "node_modules", ".venv"];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// Regular expression.
     pattern: String,
+    /// Directory to search under. Defaults to ".".
     #[serde(default = "default_path")]
     path: String,
+    /// Match regardless of case.
     #[serde(default)]
     case_insensitive: bool,
 }
@@ -50,6 +54,16 @@ impl GrepTool {
 
 #[async_trait]
 impl ToolExecutor for GrepTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Search file contents by regex within the project directory, returning matching lines.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

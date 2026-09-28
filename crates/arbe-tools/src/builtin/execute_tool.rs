@@ -2,13 +2,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Default and maximum allowed `timeout_secs` — a command with no timeout
 /// still needs *some* bound so a runaway process can't hang the loop
@@ -16,9 +17,11 @@ use crate::{ToolContext, ToolExecutor};
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// The command line to run (via `cmd /C` on Windows, `sh -c` elsewhere).
     command: String,
+    /// Seconds before the command is killed. Defaults to 30, capped at 300.
     #[serde(default)]
     timeout_secs: Option<u64>,
 }
@@ -41,6 +44,16 @@ impl ExecuteTool {
 
 #[async_trait]
 impl ToolExecutor for ExecuteTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Run a shell command with the project directory as its working directory. Highest-risk tool — always approval-gated.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::High
+    }
+
     /// Not parallel-safe: it runs an arbitrary command.
     fn parallel_safe(&self) -> bool {
         false

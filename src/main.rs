@@ -38,6 +38,13 @@ fn main() {
             std::env::set_var("ARBE_WORKDIR", workdir);
         }
     }
+    // --profile: which settings profile to use (`coding`, `general`, or
+    // one defined in a config file).
+    if let Some(profile) = parse_arg("--profile") {
+        unsafe {
+            std::env::set_var("ARBE_PROFILE", profile);
+        }
+    }
 
     tokio::runtime::Runtime::new()
         .expect("failed to start the tokio runtime")
@@ -45,7 +52,15 @@ fn main() {
 }
 
 async fn run() {
-    let config = RuntimeConfig::from_env();
+    // Defaults < ~/.arbe/config/config.toml < <workdir>/.arbe/config.toml
+    // < the selected profile < ARBE_* env vars / CLI flags.
+    let config = match RuntimeConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("invalid configuration: {err}");
+            std::process::exit(2);
+        }
+    };
     let store = arbe_tui::arbe_runtime::arbe_storage::SessionStore::new();
     let events = Arc::new(EventBus::default());
 

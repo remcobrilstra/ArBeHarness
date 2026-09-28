@@ -1,24 +1,29 @@
 use std::path::PathBuf;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use arbe_storage::atomic::write_atomic;
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Mirrors `read_file::MAX_READ_BYTES` — an edit reads the whole file into
 /// memory before applying the find/replace, so it needs the same guard
 /// against a single tool call pulling an entire large file into memory.
 const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// Path relative to the project root.
     path: String,
+    /// Exact text to find.
     find: String,
+    /// Text to put in its place.
     replace: String,
+    /// Replace every occurrence. Defaults to false, which fails on more than one match.
     #[serde(default)]
     replace_all: bool,
 }
@@ -39,6 +44,16 @@ impl EditFileTool {
 
 #[async_trait]
 impl ToolExecutor for EditFileTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Find-and-replace a substring within an existing file. Fails if `find` doesn't match, or matches more than once unless replace_all is set.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
     /// Not parallel-safe: it rewrites a file.
     fn parallel_safe(&self) -> bool {
         false

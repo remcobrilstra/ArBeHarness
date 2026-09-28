@@ -180,7 +180,7 @@ async fn approve_call(
         },
     )
     .await;
-    let risk = arbe_tools::builtin::default_risk_for(&call.name);
+    let risk = registry.risk_of(&call.name);
     let invocation = ToolInvocation {
         id: ToolCallId::new(),
         source_turn: turn_id,

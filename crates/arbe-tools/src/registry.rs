@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arbe_core::ToolError;
+use arbe_core::{RiskLevel, ToolError, ToolSpec};
 
 use crate::ToolExecutor;
 
@@ -31,6 +31,43 @@ impl ToolRegistry {
 
     pub fn contains(&self, tool_name: &str) -> bool {
         self.executors.contains_key(tool_name)
+    }
+
+    /// Keeps only the tools `keep` accepts (e.g. a profile's allow-set).
+    /// A removed tool is neither offered to the model nor callable.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.executors.retain(|name, _| keep(name));
+    }
+
+    /// Registered tool names, sorted.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.executors.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// What to offer a model: one spec per registered tool, sorted by name
+    /// (a stable order keeps the prompt prefix cacheable across turns).
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.names()
+            .into_iter()
+            .map(|name| {
+                let described = self.executors[&name].description();
+                ToolSpec {
+                    name,
+                    description: described.description,
+                    parameters: described.parameters,
+                }
+            })
+            .collect()
+    }
+
+    /// A registered tool's risk; `Medium` for an unknown name.
+    pub fn risk_of(&self, tool_name: &str) -> RiskLevel {
+        self.executors
+            .get(tool_name)
+            .map(|e| e.default_risk())
+            .unwrap_or(RiskLevel::Medium)
     }
 }
 

@@ -1,17 +1,20 @@
 use std::path::PathBuf;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use arbe_storage::atomic::write_atomic;
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// Path relative to the project root.
     path: String,
+    /// The complete new file content.
     content: String,
 }
 
@@ -30,6 +33,16 @@ impl WriteFileTool {
 
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Create or overwrite a file within the project directory with the given content.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
+
     /// Not parallel-safe: it writes a file.
     fn parallel_safe(&self) -> bool {
         false

@@ -22,9 +22,6 @@ pub mod write_file;
 use std::path::Path;
 use std::sync::Arc;
 
-use arbe_core::{RiskLevel, ToolSpec};
-use serde_json::json;
-
 use crate::ToolRegistry;
 
 /// The fixed tool-name -> executor wiring. Kept in one place so the set of
@@ -76,141 +73,6 @@ pub fn register_all(registry: &mut ToolRegistry, root: &Path) {
     registry.register("todo_write", Arc::new(todo_write::TodoWriteTool::new()));
 }
 
-/// JSON-schema descriptions of every builtin tool, for a provider that
-/// supports tool calling (`ProviderCapabilities::tool_calls`) — this is
-/// what tells the model these tools exist and how to call them. Kept
-/// hand-authored right next to `TOOL_NAMES`/`register_all` (rather than a
-/// trait method on `ToolExecutor`) so adding a schema here can't drift
-/// from the tool's actual `Args` struct without a human noticing in
-/// review; each schema below is written straight off the corresponding
-/// tool module's `Args`.
-pub fn tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "read_file".to_string(),
-            description: "Read a UTF-8 text file (optionally a 1-indexed inclusive line range) from within the project directory.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path relative to the project root."},
-                    "start_line": {"type": "integer", "description": "1-indexed, inclusive. Omit with end_line to read the whole file."},
-                    "end_line": {"type": "integer", "description": "1-indexed, inclusive."}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "write_file".to_string(),
-            description: "Create or overwrite a file within the project directory with the given content.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path relative to the project root."},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolSpec {
-            name: "edit_file".to_string(),
-            description: "Find-and-replace a substring within an existing file. Fails if `find` doesn't match, or matches more than once unless replace_all is set.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path relative to the project root."},
-                    "find": {"type": "string"},
-                    "replace": {"type": "string"},
-                    "replace_all": {"type": "boolean", "description": "Defaults to false (fails on more than one match)."}
-                },
-                "required": ["path", "find", "replace"]
-            }),
-        },
-        ToolSpec {
-            name: "list_dir".to_string(),
-            description: "List the entries (name + is_dir) of a directory within the project directory.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path relative to the project root. Defaults to \".\"."}
-                }
-            }),
-        },
-        ToolSpec {
-            name: "glob".to_string(),
-            description: "Find files matching a glob pattern (e.g. \"**/*.rs\") within the project directory.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "e.g. \"**/*.rs\", \"src/*.toml\"."},
-                    "path": {"type": "string", "description": "Directory to search under. Defaults to \".\"."}
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolSpec {
-            name: "grep".to_string(),
-            description: "Search file contents by regex within the project directory, returning matching lines.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regular expression."},
-                    "path": {"type": "string", "description": "Directory to search under. Defaults to \".\"."},
-                    "case_insensitive": {"type": "boolean"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolSpec {
-            name: "execute".to_string(),
-            description: "Run a shell command with the project directory as its working directory. Highest-risk tool — always approval-gated.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_secs": {"type": "integer", "description": "Defaults to 30, capped at 300."}
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolSpec {
-            name: "todo_write".to_string(),
-            description: "Replace the current task's todo list, for tracking progress on multi-step work. Each call resends the full list.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {"type": "string"},
-                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
-                            },
-                            "required": ["content", "status"]
-                        }
-                    }
-                },
-                "required": ["todos"]
-            }),
-        },
-    ]
-}
-
-/// A coarse, tool-name-keyed default risk for a model-initiated call
-/// (harness spec FR-4's risk indicator) — read/list/search operations are
-/// low risk, file mutation is medium, arbitrary shell execution is high.
-/// Purely informational (the approval *policy* decision is driven by
-/// `ApprovalPolicyMode`/allow-/denylist, not risk — see `crate::policy`),
-/// used only for what's shown to a human when a prompt is required.
-pub fn default_risk_for(tool_name: &str) -> RiskLevel {
-    match tool_name {
-        "read_file" | "list_dir" | "glob" | "grep" | "todo_write" => RiskLevel::Low,
-        "write_file" | "edit_file" => RiskLevel::Medium,
-        "execute" => RiskLevel::High,
-        _ => RiskLevel::Medium,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,25 +112,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_declared_tool_name_has_a_spec_and_a_default_risk() {
-        let specs = tool_specs();
-        for name in TOOL_NAMES {
-            assert!(
-                specs.iter().any(|s| s.name == *name),
-                "expected a ToolSpec for {name:?}"
-            );
-            // Exercised for the side effect of not panicking on an
-            // unrecognized name — every declared name must hit a real
-            // match arm, not the catch-all default.
-            let _ = default_risk_for(name);
-        }
-        assert_eq!(specs.len(), TOOL_NAMES.len());
+    fn builtin_specs() -> Vec<arbe_core::ToolSpec> {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry, Path::new("."));
+        registry.specs()
+    }
+
+    fn required(spec: &arbe_core::ToolSpec) -> Vec<&str> {
+        let mut names: Vec<&str> = spec.parameters["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     #[test]
-    fn execute_is_the_highest_risk_builtin() {
-        assert_eq!(default_risk_for("execute"), RiskLevel::High);
-        assert_eq!(default_risk_for("read_file"), RiskLevel::Low);
+    fn every_builtin_describes_itself_with_an_object_schema() {
+        let specs = builtin_specs();
+        assert_eq!(specs.len(), TOOL_NAMES.len());
+        for spec in &specs {
+            assert!(
+                !spec.description.is_empty(),
+                "{} has no description",
+                spec.name
+            );
+            assert_eq!(spec.parameters["type"], "object", "{}", spec.name);
+            let text = spec.parameters.to_string();
+            assert!(!text.contains("$ref"), "{} schema uses $ref", spec.name);
+            assert!(
+                !text.contains("$schema"),
+                "{} schema has $schema",
+                spec.name
+            );
+        }
+    }
+
+    /// The schema is derived from each tool's real argument type, so
+    /// required-ness follows `#[serde(default)]`/`Option` exactly.
+    #[test]
+    fn required_arguments_follow_the_argument_types() {
+        let specs = builtin_specs();
+        let spec = |name: &str| specs.iter().find(|s| s.name == name).unwrap().clone();
+        assert_eq!(required(&spec("read_file")), vec!["path"]);
+        assert_eq!(required(&spec("write_file")), vec!["content", "path"]);
+        assert_eq!(
+            required(&spec("edit_file")),
+            vec!["find", "path", "replace"]
+        );
+        assert_eq!(required(&spec("list_dir")), Vec::<&str>::new());
+        assert_eq!(required(&spec("grep")), vec!["pattern"]);
+        assert_eq!(required(&spec("execute")), vec!["command"]);
+        assert_eq!(required(&spec("todo_write")), vec!["todos"]);
+        // Field doc comments become the argument descriptions.
+        assert_eq!(
+            spec("read_file").parameters["properties"]["path"]["description"],
+            "Path relative to the project root."
+        );
+        // Nested types are inlined, including the status enum.
+        let status =
+            &spec("todo_write").parameters["properties"]["todos"]["items"]["properties"]["status"];
+        assert_eq!(
+            status["enum"],
+            serde_json::json!(["pending", "in_progress", "completed"])
+        );
+    }
+
+    #[test]
+    fn risk_levels_come_from_the_tools() {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry, Path::new("."));
+        use arbe_core::RiskLevel;
+        assert_eq!(registry.risk_of("execute"), RiskLevel::High);
+        assert_eq!(registry.risk_of("write_file"), RiskLevel::Medium);
+        assert_eq!(registry.risk_of("read_file"), RiskLevel::Low);
+        assert_eq!(registry.risk_of("todo_write"), RiskLevel::Low);
+        assert_eq!(registry.risk_of("not-a-tool"), RiskLevel::Medium);
     }
 }

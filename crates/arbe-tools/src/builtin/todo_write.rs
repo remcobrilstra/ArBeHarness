@@ -1,11 +1,12 @@
 use std::sync::Mutex;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Caps how many todos a single call can hold, so a runaway list can't
 /// flood every subsequent turn's context (this tool's own output gets fed
@@ -13,7 +14,7 @@ use crate::{ToolContext, ToolExecutor};
 /// tool).
 const MAX_TODOS: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
@@ -21,14 +22,17 @@ pub enum TodoStatus {
     Completed,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TodoItem {
+    /// What needs doing.
     pub content: String,
+    /// At most one item may be in_progress.
     pub status: TodoStatus,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// The complete todo list (replaces the previous one).
     todos: Vec<TodoItem>,
 }
 
@@ -67,6 +71,16 @@ impl Default for TodoWriteTool {
 
 #[async_trait]
 impl ToolExecutor for TodoWriteTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Replace the current task's todo list, for tracking progress on multi-step work. Each call resends the full list.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+
     /// Not parallel-safe: it replaces the shared todo list.
     fn parallel_safe(&self) -> bool {
         false

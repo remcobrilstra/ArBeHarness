@@ -1,19 +1,21 @@
 use std::path::PathBuf;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Caps how many entries a single `list_dir` call returns, so a huge
 /// directory can't flood the model's context in one call.
 const MAX_ENTRIES: usize = 1_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// Path relative to the project root. Defaults to ".".
     #[serde(default = "default_path")]
     path: String,
 }
@@ -40,6 +42,16 @@ impl ListDirTool {
 
 #[async_trait]
 impl ToolExecutor for ListDirTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "List the entries (name + is_dir) of a directory within the project directory.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

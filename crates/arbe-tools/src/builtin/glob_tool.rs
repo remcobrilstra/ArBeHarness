@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use walkdir::WalkDir;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Caps how many matches a single `glob` call returns, so a broad pattern
 /// over a large tree can't flood the model's context in one call.
@@ -18,10 +19,11 @@ const MAX_MATCHES: usize = 2_000;
 /// never what a glob over source code is looking for.
 const SKIPPED_DIR_NAMES: &[&str] = &[".git", "target", "node_modules", ".venv"];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
-    /// e.g. `"**/*.rs"`, `"src/*.toml"`.
+    /// Glob pattern, e.g. "**/*.rs" or "src/*.toml".
     pattern: String,
+    /// Directory to search under. Defaults to ".".
     #[serde(default = "default_path")]
     path: String,
 }
@@ -42,6 +44,16 @@ impl GlobTool {
 
 #[async_trait]
 impl ToolExecutor for GlobTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Find files matching a glob pattern (e.g. \"**/*.rs\") within the project directory.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

@@ -60,6 +60,8 @@ Phase 7 (hardening) is done: cross-crate integration coverage was added at the `
 - Live smoke tests: `cargo test -p arbe-providers --test live -- --ignored --nocapture` (each provider skips without credentials). Stream fixtures in unit tests are hand-written from documented formats, not captured traffic.
 - Env knobs added: `ARBE_MAX_RETRIES`, `ARBE_THINKING_BUDGET`, `ARBE_HTTP_HEADERS`, `ARBE_CONTEXT_BUDGET`, `ARBE_MAX_TOOL_ROUNDS`.
 
+**v2 config & profiles** (v2 plan P4.1–P4.3): `RuntimeConfig::load()` layers defaults → built-in profile → `~/.arbe/config/config.toml` → `<workdir>/.arbe/config.toml` → `[profiles.<name>]` sections → `ARBE_*` env (CLI flags set env). Use `RuntimeConfig::load_from(files, &env_fn, project_dir)` in tests (env as a function — never mutate process env) or `RuntimeConfig::defaults(dir)` for a plain struct. Profiles carry a tool allow-set (enforced via `ToolRegistry::retain`) and a `PromptTemplate`. Tool specs come from `ToolExecutor::description()` (`ToolDescription::from_args::<Args>` via schemars — put model-facing docs on the `Args` fields) and `ToolRegistry::specs()`.
+
 **v2 agent loop** (v2 plan P3, `crates/arbe-runtime/src/agent/`):
 - `Agent`'s methods all take `&self`; share it as `Arc<Agent>` with no outer lock. `submit_message` runs one turn (a second concurrent one → `HarnessError::Busy`); `cancel_turn()` and `supply_tool_decision(id, decision)` work *during* a turn; `invoke_tool(name, args)` is the manual `/tool` path and goes through exactly the same gated code as a model call.
 - Modules: `mod.rs` (session state + API), `turn.rs` (turn runner: streaming rounds, loop guards, persistence), `tools.rs` (one round of tool calls), `hooks.rs` (typed hook payloads), `approvals.rs` (decision mailbox), `tests.rs`.

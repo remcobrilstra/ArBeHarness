@@ -296,7 +296,8 @@ impl TurnRunner<'_> {
         .await;
 
         advance(&mut self.machine, LoopPhase::AssembleContext)?;
-        let system_prompt = build_system_prompt_async(&agent.settings.project_dir).await;
+        let system_prompt =
+            build_system_prompt_async(&agent.settings.prompt, &agent.settings.project_dir).await;
         let user_message = Message::new(Role::User, content);
         let (context, estimated_display) = {
             let mut state = agent.state();
@@ -329,7 +330,7 @@ impl TurnRunner<'_> {
             .capabilities(&agent.settings.model)
             .tool_calls
         {
-            arbe_tools::builtin::tool_specs()
+            agent.registry_snapshot().specs()
         } else {
             Vec::new()
         };

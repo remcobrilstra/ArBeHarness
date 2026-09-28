@@ -45,6 +45,7 @@ use arbe_tools::{
 
 use crate::EventBus;
 use crate::config::RuntimeConfig;
+use crate::system_prompt::PromptTemplate;
 use approvals::ToolDecisions;
 
 /// Fixed-for-the-session knobs, copied out of `RuntimeConfig`.
@@ -65,6 +66,8 @@ struct Settings {
     /// The repo/project this agent works on (`RuntimeConfig::project_dir`)
     /// — the sandbox root the builtin tools are registered against.
     project_dir: PathBuf,
+    /// The profile's system prompt template, rendered every turn.
+    prompt: PromptTemplate,
 }
 
 /// Mutable session state. Only ever locked briefly, never across an
@@ -130,7 +133,7 @@ fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
 /// than cached, so edits take effect on the next turn without restarting.
 /// A read error degrades to an absent section — instructions are additive,
 /// not load-bearing, so a transient error can't take down a turn.
-fn build_system_prompt(project_dir: &Path) -> String {
+fn build_system_prompt(template: &PromptTemplate, project_dir: &Path) -> String {
     let global = arbe_storage::instructions::read_global_instructions().unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to read global instructions; continuing without them");
         None
@@ -140,14 +143,15 @@ fn build_system_prompt(project_dir: &Path) -> String {
             tracing::warn!(%err, "failed to read project instructions; continuing without them");
             None
         });
-    crate::system_prompt::render_system_prompt(global.as_deref(), project.as_deref())
+    crate::system_prompt::render_template(&template.text(), global.as_deref(), project.as_deref())
 }
 
 /// [`build_system_prompt`] off the async executor: `arbe_storage`'s readers
-/// are synchronous `std::fs` calls.
-async fn build_system_prompt_async(project_dir: &Path) -> String {
+/// (and a custom template file) are synchronous `std::fs` reads.
+async fn build_system_prompt_async(template: &PromptTemplate, project_dir: &Path) -> String {
+    let template = template.clone();
     let project_dir = project_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || build_system_prompt(&project_dir))
+    tokio::task::spawn_blocking(move || build_system_prompt(&template, &project_dir))
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
@@ -261,11 +265,14 @@ impl Agent {
                 api_key: config.api_key.clone(),
                 base_url: config.base_url.clone(),
                 extra_headers: config.extra_headers.clone(),
-                ..Default::default()
+                catalog: config.catalog.clone(),
             },
         )?;
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
+        if let Some(allowed) = &config.tools {
+            registry.retain(|name| allowed.iter().any(|a| a == name));
+        }
         let budget_tokens = config
             .effective_context_budget(provider.capabilities(&config.model).max_context_tokens);
 
@@ -284,6 +291,7 @@ impl Agent {
                 retry: config.retry,
                 thinking_budget_tokens: config.thinking_budget_tokens,
                 project_dir: config.project_dir.clone(),
+                prompt: config.prompt.clone(),
             },
             store,
             meta,

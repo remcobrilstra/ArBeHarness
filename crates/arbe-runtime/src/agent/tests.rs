@@ -253,6 +253,7 @@ fn test_parts(
             // Doesn't exist: no project instruction files, so tests don't
             // depend on this repo's own CLAUDE.md.
             project_dir: temp_dir("no-project"),
+            prompt: crate::system_prompt::PromptTemplate::Coding,
         },
         store,
         meta,
@@ -507,6 +508,9 @@ async fn the_whole_tool_trace_is_sent_persisted_and_replayed() {
 
     {
         let requests = requests.lock().unwrap();
+        // Tools registered at runtime are offered to the model, with the
+        // description each tool gives of itself.
+        assert!(requests[0].tools.iter().any(|t| t.name == "echo"));
         let second = &requests[1].messages;
         let assistant = &second[second.len() - 2];
         // Text alongside the tool call is kept; fragments were reassembled.
@@ -1059,4 +1063,32 @@ async fn builtin_tools_are_registered_and_usable_through_the_real_agent() {
 
     std::fs::remove_dir_all(&store_dir).ok();
     std::fs::remove_dir_all(&project_dir).ok();
+}
+
+/// A profile's tool allow-set is enforced by construction: tools outside
+/// it aren't registered, so they're neither offered nor callable.
+#[tokio::test]
+async fn the_general_profile_agent_only_has_its_allowed_tools() {
+    let store_dir = temp_dir("general-store");
+    let config = crate::RuntimeConfig {
+        provider_name: "ollama".into(),
+        tools: Some(vec!["todo_write".into()]),
+        prompt: crate::PromptTemplate::General,
+        ..crate::RuntimeConfig::defaults(temp_dir("general-project"))
+    };
+    let agent = Agent::create(
+        &config,
+        SessionStore::with_root(store_dir.clone()),
+        Arc::new(EventBus::default()),
+    )
+    .unwrap();
+    assert_eq!(agent.registry_snapshot().names(), vec!["todo_write"]);
+    let message = agent
+        .invoke_tool("execute", json!({"command": "echo hi"}))
+        .await
+        .unwrap();
+    let (_, text, is_error) = tool_result_of(&message, 0);
+    assert!(is_error);
+    assert!(text.contains("no tool registered"), "{text}");
+    std::fs::remove_dir_all(&store_dir).ok();
 }

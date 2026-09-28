@@ -1,23 +1,26 @@
 use std::path::PathBuf;
 
-use arbe_core::{ToolError, ToolInvocation, ToolResult};
+use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::{ToolContext, ToolExecutor};
+use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Files larger than this are rejected rather than read in full — keeps a
 /// single tool call from pulling an entire large binary/log into the
 /// model's context by accident.
 const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
+    /// Path relative to the project root.
     path: String,
-    /// 1-indexed, inclusive. Omit both to read the whole file.
+    /// First line to read, 1-indexed and inclusive. Omit (with `end_line`) to read the whole file.
     start_line: Option<u64>,
+    /// Last line to read, 1-indexed and inclusive.
     end_line: Option<u64>,
 }
 
@@ -33,6 +36,16 @@ impl ReadFileTool {
 
 #[async_trait]
 impl ToolExecutor for ReadFileTool {
+    fn description(&self) -> ToolDescription {
+        ToolDescription::from_args::<Args>(
+            "Read a UTF-8 text file (optionally a 1-indexed inclusive line range) from within the project directory.",
+        )
+    }
+
+    fn default_risk(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

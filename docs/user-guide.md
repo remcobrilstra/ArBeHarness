@@ -10,18 +10,20 @@ This guide is for people **using** ArBeHarness: how to start it, how to configur
 
 1. [Quick start](#quick-start)
 2. [Command-line arguments](#command-line-arguments)
-3. [Environment variables](#environment-variables)
-4. [Providers and models](#providers-and-models)
-5. [The chat screen](#the-chat-screen)
-6. [Keybindings](#keybindings)
-7. [Chat commands](#chat-commands)
-8. [Tools and approvals](#tools-and-approvals)
-9. [Instructions and skills](#instructions-and-skills)
-10. [Sessions](#sessions)
-11. [Where files are stored](#where-files-are-stored)
-12. [File formats](#file-formats)
-13. [Logs and troubleshooting](#logs-and-troubleshooting)
-14. [Not yet active](#not-yet-active)
+3. [Configuration file](#configuration-file)
+4. [Profiles](#profiles)
+5. [Environment variables](#environment-variables)
+6. [Providers and models](#providers-and-models)
+7. [The chat screen](#the-chat-screen)
+8. [Keybindings](#keybindings)
+9. [Chat commands](#chat-commands)
+10. [Tools and approvals](#tools-and-approvals)
+11. [Instructions and skills](#instructions-and-skills)
+12. [Sessions](#sessions)
+13. [Where files are stored](#where-files-are-stored)
+14. [File formats](#file-formats)
+15. [Logs and troubleshooting](#logs-and-troubleshooting)
+16. [Not yet active](#not-yet-active)
 
 ---
 
@@ -60,6 +62,7 @@ The agent works on the directory you start it in. To point it somewhere else, us
 | Argument | Equivalent env var | Description |
 |---|---|---|
 | `--workdir <path>` | `ARBE_WORKDIR` | The project/repository the agent works on. File tools are sandboxed to it and shell commands run in it. Defaults to the current directory. |
+| `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, or one defined in a config file. |
 | `--dev-home <path>` | `ARBE_HOME` | **For development and testing only.** Moves the harness's own storage (normally `~/.arbe/`) to another directory so experiments don't touch your real sessions and settings. |
 
 Both accept `--flag value` or `--flag=value`. If you pass both a flag and its env var, the flag wins.
@@ -70,7 +73,7 @@ When running through Cargo, put the arguments after `--`:
 cargo run --release -- --workdir ../my-project
 ```
 
-There is no `--help`, `--version`, or other flag right now. Unknown arguments are silently ignored. Everything else is configured with [environment variables](#environment-variables).
+There is no `--help`, `--version`, or other flag right now. Unknown arguments are silently ignored. Everything else is configured with a [configuration file](#configuration-file) or [environment variables](#environment-variables).
 
 ### Workdir vs. harness home
 
@@ -81,14 +84,136 @@ These two are easy to mix up:
 
 ---
 
+## Configuration file
+
+Settings can live in TOML files instead of (or as well as) environment variables. Both files are optional:
+
+| File | Scope |
+|---|---|
+| `~/.arbe/config/config.toml` | Global: every project. |
+| `<workdir>/.arbe/config.toml` | Project: only when working in this directory. |
+
+**Precedence**, lowest to highest: built-in defaults → the built-in profile → global file → project file → the selected profile's section in the global file, then in the project file → environment variables → command-line flags. Each layer only changes what it sets.
+
+Files are read once at startup; restart after editing. A mistake stops the app before the chat opens, with a message naming the file and line, for example:
+
+```text
+invalid configuration: C:\Users\you\.arbe\config\config.toml: TOML parse error at line 2, column 1 ... unknown field `temprature`
+```
+
+Unknown keys are errors on purpose, so a typo can't silently do nothing.
+
+### Example
+
+```toml
+profile = "coding"                 # default profile (see Profiles)
+
+[provider]
+name = "anthropic"                 # ollama | openai | anthropic | openai_compatible
+model = "claude-sonnet-5"
+# base_url = "https://..."
+api_key_env = "ANTHROPIC_API_KEY"  # NAME of the env var holding the key
+headers = { "X-Title" = "ArBe" }
+
+[generation]
+temperature = 0.2
+max_tokens = 4096
+# thinking_budget_tokens = 8000
+
+[context]
+# budget_tokens = 100000
+memory_strategy = "truncation"     # truncation | compact_summary
+
+[loop]
+max_tool_rounds = 50
+# max_turn_tokens = 500000
+max_tool_output_chars = 50000
+max_retries = 4
+
+[approval]
+mode = "allowlist_auto"            # always_prompt | allowlist_auto | denylist_block | dry_run_only
+allow = ["read_file", "list_dir", "glob", "grep", "todo_write"]
+deny = []
+session_approval_covers_high_risk = false
+
+[hooks]
+timeout_ms = 500
+
+[[models]]                         # correct the built-in model table
+provider = "ollama"
+name = "qwen3:14b"
+context_window = 32768
+# tool_calls = true, vision = false, thinking = false
+```
+
+### Keys
+
+| Key | Default | Description |
+|---|---|---|
+| `profile` | `coding` | Profile to use. Top level only. |
+| `tools` | all tools | Tools the model may use, by name. Tools not listed are not available at all (not even through `/tool`). |
+| `prompt` | per profile | System prompt template: `coding`, `general`, or a path to your own Markdown file (relative paths are relative to the config file). See [Profiles](#profiles). |
+| `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
+| `provider.model` | per provider | Same as `ARBE_MODEL`. |
+| `provider.base_url` | provider's endpoint | Same as `ARBE_BASE_URL`. |
+| `provider.api_key_env` | the provider's usual variable | The **name** of the environment variable that holds the API key, e.g. `"WORK_OPENAI_KEY"`. Keys themselves never go in a config file: an `api_key` key is rejected. |
+| `provider.headers` | none | Extra HTTP headers, as a table. Same as `ARBE_HTTP_HEADERS`. |
+| `generation.temperature` | `1.0` openai, else `0.2` | Same as `ARBE_TEMPERATURE`. |
+| `generation.max_tokens` | `4096` | Maximum length of one model response, in tokens. |
+| `generation.thinking_budget_tokens` | off | Same as `ARBE_THINKING_BUDGET`. |
+| `context.budget_tokens` | window − `max_tokens` | Same as `ARBE_CONTEXT_BUDGET`. |
+| `context.memory_strategy` | `truncation` | What happens to older history that no longer fits. `truncation` leaves it out silently; `compact_summary` leaves it out and adds a one-line note saying how many messages (and roughly how many tokens) were left out. Neither summarizes the content yet. |
+| `loop.max_tool_rounds` | `50` | Same as `ARBE_MAX_TOOL_ROUNDS`. |
+| `loop.max_turn_tokens` | off | Same as `ARBE_MAX_TURN_TOKENS`. |
+| `loop.max_tool_output_chars` | `50000` | Same as `ARBE_MAX_TOOL_OUTPUT_CHARS`. |
+| `loop.max_retries` | `4` | Same as `ARBE_MAX_RETRIES`. |
+| `approval.mode` | `always_prompt` | See [Approvals](#approvals). |
+| `approval.allow` | `[]` | Tools that run without asking in `allowlist_auto` mode. |
+| `approval.deny` | `[]` | Tools that are always refused in `denylist_block` mode. |
+| `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` also covers high-risk tools (`execute`). |
+| `hooks.timeout_ms` | `500` | Time limit for each hook. (You can't register hooks yet; see [Not yet active](#not-yet-active).) |
+| `[[models]]` | none | Corrects the [context-window table](#providers-and-models) for one model: `provider`, exact `name`, `context_window`, and optionally `tool_calls`, `vision`, `thinking`. For Ollama this also sets the context size the server is asked to allocate. |
+
+---
+
+## Profiles
+
+A profile is a named set of settings: which tools the agent has, which system prompt it uses, and anything else from the config file. Pick one with `--profile`, `ARBE_PROFILE`, or `profile = "..."` in a config file. The header shows the active profile.
+
+Two profiles are built in:
+
+| Profile | Tools | System prompt |
+|---|---|---|
+| `coding` (default) | all builtin tools | A software-engineering agent working in the workdir. |
+| `general` | only `todo_write` (no file access, no shell) | A general-purpose assistant. |
+
+Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine `coding` or `general` this way.
+
+```toml
+[profiles.review]                  # a read-only code reviewer
+tools = ["read_file", "list_dir", "glob", "grep"]
+prompt = "prompts/review.md"      # your own template
+
+[profiles.review.approval]
+mode = "allowlist_auto"
+allow = ["read_file", "list_dir", "glob", "grep"]
+```
+
+**Custom prompt templates** are Markdown files. Put `{global_instructions}` and `{project_instructions}` where your [instruction files](#instructions-and-skills) should be inserted; either can be left out. The file is re-read before every message. If it can't be read, the `coding` template is used instead.
+
+An unknown profile name stops the app at startup with a list of the known ones.
+
+---
+
 ## Environment variables
 
-All configuration is read from environment variables at startup. Changing one requires restarting the app.
+Environment variables override the [configuration file](#configuration-file). They're read at startup; changing one requires restarting the app. An invalid number (e.g. `ARBE_MAX_TOOL_ROUNDS=lots`) stops the app with an error naming the variable.
 
 ### Provider and model
 
 | Variable | Default | Description |
 |---|---|---|
+| `ARBE_PROFILE` | `coding` | Same as `--profile`. See [Profiles](#profiles). |
 | `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`. See [Providers and models](#providers-and-models). |
 | `ARBE_MODEL` | per provider: `llama3.1` (ollama), `gpt-5-mini` (openai), `claude-sonnet-5` (anthropic) | The model ID sent to the provider. |
 | `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. |
@@ -258,7 +383,16 @@ If a tool fails (bad arguments, file not found, unknown tool) or you deny it, th
 
 ### Approvals
 
-Right now **every tool call asks for approval**. This includes the low-risk read-only tools. The approval mode is fixed to "always prompt". Other modes (allowlist, denylist, dry-run) exist internally but can't be selected yet.
+How tool calls are approved is set by `approval.mode` in the [configuration file](#configuration-file):
+
+| Mode | Behavior |
+|---|---|
+| `always_prompt` (default) | Every call asks you, including the read-only tools. |
+| `allowlist_auto` | Tools listed in `approval.allow` run without asking; everything else asks. |
+| `denylist_block` | Tools listed in `approval.deny` are refused; everything else runs without asking. |
+| `dry_run_only` | Nothing runs. Every call is refused, and the model is told so. |
+
+**High-risk tools always ask.** `execute` (and any other high-risk tool) prompts you even if a mode or list would let it run on its own. Only `dry_run_only` refuses it outright.
 
 In the approval dialog you can:
 
@@ -329,7 +463,7 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 | Linux / macOS | `~/.arbe/` (from `$HOME`) |
 | Windows | `%USERPROFILE%\.arbe\`, e.g. `C:\Users\you\.arbe\` |
 
-`--dev-home` / `ARBE_HOME` moves the whole tree. The harness never writes to your workdir itself. Only the tools the model calls (and you approve) change files there.
+`--dev-home` / `ARBE_HOME` moves the whole tree. In the workdir, the harness only *reads* `agent.md`/`CLAUDE.md` and `.arbe/config.toml`. It never writes there itself. Only the tools the model calls (and you approve) change files there.
 
 ```text
 ~/.arbe/
@@ -347,7 +481,8 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 │   ├── global/memory.md       (reserved, not read yet)
 │   └── projects/<id>/memory.md (reserved, not read yet)
 ├── mcp/                        (reserved, not read yet)
-├── config/                     (reserved, not read yet)
+├── config/
+│   └── config.toml            your global settings (active)
 └── logs/                       (reserved, nothing written yet)
 ```
 
@@ -437,6 +572,7 @@ Common problems:
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `invalid configuration: ...` at startup | A config file has a typo, an unknown key, or an invalid value, or an `ARBE_*` number variable isn't a number. The message names the file and line or the variable. |
 | Connection error with the default setup | Ollama isn't running. Start it, or set `ARBE_PROVIDER`. |
 | `... provider requires an api_key` | Set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or `ARBE_API_KEY`). |
 | `openai_compatible provider requires a base_url` | Set `ARBE_BASE_URL`. |
@@ -457,11 +593,9 @@ These have code in the repository but **can't be used yet**. They're listed so y
 
 | Feature | Status |
 |---|---|
-| Config file (`~/.arbe/config/`) | No config file is read. Everything comes from environment variables. |
-| Approval modes other than always-prompt | Allowlist, denylist, and dry-run exist internally but can't be selected. |
 | MCP servers (`~/.arbe/mcp/servers.toml`) | The client and the file parser exist, but servers are not started or offered to the model. |
 | Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
-| Memory strategy selection | Always `truncation`: the oldest turns are dropped when over budget. Summary-based compaction exists but can't be selected. |
+| Real summarization of old history | `compact_summary` only notes how much was left out; it doesn't summarize it. |
 | Project-local / session-local skills | Only global skills (`~/.arbe/skills/`) are loaded. |
 | Hooks | The hook system exists, but you can't register your own hooks. |
 | Log files (`~/.arbe/logs/`) | Nothing is written. |

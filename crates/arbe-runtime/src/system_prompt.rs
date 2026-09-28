@@ -1,9 +1,64 @@
-/// Placeholder-based system prompt composition (docs/tmp/system-prompt.md).
-/// Deliberately temporary: the exact wording below is a stand-in until a
-/// real template is written, but the substitution mechanism
-/// (`{global_instructions}`/`{project_instructions}`) is the actual
-/// contract other code should rely on.
-const TEMPLATE: &str = "\
+//! Placeholder-based system prompt composition (docs/tmp/system-prompt.md).
+//! A template is Markdown text with optional `{global_instructions}` and
+//! `{project_instructions}` placeholders; the built-in wordings are
+//! stand-ins until real templates are written, but the substitution
+//! contract is what other code relies on.
+
+use std::path::PathBuf;
+
+/// Which system prompt template a profile uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptTemplate {
+    /// Software-engineering agent working on the project directory.
+    Coding,
+    /// General-purpose assistant; no assumptions about code or files.
+    General,
+    /// A Markdown file with the user's own template, re-read every turn.
+    File(PathBuf),
+}
+
+impl PromptTemplate {
+    /// `"coding"`, `"general"`, or anything else as a file path.
+    pub fn parse(value: &str, relative_to: Option<&std::path::Path>) -> Self {
+        match value {
+            "coding" => Self::Coding,
+            "general" => Self::General,
+            path => {
+                let path = PathBuf::from(path);
+                match relative_to {
+                    Some(base) if path.is_relative() => Self::File(base.join(path)),
+                    _ => Self::File(path),
+                }
+            }
+        }
+    }
+
+    /// The template text. A custom file that can't be read falls back to
+    /// the coding template (with a warning), so a moved file degrades the
+    /// prompt instead of breaking every turn.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Coding => CODING_TEMPLATE.to_string(),
+            Self::General => GENERAL_TEMPLATE.to_string(),
+            Self::File(path) => std::fs::read_to_string(path).unwrap_or_else(|err| {
+                tracing::warn!(path = %path.display(), %err, "prompt template unreadable; using the coding template");
+                CODING_TEMPLATE.to_string()
+            }),
+        }
+    }
+}
+
+const GENERAL_TEMPLATE: &str = "You are ArBeHarness, a helpful general-purpose assistant. Answer questions, help with writing and analysis, and work through problems step by step.
+
+Use the tools you have when they help; don't assume you can read or change files unless a tool for it is available.
+
+Keep responses clear and direct: lead with the answer, then the detail that supports it. Say so when you're unsure rather than guessing.
+
+{global_instructions}
+
+{project_instructions}";
+
+const CODING_TEMPLATE: &str = "\
 You are ArBeHarness, an autonomous agent that completes software engineering tasks: solving bugs, adding functionality, refactoring, and explaining code. Your main goal is to complete the user's request.
 
 You are highly capable and often allow users to complete ambitious tasks that would otherwise be too complex or take too long. Defer to the user's judgement about whether a task is too large to attempt.
@@ -27,34 +82,41 @@ Keep responses brief and direct: lead with the action or answer, skip restating 
 /// could otherwise crowd out all history for a turn.
 const MAX_SECTION_CHARS: usize = 8_000;
 
-/// Renders [`TEMPLATE`] by substituting `{global_instructions}` and
+/// Renders the coding template — see [`render_template`].
+pub fn render_system_prompt(global: Option<&str>, project: Option<&str>) -> String {
+    render_template(CODING_TEMPLATE, global, project)
+}
+
+/// Renders `template` by substituting `{global_instructions}` and
 /// `{project_instructions}` with the given content, each capped at
 /// `MAX_SECTION_CHARS`. A missing section (`None`) substitutes an empty
 /// string rather than omitting the placeholder text itself, so the
 /// template's surrounding wording never needs to special-case absence.
 ///
-/// Splits `TEMPLATE` around both placeholders up front and assembles the
-/// result from the pieces, rather than doing two sequential `.replace()`
-/// passes over the same growing string — a sequential replace would rescan
-/// text already substituted in by the first pass, so if `global`'s content
-/// happened to contain the literal substring `"{project_instructions}"`
-/// (plausible for a hand-written `agent.md`/`CLAUDE.md`), the second
-/// `.replace` would splice the project instructions into the middle of the
-/// already-inserted global instructions instead of leaving them alone.
-pub fn render_system_prompt(global: Option<&str>, project: Option<&str>) -> String {
-    let (before, rest) = TEMPLATE
-        .split_once("{global_instructions}")
-        .expect("TEMPLATE must contain the {global_instructions} placeholder");
-    let (middle, after) = rest
-        .split_once("{project_instructions}")
-        .expect("TEMPLATE must contain the {project_instructions} placeholder");
+/// Each placeholder is optional and replaced at most once (a custom
+/// template may leave either out). Substitution is a single pass over the
+/// template's own text, never over already-inserted content: if `global`
+/// contained the literal `"{project_instructions}"` (plausible in an
+/// `agent.md` that documents this very contract), a second `.replace()`
+/// pass would splice the project section into it.
+pub fn render_template(template: &str, global: Option<&str>, project: Option<&str>) -> String {
+    let mut slots: Vec<(usize, &str, String)> = [
+        ("{global_instructions}", global),
+        ("{project_instructions}", project),
+    ]
+    .into_iter()
+    .filter_map(|(marker, value)| template.find(marker).map(|at| (at, marker, cap(value))))
+    .collect();
+    slots.sort_by_key(|(at, _, _)| *at);
 
-    let mut rendered = String::with_capacity(TEMPLATE.len());
-    rendered.push_str(before);
-    rendered.push_str(&cap(global));
-    rendered.push_str(middle);
-    rendered.push_str(&cap(project));
-    rendered.push_str(after);
+    let mut rendered = String::with_capacity(template.len());
+    let mut cursor = 0;
+    for (at, marker, value) in slots {
+        rendered.push_str(&template[cursor..at]);
+        rendered.push_str(&value);
+        cursor = at + marker.len();
+    }
+    rendered.push_str(&template[cursor..]);
     rendered
 }
 
@@ -114,6 +176,44 @@ mod tests {
         // The project section must appear exactly once, in its own slot —
         // not injected a second time into the middle of the global text.
         assert_eq!(rendered.matches("this is a Rust repo").count(), 1);
+    }
+
+    #[test]
+    fn custom_templates_may_omit_or_reorder_placeholders() {
+        assert_eq!(
+            render_template(
+                "P: {project_instructions} G: {global_instructions}",
+                Some("g"),
+                Some("p")
+            ),
+            "P: p G: g"
+        );
+        assert_eq!(
+            render_template("no slots here", Some("g"), Some("p")),
+            "no slots here"
+        );
+    }
+
+    #[test]
+    fn templates_are_chosen_by_name_or_path() {
+        assert_eq!(
+            PromptTemplate::parse("coding", None),
+            PromptTemplate::Coding
+        );
+        assert_eq!(
+            PromptTemplate::parse("general", None),
+            PromptTemplate::General
+        );
+        assert_eq!(
+            PromptTemplate::parse("prompts/mine.md", Some(std::path::Path::new("/cfg"))),
+            PromptTemplate::File(std::path::Path::new("/cfg").join("prompts/mine.md"))
+        );
+        assert!(PromptTemplate::General.text().contains("general-purpose"));
+        // An unreadable custom template degrades to the coding one.
+        assert_eq!(
+            PromptTemplate::File("/definitely/not/here.md".into()).text(),
+            PromptTemplate::Coding.text()
+        );
     }
 
     #[test]
