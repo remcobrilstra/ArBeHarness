@@ -161,12 +161,20 @@ async fn kill_process_tree(pid: u32) {
 /// redirection, and multiple statements the same way they would at a
 /// terminal, rather than being limited to a single argv-style program +
 /// args.
-fn shell_command(command: &str) -> Command {
-    if cfg!(windows) {
+///
+/// On Windows the command line is handed to `cmd` verbatim
+/// (`cmd /S /C "<command>"` via `raw_arg`): Rust's normal argument quoting
+/// escapes inner quotes with backslashes, which `cmd` doesn't understand,
+/// so anything like `git commit -m "fix bug"` would arrive mangled.
+pub fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.raw_arg(format!("/S /C \"{command}\""));
         c
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         let mut c = Command::new("sh");
         c.arg("-c").arg(command);
         c
@@ -262,6 +270,27 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::Timeout));
+    }
+
+    /// Quotes must reach the shell intact on every platform (on Windows,
+    /// Rust's default argument escaping used to mangle them for `cmd`).
+    #[tokio::test]
+    async fn quoted_arguments_reach_the_shell_intact() {
+        let dir = tempdir().unwrap();
+        let tool = ExecuteTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute_default(invocation(
+                json!({ "command": "echo \"hello  world\" && echo second" }),
+            ))
+            .await
+            .unwrap();
+        let stdout = result.output["stdout"].as_str().unwrap();
+        assert!(stdout.contains("hello  world"), "{stdout:?}");
+        assert!(stdout.contains("second"), "{stdout:?}");
+        assert!(
+            !stdout.contains('\\'),
+            "backslash escapes leaked: {stdout:?}"
+        );
     }
 
     #[tokio::test]

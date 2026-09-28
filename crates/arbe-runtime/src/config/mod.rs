@@ -28,6 +28,14 @@ use arbe_providers::{ModelCatalog, RetryPolicy, catalog};
 pub use crate::system_prompt::PromptTemplate;
 use file::Layer;
 
+/// One configured command hook.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookCommand {
+    pub phase: arbe_hooks::HookPhase,
+    pub command: String,
+    pub timeout: std::time::Duration,
+}
+
 /// How skills reach the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillsMode {
@@ -63,6 +71,9 @@ pub struct RuntimeConfig {
     pub allowlist: Vec<String>,
     pub denylist: Vec<String>,
     pub hook_timeout_ms: u64,
+    /// Command hooks, in the order they were configured (global file
+    /// first). See `arbe_hooks::CommandHook`.
+    pub hook_commands: Vec<HookCommand>,
     /// Whether "approve for session" also covers `RiskLevel::High` tools.
     pub session_approval_covers_high_risk: bool,
     /// Runaway guard: model<->tool rounds per turn.
@@ -132,6 +143,7 @@ impl RuntimeConfig {
             allowlist: Vec::new(),
             denylist: Vec::new(),
             hook_timeout_ms: 500,
+            hook_commands: Vec::new(),
             session_approval_covers_high_risk: false,
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
             max_turn_tokens: None,
@@ -329,6 +341,32 @@ impl RuntimeConfig {
         }
         if let Some(h) = &layer.hooks {
             assign(&mut self.hook_timeout_ms, h.timeout_ms);
+            // Hooks accumulate across files rather than replacing: a
+            // project's hooks run in addition to the global ones.
+            for entry in h.commands.iter().flatten() {
+                let phase = arbe_hooks::HookPhase::from_name(&entry.phase).ok_or_else(|| {
+                    let known: Vec<&str> = arbe_hooks::HookPhase::ALL
+                        .iter()
+                        .map(|p| p.name())
+                        .collect();
+                    invalid(
+                        path,
+                        &format!(
+                            "hooks.commands: unknown phase {:?} (one of: {})",
+                            entry.phase,
+                            known.join(", ")
+                        ),
+                    )
+                })?;
+                self.hook_commands.push(HookCommand {
+                    phase,
+                    command: entry.command.clone(),
+                    timeout: entry
+                        .timeout_ms
+                        .map(std::time::Duration::from_millis)
+                        .unwrap_or(arbe_hooks::command::DEFAULT_COMMAND_TIMEOUT),
+                });
+            }
         }
         if let Some(skills) = &layer.skills
             && let Some(mode) = &skills.mode
@@ -940,6 +978,54 @@ mod tests {
         std::fs::create_dir_all(dir.join("repo")).unwrap();
         assert!(is_trusted(&dir.join("repo").join("not-created"), &trusted));
         assert!(!is_trusted(&dir.join("other"), &trusted));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hook_commands_accumulate_and_unknown_phases_are_rejected() {
+        let dir = temp_dir();
+        let global = write(
+            &dir,
+            "g.toml",
+            "[[hooks.commands]]\nphase = \"on_turn_complete\"\ncommand = \"notify-send done\"\n",
+        );
+        let project = write(
+            &dir,
+            "p.toml",
+            "[[hooks.commands]]\nphase = \"before_tool_execute\"\ncommand = \"./guard\"\ntimeout_ms = 2000\n",
+        );
+        let c = load(&[global, project], &no_env).unwrap();
+        assert_eq!(c.hook_commands.len(), 2);
+        assert_eq!(
+            c.hook_commands[1].phase,
+            arbe_hooks::HookPhase::BeforeToolExecute
+        );
+        assert_eq!(
+            c.hook_commands[1].timeout,
+            std::time::Duration::from_millis(2000)
+        );
+
+        let bad = write(
+            &dir,
+            "b.toml",
+            "[[hooks.commands]]\nphase = \"sometimes\"\ncommand = \"x\"\n",
+        );
+        let err = load(&[bad], &no_env).unwrap_err().to_string();
+        assert!(err.contains("before_tool_execute"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_add_hook_commands() {
+        let dir = temp_dir();
+        let project = write(
+            &dir,
+            "p.toml",
+            "[[hooks.commands]]\nphase = \"on_turn_complete\"\ncommand = \"curl evil\"\n",
+        );
+        let c = RuntimeConfig::load_from_sources(&[], &[project], &no_env, dir.clone()).unwrap();
+        assert!(c.hook_commands.is_empty());
+        assert!(c.warnings[0].contains("hook commands"));
         std::fs::remove_dir_all(dir).ok();
     }
 

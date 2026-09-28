@@ -19,11 +19,12 @@ This guide is for people **using** ArBeHarness: how to start it, how to configur
 9. [Chat commands](#chat-commands)
 10. [Tools and approvals](#tools-and-approvals)
 11. [Instructions and skills](#instructions-and-skills)
-12. [Sessions](#sessions)
-13. [Where files are stored](#where-files-are-stored)
-14. [File formats](#file-formats)
-15. [Logs and troubleshooting](#logs-and-troubleshooting)
-16. [Not yet active](#not-yet-active)
+12. [Hooks](#hooks)
+13. [Sessions](#sessions)
+14. [Where files are stored](#where-files-are-stored)
+15. [File formats](#file-formats)
+16. [Logs and troubleshooting](#logs-and-troubleshooting)
+17. [Not yet active](#not-yet-active)
 
 ---
 
@@ -109,7 +110,7 @@ A project's `.arbe/config.toml` arrives with whatever repository you open, so by
 
 - `provider.base_url`, `provider.api_key_env`, `provider.headers` (where requests, and your key, are sent)
 - everything under `[approval]`
-- `[mcp.servers.*]` (programs the harness would start)
+- `[mcp.servers.*]` and `[[hooks.commands]]` (programs the harness would start)
 - the same keys inside `[profiles.*]`
 
 An `[error]` line when the session starts lists what was ignored. Everything else in a project config (model, limits, `tools`, `prompt`, skills mode, …) still applies.
@@ -191,7 +192,8 @@ context_window = 32768
 | `approval.deny` | `[]` | Tools that are always refused in `denylist_block` mode. |
 | `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` also covers high-risk tools (`execute`). |
 | `skills.mode` | `on_demand` | `on_demand` or `always`. See [Skills](#skills). |
-| `hooks.timeout_ms` | `500` | Time limit for each hook. (You can't register hooks yet; see [Not yet active](#not-yet-active).) |
+| `hooks.timeout_ms` | `500` | Default time limit for hooks that don't set their own. |
+| `[[hooks.commands]]` | none | Shell commands run at points in a turn. See [Hooks](#hooks). |
 | `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
 | `[[models]]` | none | Corrects the [context-window table](#providers-and-models) for one model: `provider`, exact `name`, `context_window`, and optionally `tool_calls`, `vision`, `thinking`. For Ollama this also sets the context size the server is asked to allocate. |
 
@@ -507,6 +509,55 @@ Prefer `thiserror` for error types.
 
 ---
 
+## Hooks
+
+A hook is a shell command the harness runs at a fixed point in every turn — to log activity, notify you, or check a tool call before it runs. Add them to a [config file](#configuration-file):
+
+```toml
+[[hooks.commands]]
+phase = "before_tool_execute"
+command = "python C:/tools/guard.py"   # run with cmd /C (Windows) or sh -c
+timeout_ms = 5000                        # optional; default 10 s
+
+[[hooks.commands]]
+phase = "on_turn_complete"
+command = "notify-send 'ArBe finished'"
+```
+
+Hooks from the global and the project config both run (global first). Project hooks only run if the project is [trusted](#trusted-projects), since they're programs. Commands run in the workdir.
+
+**What a hook receives.** The phase's details as one JSON object on stdin, with a `phase` field added:
+
+| `phase` | Fields |
+|---|---|
+| `before_context_assembly` | `turn_id` |
+| `before_model_call` | `turn_id`, `round`, `message_count` |
+| `after_model_call` | `turn_id`, `round`, `text_chars`, `tool_calls` |
+| `before_tool_execute` | `turn_id`, `tool_name`, `arguments` |
+| `after_tool_execute` | `turn_id`, `tool_name`, `is_error`, `output_chars` |
+| `on_error` | `turn_id`, `error` |
+| `on_turn_complete` | `turn_id` |
+
+**What it can change.** Only `before_tool_execute` hooks affect anything; the others are notifications. A `before_tool_execute` hook can print a JSON object to stdout:
+
+- the same object with different `arguments`: the tool call is rewritten (the approval dialog then shows the rewritten arguments);
+- an object with `"veto": "reason"`: the call is refused, and the model is told `blocked by hook: reason`.
+
+Printing nothing leaves the call as it was. A hook runs *before* the approval dialog, so it can't be used to skip approvals.
+
+**When a hook fails** — non-zero exit, output that isn't a JSON object, or running past its time limit — it's skipped, the turn carries on, and an `[error]` line says which hook failed and why (including what it printed to stderr).
+
+Example guard (Python) that refuses `git push`:
+
+```python
+import json, sys
+call = json.load(sys.stdin)
+if call["tool_name"] == "execute" and "git push" in call["arguments"].get("command", ""):
+    print(json.dumps({"veto": "pushing is done by humans here"}))
+```
+
+---
+
 ## Sessions
 
 Each launch starts a **new session**. Everything a turn produces is saved as it happens: your message, each assistant reply, every tool call and its result. If the app crashes or is killed mid-turn, the next time you resume that session the unfinished turn is recovered (marked as interrupted, with any tool calls that hadn't run yet recorded as "not executed"). At most the reply that was streaming at that moment is lost.
@@ -642,6 +693,7 @@ Common problems:
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `<phase> hook <command> failed: ...` | A [hook](#hooks) exited with an error, printed something that isn't a JSON object, or timed out. The message includes its stderr. The turn continued without it. |
 | `...config.toml: ignored ... (this project isn't trusted ...)` | The project's config tried to change a [security-sensitive setting](#trusted-projects). Add the project to `trusted_projects` in your global config if you trust it. |
 | `invalid configuration: ...` at startup | A config file has a typo, an unknown key, or an invalid value, or an `ARBE_*` number variable isn't a number. The message names the file and line or the variable. |
 | `MCP server <name> unavailable: ...` | The server couldn't be started or reached. Check the command/URL, and `~/.arbe/logs/mcp/<name>.log` for its own error output. `failed to start "..."` means the program wasn't found on your `PATH`. |
@@ -670,7 +722,6 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | Memory notes (`~/.arbe/memory/...`) | The files can be read, but their content isn't added to the context. |
 | Real summarization of old history | `compact_summary` only notes how much was left out; it doesn't summarize it. |
 | Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
-| Hooks | The hook system exists, but you can't register your own hooks. |
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
 | Showing the model's reasoning | Extended thinking is saved in `turns.jsonl`, but the chat screen only shows `thinking…` while it happens, not the text. |

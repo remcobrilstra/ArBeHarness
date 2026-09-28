@@ -4,9 +4,12 @@
 //! assembled ad hoc at each call site, so a hook author has one place to
 //! read what each phase sends.
 
+use arbe_core::RuntimeEvent;
 use arbe_hooks::{HookPhase, HookRegistry};
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::EventBus;
 
 #[derive(Debug, Serialize)]
 pub(super) struct TurnPayload {
@@ -55,10 +58,26 @@ pub(super) struct ErrorPayload {
 
 /// Runs `phase`'s hooks over `payload` and returns the (possibly
 /// transformed) result. Hooks are isolated by `HookRegistry` (timeouts,
-/// panics), so this never fails.
-pub(super) async fn run(hooks: &HookRegistry, phase: HookPhase, payload: &impl Serialize) -> Value {
+/// panics), so this never fails; each hook that was skipped is published
+/// as `HookFailed` so a broken hook doesn't fail silently.
+pub(super) async fn run(
+    hooks: &HookRegistry,
+    events: &EventBus,
+    phase: HookPhase,
+    payload: &impl Serialize,
+) -> Value {
+    if hooks.is_empty() {
+        return serde_json::to_value(payload).unwrap_or(Value::Null);
+    }
     let value = serde_json::to_value(payload).unwrap_or(Value::Null);
-    hooks.run_phase(phase, value).await
+    let (result, failures) = hooks.run_phase_reporting(phase, value).await;
+    for failure in failures {
+        events.publish(RuntimeEvent::HookFailed {
+            hook: failure.hook,
+            reason: failure.reason,
+        });
+    }
+    result
 }
 
 /// How a `BeforeToolExecute` result changes the call.

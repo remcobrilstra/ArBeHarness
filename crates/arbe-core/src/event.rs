@@ -112,6 +112,11 @@ pub enum RuntimeEvent {
         server: String,
         reason: String,
     },
+    /// A hook failed (error, bad output, timeout) and was skipped.
+    HookFailed {
+        hook: String,
+        reason: String,
+    },
     /// Older context was compacted to fit the budget.
     CompactionPerformed {
         session_id: SessionId,

@@ -172,6 +172,7 @@ async fn approve_call(
 ) -> Option<Slot> {
     let hook_result = hooks::run(
         &agent.hooks,
+        &agent.events,
         HookPhase::BeforeToolExecute,
         &ToolCallPayload {
             turn_id: turn_id.to_string(),
@@ -374,6 +375,7 @@ async fn run_batch(
         };
         hooks::run(
             &agent.hooks,
+            &agent.events,
             HookPhase::AfterToolExecute,
             &ToolResultPayload {
                 turn_id: turn_id.to_string(),

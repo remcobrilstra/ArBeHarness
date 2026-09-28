@@ -34,26 +34,40 @@ impl HookRegistry {
         self.hooks.push(hook);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+    }
+
     /// Runs every hook registered for `phase`, in registration order,
     /// threading the (possibly transformed) payload through the chain.
     pub async fn run_phase(&self, phase: HookPhase, payload: Value) -> Value {
+        self.run_phase_reporting(phase, payload).await.0
+    }
+
+    /// [`run_phase`](Self::run_phase), also returning a report for every
+    /// hook that failed, panicked, or timed out (and was skipped).
+    pub async fn run_phase_reporting(
+        &self,
+        phase: HookPhase,
+        payload: Value,
+    ) -> (Value, Vec<HookFailure>) {
         let mut current = payload;
+        let mut failures = Vec::new();
         for hook in self.hooks.iter().filter(|h| h.phase() == phase) {
+            let name = hook.name();
+            let limit = hook.timeout().unwrap_or(self.timeout);
             let hook = hook.clone();
             let input = current.clone();
             let mut handle = tokio::spawn(async move { hook.run(input).await });
-            let outcome = tokio::time::timeout(self.timeout, &mut handle).await;
+            let outcome = tokio::time::timeout(limit, &mut handle).await;
 
-            current = match outcome {
-                Ok(Ok(Ok(transformed))) => transformed,
-                Ok(Ok(Err(err))) => {
-                    tracing::warn!(?err, "hook returned an error; skipping its output");
-                    current
+            let reason = match outcome {
+                Ok(Ok(Ok(transformed))) => {
+                    current = transformed;
+                    continue;
                 }
-                Ok(Err(join_err)) => {
-                    tracing::warn!(%join_err, "hook panicked; skipping its output");
-                    current
-                }
+                Ok(Ok(Err(err))) => err.to_string(),
+                Ok(Err(join_err)) => format!("panicked: {join_err}"),
                 Err(_elapsed) => {
                     // Dropping the timeout future doesn't stop the spawned
                     // task — only .abort() does. Without this, a hook that
@@ -61,16 +75,21 @@ impl HookRegistry {
                     // running in the background indefinitely instead of
                     // actually being cut off.
                     handle.abort();
-                    tracing::warn!(
-                        timeout_ms = self.timeout.as_millis(),
-                        "hook timed out; aborting and skipping its output"
-                    );
-                    current
+                    format!("timed out after {} ms", limit.as_millis())
                 }
             };
+            tracing::warn!(hook = %name, %reason, "hook failed; skipping its output");
+            failures.push(HookFailure { hook: name, reason });
         }
-        current
+        (current, failures)
     }
+}
+
+/// A hook that was skipped because it failed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookFailure {
+    pub hook: String,
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -162,6 +181,45 @@ mod tests {
 
         let result = registry.run_phase(HookPhase::OnError, json!("start")).await;
         assert_eq!(result, json!("start-after"));
+    }
+
+    #[tokio::test]
+    async fn failures_are_reported_with_the_hooks_name() {
+        let mut registry = HookRegistry::new(Duration::from_millis(500));
+        registry.register(Arc::new(FailingHook(HookPhase::OnError)));
+        registry.register(Arc::new(AppendHook(HookPhase::OnError, "-after")));
+
+        let (result, failures) = registry
+            .run_phase_reporting(HookPhase::OnError, json!("start"))
+            .await;
+        assert_eq!(result, json!("start-after"));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].hook, "on_error hook");
+        assert!(failures[0].reason.contains("nope"));
+    }
+
+    struct PatientHook;
+
+    #[async_trait]
+    impl Hook for PatientHook {
+        fn phase(&self) -> HookPhase {
+            HookPhase::OnError
+        }
+        async fn run(&self, payload: Value) -> Result<Value, HookError> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(json!(format!("{}-patient", payload.as_str().unwrap())))
+        }
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(5))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hooks_own_timeout_overrides_the_registry_default() {
+        let mut registry = HookRegistry::new(Duration::from_millis(50));
+        registry.register(Arc::new(PatientHook));
+        let result = registry.run_phase(HookPhase::OnError, json!("start")).await;
+        assert_eq!(result, json!("start-patient"));
     }
 
     #[tokio::test]

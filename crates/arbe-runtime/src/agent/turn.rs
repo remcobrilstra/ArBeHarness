@@ -148,6 +148,7 @@ pub(super) async fn run_turn(
             advance(&mut runner.machine, LoopPhase::Idle)?;
             hooks::run(
                 &agent.hooks,
+                &agent.events,
                 HookPhase::OnTurnComplete,
                 &TurnPayload {
                     turn_id: turn_id.to_string(),
@@ -180,6 +181,7 @@ pub(super) async fn run_turn(
             });
             hooks::run(
                 &agent.hooks,
+                &agent.events,
                 HookPhase::OnError,
                 &ErrorPayload {
                     turn_id: turn_id.to_string(),
@@ -288,6 +290,7 @@ impl TurnRunner<'_> {
         });
         hooks::run(
             &agent.hooks,
+            &agent.events,
             HookPhase::BeforeContextAssembly,
             &TurnPayload {
                 turn_id: turn_id.to_string(),
@@ -367,6 +370,7 @@ impl TurnRunner<'_> {
             advance(&mut self.machine, LoopPhase::ModelInference)?;
             hooks::run(
                 &agent.hooks,
+                &agent.events,
                 HookPhase::BeforeModelCall,
                 &ModelCallPayload {
                     turn_id: turn_id.to_string(),
@@ -401,6 +405,7 @@ impl TurnRunner<'_> {
 
             hooks::run(
                 &agent.hooks,
+                &agent.events,
                 HookPhase::AfterModelCall,
                 &ModelResultPayload {
                     turn_id: turn_id.to_string(),

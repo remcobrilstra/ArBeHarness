@@ -69,6 +69,11 @@ impl Layer {
         if self.mcp.take().is_some() {
             removed.push("mcp servers");
         }
+        if let Some(hooks) = &mut self.hooks
+            && hooks.commands.take().is_some()
+        {
+            removed.push("hook commands");
+        }
         if self.trusted_projects.take().is_some() {
             removed.push("trusted_projects");
         }
@@ -144,6 +149,17 @@ pub struct McpSection {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksSection {
+    pub timeout_ms: Option<u64>,
+    /// `[[hooks.commands]]`: shell commands run at a lifecycle phase.
+    pub commands: Option<Vec<CommandHookEntry>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandHookEntry {
+    /// e.g. `"before_tool_execute"`.
+    pub phase: String,
+    pub command: String,
     pub timeout_ms: Option<u64>,
 }
 

@@ -1223,3 +1223,46 @@ async fn project_skills_are_indexed_on_demand_or_inlined_always() {
     std::fs::remove_dir_all(&project).ok();
     std::fs::remove_dir_all(&store_dir).ok();
 }
+
+#[tokio::test]
+async fn command_hooks_can_veto_tool_calls_and_their_failures_are_reported() {
+    let veto = if cfg!(windows) {
+        r#"echo {"veto": "blocked by policy script"}"#.to_string()
+    } else {
+        r#"echo '{"veto": "blocked by policy script"}'"#.to_string()
+    };
+    let provider = ScriptedProvider::new(
+        vec![tool_calls(&[("c1", "echo", json!({"x": 1}))])],
+        answer("ok"),
+    );
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.hooks.register(Arc::new(arbe_hooks::CommandHook::new(
+            HookPhase::BeforeToolExecute,
+            veto,
+        )));
+        parts.hooks.register(Arc::new(arbe_hooks::CommandHook::new(
+            HookPhase::OnTurnComplete,
+            "exit 4",
+        )));
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+
+    t.agent.submit_message("go".into()).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    let (_, text, is_error) = tool_result_of(requests[1].messages.last().unwrap(), 0);
+    assert!(is_error);
+    assert_eq!(text, "blocked by hook: blocked by policy script");
+    let failed = drain(&mut rx).into_iter().find_map(|e| match e {
+        RuntimeEvent::HookFailed { hook, reason } => Some((hook, reason)),
+        _ => None,
+    });
+    let (hook, reason) = failed.expect("the failing hook is reported");
+    assert!(
+        hook.contains("on_turn_complete") && hook.contains("exit 4"),
+        "{hook}"
+    );
+    assert!(reason.contains('4'), "{reason}");
+}

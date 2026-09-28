@@ -8,7 +8,7 @@ pub mod event_bus;
 pub mod system_prompt;
 
 pub use agent::Agent;
-pub use config::{PromptTemplate, RuntimeConfig, SkillsMode};
+pub use config::{HookCommand, PromptTemplate, RuntimeConfig, SkillsMode};
 pub use event_bus::EventBus;
 
 pub use arbe_core;

@@ -207,6 +207,9 @@ fn drain_runtime_events(
             Ok(RuntimeEvent::McpServerFailed { server, reason }) => {
                 app.status_message = Some(format!("MCP server {server} unavailable: {reason}"));
             }
+            Ok(RuntimeEvent::HookFailed { hook, reason }) => {
+                app.status_message = Some(format!("{hook} failed: {reason}"));
+            }
             Ok(RuntimeEvent::UsageUpdated { session, .. }) => {
                 app.session_tokens = session.total_tokens();
             }

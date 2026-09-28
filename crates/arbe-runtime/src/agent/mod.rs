@@ -331,7 +331,17 @@ impl Agent {
                     config.denylist.clone(),
                 )
             },
-            hooks: HookRegistry::new(Duration::from_millis(config.hook_timeout_ms)),
+            hooks: {
+                let mut hooks = HookRegistry::new(Duration::from_millis(config.hook_timeout_ms));
+                for h in &config.hook_commands {
+                    hooks.register(Arc::new(
+                        arbe_hooks::CommandHook::new(h.phase, h.command.clone())
+                            .in_dir(config.project_dir.clone())
+                            .with_timeout(h.timeout),
+                    ));
+                }
+                hooks
+            },
             events,
             registry,
             history,
