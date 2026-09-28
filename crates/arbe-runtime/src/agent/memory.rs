@@ -149,7 +149,7 @@ impl ToolExecutor for RememberTool {
 
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
-            "Save a short note to persistent memory, shown to you at the start of future sessions. Use it for durable facts: the user's preferences, project conventions, where important things are. Not for task progress.",
+            "Save a note about the user or this project to persistent memory, shown to you at the start of future sessions. Use it only when the user asks you to remember something, or states a lasting preference or convention (e.g. \"always use tabs\"). Never for general knowledge, answers to questions, or task progress.",
         )
     }
 

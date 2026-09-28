@@ -23,6 +23,10 @@ use serde_json::json;
 struct Target {
     provider: Box<dyn ModelProvider>,
     model: String,
+    /// OpenAI reasoning models only accept the default (1.0); everything
+    /// else runs deterministic, which small local models need to follow
+    /// "reply with exactly..." reliably.
+    temperature: f32,
 }
 
 fn target(name: &str) -> Option<Target> {
@@ -53,6 +57,7 @@ fn target(name: &str) -> Option<Target> {
     Some(Target {
         provider: build_provider(name, api_key, base_url).expect("provider builds"),
         model,
+        temperature: if name == "openai" { 1.0 } else { 0.0 },
     })
 }
 
@@ -60,8 +65,7 @@ fn request(target: &Target, messages: Vec<Message>, tools: Vec<ToolSpec>) -> Mod
     ModelRequest {
         model: target.model.clone(),
         messages,
-        // OpenAI reasoning models only accept the default temperature.
-        temperature: 1.0,
+        temperature: target.temperature,
         max_tokens: 2_000,
         tools,
         thinking_budget_tokens: None,
@@ -91,7 +95,7 @@ async fn text_round_trip(name: &str) {
             &target,
             vec![
                 Message::new(Role::System, "You follow instructions exactly."),
-                Message::new(Role::User, "Reply with exactly one word: pong"),
+                Message::new(Role::User, "Say the word pong and nothing else."),
             ],
             vec![],
         ),

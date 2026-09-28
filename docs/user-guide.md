@@ -283,7 +283,7 @@ The maximum response length is fixed at 4096 output tokens.
 
 | `ARBE_PROVIDER` | Needs key | Default endpoint | Notes |
 |---|---|---|---|
-| `ollama` | no | `http://localhost:11434` | Runs with an 8,192-token context window. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. |
+| `ollama` | no | `http://localhost:11434` | Runs with an 8,192-token context window. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. Some models (such as `qwen2.5-coder`) write a tool call as plain JSON text instead of using Ollama's tool-call format; when a reply consists only of such calls to offered tools, the harness treats them as real tool calls. A reply that could be one is shown once it's complete rather than word by word. |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | Chat Completions API. |
 | `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | Messages API. Supports extended thinking (`ARBE_THINKING_BUDGET`). |
 | `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. |
@@ -755,6 +755,7 @@ Common problems:
 | `... provider requires an api_key` | Set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or `ARBE_API_KEY`). |
 | `openai_compatible provider requires a base_url` | Set `ARBE_BASE_URL`. |
 | Agent answers but never uses tools | The model doesn't support tool calling (common with small Ollama models). Pick a tool-capable model. |
+| Approval prompts for tool calls that make no sense (e.g. `remember` with a plain fact) | Small models tend to call whatever tool is available. Deny it; `d` denies that tool for the rest of the session. |
 | "Context length exceeded" | The model's real window is smaller than the harness assumes. Set `ARBE_CONTEXT_BUDGET` lower. |
 | "… retrying in Ns (attempt N)…" status | The provider rate-limited or was overloaded, or the network hiccuped. The harness retries up to `ARBE_MAX_RETRIES` times before showing an error. |
 | `[info] stopped: ...` after a turn | A loop guard ended it: too many tool rounds, the same calls repeated three times, or `ARBE_MAX_TURN_TOKENS` reached. Rephrase, or raise the limit. |

@@ -16,20 +16,21 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 |---|---|---|---|---|
 | P0 | Housekeeping & quick correctness fixes | Done | 6 / 6 | 223 tests, fmt/clippy clean. P0.3 not verified against a live Ollama server (none available) |
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
-| P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested (296 tests). **Not Done yet:** the exit criterion needs live runs, and there are no API keys or Ollama server here — run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with keys set |
+| P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested. Ollama verified live (qwen2.5-coder:3b, llama3.2:3b). **Not Done yet:** the exit criterion also needs live OpenAI and Anthropic runs (no API keys here) |
 | P3 | Agent loop v2 | In progress | 8 / 10 | 322 tests, fmt/clippy clean. Open: P3.7 image/block tool results, P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | Not started | 0 / 8 | Depends on P4 |
-| P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; live provider smoke tests exist (P7.2, partial) |
+| P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; P7.2 partial: Ollama live provider + end-to-end agent tests pass, OpenAI/Anthropic not run |
 
 **Current focus:** P6 (library facade, headless mode, subagents)
-**Last updated:** 2026-09-28 · test count: 424 (+4 ignored live tests)
+**Last updated:** 2026-09-28 · test count: 430 (+6 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-28 — First live runs (Ollama).** Provider live tests and a new end-to-end agent test pass against the local default models. Fixed: qwen2.5-coder's text-form tool calls are now recognized (without this the default coding model couldn't use tools at all); `remember`'s description tightened; live-test temperature 0 except OpenAI. 424 → 430 tests. Next: P6.2 headless mode (JSON-RPC 2.0 over stdio, decided).
 - **2026-09-28 — Default models changed.** With no model configured, Ollama now uses `qwen2.5-coder:3b` for the coding profile (and custom prompt files) and `llama3.2:3b` for the `general` prompt, both small and tool-capable (was `llama3.1` for everything); openai/anthropic defaults unchanged. The default follows the resolved prompt template, so `ARBE_PROFILE=general` alone switches it. Live-test default is now `qwen2.5-coder:3b`. 423 → 424 tests.
 - **2026-09-28 — P5 complete.** Cache-aware assembly (memory notes moved into the stable prefix; truncation cut quantized to multiples of 4 turns on long histories so the prefix stays stable), nested `AGENTS.md`/`agent.md`/`CLAUDE.md` shown with the first tool call touching their folder, persistent memory read every turn plus a `remember` tool. The 200-turn exit test found two real problems, both fixed: (1) a round could overflow the budget when a new, must-keep result arrived on a full context — the loop now drops the oldest earlier turns from the request as a last resort; (2) truncation kept every full tool output in memory forever and re-copied it every turn (42 s → 2 s) — history is now pruned in place (full text stays on disk). 413 → 423 tests. Next: P6.
 - **2026-09-28 — P5.1–P5.3 done (pruning + compaction).** Old tool results are stubbed before any turn is dropped — in history and within a long tool loop (newest results protected, persisted trace untouched). `compact_summary` now really summarizes: past ~80% of the budget the model summarizes the oldest whole turns (down to ~40%) into `compactions.jsonl`, chained onto the previous summary, restored on resume; `/compact` forces it; failure falls back to trimming. 399 → 413 tests. Next: P5.4.
@@ -292,6 +293,7 @@ Start P7.1 to P7.3 alongside P2; they are infrastructure the other phases need.
 - [ ] **P7.1 HTTP mock tests.** Add `wiremock` (dev-dep) and cover `stream` end-to-end per adapter: retries, rate limits with `retry_after`, mid-stream disconnects, malformed chunks.
 - [ ] **P7.2 Live smoke tests.** `#[ignore]`d tests (run via `cargo test -- --ignored`) that hit real OpenAI / Anthropic / Ollama when their env vars are present; a manual CI workflow (`workflow_dispatch`) with secrets. Record results in this plan's status table.
   - *Partly done (with P2):* `crates/arbe-providers/tests/live.rs` — a text round trip plus a tool round trip (incl. echoing the assistant message back) per provider, each skipped without credentials. Remaining: the `workflow_dispatch` CI job, and actually running them.
+  - *Ollama run (2026-09-28):* provider tests pass on `qwen2.5-coder:3b` and `llama3.2:3b` after two fixes: qwen writes tool calls as bare JSON text, which Ollama doesn't parse — now recognized by `text_tool_calls::TextToolCallFilter` (whole-reply only, offered tools only); and the text prompt was reworded (qwen answered "Yes" to "Reply with exactly one word: pong"). New `crates/arbe-runtime/tests/live_agent.rs` drives a real `Agent` (system prompt, builtin tools, approvals, persistence) on a scratch project: coding profile reads a value with `read_file` and changes it with `edit_file`; general profile answers a question. Passes 3/3 runs. Observed: llama3.2:3b calls `remember` on trivia regardless of the tool description — reported by the test, left to the approval gate. In raw tests (not through the harness) qwen re-calls a tool after its result on a toy prompt; with the real system prompt it didn't.
 - [x] **P7.3 Reference MCP server.** A tiny stdio MCP server in `tests/fixtures/` (a small Rust test binary) so `McpClient` and the P4.4 wiring get real process-level integration tests — closing v1's untested-client gap.
   - *Done:* `crates/arbe-mcp/tests/fixture/mcp_fixture_server.rs` (built as the `mcp-fixture-server` bin): out-of-order replies, stdout noise, stderr logging, crash, list-changed. 8 integration tests incl. an in-test HTTP server. Plus `#[ignore]`d live tests against the official `server-everything` (client-level and through the agent), both passing.
 - [ ] **P7.4 Gate enforcement.** Make `ToolExecutor::execute` unreachable except via the gate: e.g. executors receive a `GateToken` that only `execute_gated` can construct. Closes the open item from the 2026-08-04 review.
@@ -340,6 +342,6 @@ Start P7.1 to P7.3 alongside P2; they are infrastructure the other phases need.
 ## Open questions
 
 1. **OpenAI Responses API vs. Chat Completions.** Plan assumes Chat Completions (broadest gateway compatibility). Responses API gives better reasoning-model support; revisit after P2.4.
-2. **Headless protocol shape.** JSON-RPC 2.0 vs. raw newline-delimited `RuntimeEvent`s — decide at P6.2; leaning JSON-RPC for request/response correlation.
+2. **Headless protocol shape.** *Decided 2026-09-28:* JSON-RPC 2.0 over stdio (request/response correlation; events as notifications).
 3. **Sandboxing `execute`.** v2 keeps "always gated"; OS-level sandboxing (containers, Seatbelt, landlock, Windows job objects) is out of scope for v2 unless prioritized.
 4. **Windows symlink testing.** Unix-only symlink escape tests remain; consider a privileged Windows CI job.

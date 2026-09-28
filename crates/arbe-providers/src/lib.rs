@@ -18,6 +18,7 @@ pub mod openai;
 pub mod registry;
 pub mod retry;
 pub mod sse;
+mod text_tool_calls;
 pub mod utf8_buffer;
 
 pub use accumulator::{AccumulatedResponse, ResponseAccumulator};

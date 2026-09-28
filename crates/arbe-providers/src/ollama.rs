@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::ModelCatalog;
+use crate::text_tool_calls::TextToolCallFilter;
 use crate::{
     ModelCapabilities, ModelProvider, ModelRequest, ProviderEvent, ProviderStream, http,
     next_call_id,
@@ -301,9 +302,35 @@ struct ChatResponseLine {
     error: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StreamState {
     saw_tool_call: bool,
+    /// Recognizes tool calls some models write as text (see
+    /// `text_tool_calls`).
+    text_calls: TextToolCallFilter,
+}
+
+impl StreamState {
+    fn new(offered_tools: Vec<String>) -> Self {
+        Self {
+            saw_tool_call: false,
+            text_calls: TextToolCallFilter::new(offered_tools),
+        }
+    }
+
+    fn push_tool_call(&mut self, events: &mut Vec<ProviderEvent>, name: String, arguments: Value) {
+        self.saw_tool_call = true;
+        let id = next_call_id("ollama");
+        events.push(ProviderEvent::ToolUseStart {
+            id: id.clone(),
+            name,
+        });
+        events.push(ProviderEvent::ToolUseInputDelta {
+            id: id.clone(),
+            partial_json: arguments_json(arguments),
+        });
+        events.push(ProviderEvent::ToolUseEnd { id });
+    }
 }
 
 /// Some models emit `arguments` as a JSON-encoded string instead of an
@@ -336,24 +363,27 @@ fn translate_line(
             events.push(ProviderEvent::ThinkingDelta(thinking));
         }
         if !message.content.is_empty() {
-            events.push(ProviderEvent::TextDelta(message.content));
+            let shown = state.text_calls.push(&message.content);
+            if !shown.is_empty() {
+                events.push(ProviderEvent::TextDelta(shown));
+            }
         }
         for call in message.tool_calls.unwrap_or_default() {
-            state.saw_tool_call = true;
-            let id = next_call_id("ollama");
-            events.push(ProviderEvent::ToolUseStart {
-                id: id.clone(),
-                name: call.function.name,
-            });
-            events.push(ProviderEvent::ToolUseInputDelta {
-                id: id.clone(),
-                partial_json: arguments_json(call.function.arguments),
-            });
-            events.push(ProviderEvent::ToolUseEnd { id });
+            state.push_tool_call(&mut events, call.function.name, call.function.arguments);
         }
     }
 
     if parsed.done {
+        match state.text_calls.finish() {
+            Ok(calls) => {
+                tracing::debug!(count = calls.len(), "recognized tool calls written as text");
+                for call in calls {
+                    state.push_tool_call(&mut events, call.name, call.arguments);
+                }
+            }
+            Err(text) if !text.is_empty() => events.push(ProviderEvent::TextDelta(text)),
+            Err(_) => {}
+        }
         events.push(ProviderEvent::Usage(Usage {
             input_tokens: parsed.prompt_eval_count,
             output_tokens: parsed.eval_count,
@@ -406,9 +436,11 @@ impl ModelProvider for OllamaProvider {
             other => other?,
         };
 
+        let offered_tools: Vec<String> =
+            body.tools.iter().map(|t| t.function.name.clone()).collect();
         let events = async_stream::stream! {
             let mut buffer = String::new();
-            let mut state = StreamState::default();
+            let mut state = StreamState::new(offered_tools);
             let mut chunks = Box::pin(http::text_chunks(response));
             while let Some(text) = chunks.next().await {
                 match text {
@@ -545,7 +577,11 @@ mod tests {
     }
 
     fn translate_all(lines: &[&str]) -> Vec<ProviderEvent> {
-        let mut state = StreamState::default();
+        translate_offering(&[], lines)
+    }
+
+    fn translate_offering(tools: &[&str], lines: &[&str]) -> Vec<ProviderEvent> {
+        let mut state = StreamState::new(tools.iter().map(|t| t.to_string()).collect());
         lines
             .iter()
             .flat_map(|l| translate_line(&mut state, l).unwrap())
@@ -597,6 +633,36 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_written_as_text_becomes_a_tool_use() {
+        // What qwen2.5-coder:3b actually streamed for a get_weather request.
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"{\"name\": \"get_weather\", "},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":"\"arguments\": {\"city\": \"Paris\"}}"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}"#,
+        ];
+        let mut acc = ResponseAccumulator::new();
+        for e in translate_offering(&["get_weather"], &lines) {
+            acc.push(e);
+        }
+        let r = acc.finish();
+        assert_eq!(r.message.text(), "");
+        let calls = r.message.tool_uses();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+
+        // Without the tool offered, the same text is just text.
+        let mut acc = ResponseAccumulator::new();
+        for e in translate_all(&lines) {
+            acc.push(e);
+        }
+        let r = acc.finish();
+        assert!(r.message.text().starts_with("{\"name\""));
+        assert_eq!(r.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
     fn string_encoded_and_missing_arguments_are_handled() {
         assert_eq!(
             arguments_json(json!("{\"path\":\"a\"}")),
@@ -625,7 +691,7 @@ mod tests {
 
     #[test]
     fn an_error_line_is_an_error() {
-        let mut state = StreamState::default();
+        let mut state = StreamState::new(Vec::new());
         assert!(translate_line(&mut state, r#"{"error":"model crashed"}"#).is_err());
     }
 
