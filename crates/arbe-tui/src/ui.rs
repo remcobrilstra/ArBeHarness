@@ -268,7 +268,7 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
         // so say so rather than let [a] look broken when it asks again.
         if approval.risk == RiskLevel::High {
             Line::from(Span::styled(
-                "(high risk: [a] still asks again next call unless config allows it)",
+                "(high risk: [a] approves only this exact call for the session)",
                 Style::default().fg(Color::DarkGray),
             ))
         } else {

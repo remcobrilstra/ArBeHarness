@@ -151,8 +151,8 @@ max_retries = 4
 
 [approval]
 mode = "allowlist_auto"            # always_prompt | allowlist_auto | denylist_block | dry_run_only
-allow = ["read_file", "list_dir", "glob", "grep", "todo_write"]
-deny = []
+allow = ["read_file", "list_dir", "glob", "grep", "todo_write", "execute(cargo test*)"]
+deny = ["execute(git push*)", "write_file(.git/*)"]
 session_approval_covers_high_risk = false
 
 [hooks]
@@ -188,9 +188,9 @@ context_window = 32768
 | `loop.max_tool_output_chars` | `50000` | Same as `ARBE_MAX_TOOL_OUTPUT_CHARS`. |
 | `loop.max_retries` | `4` | Same as `ARBE_MAX_RETRIES`. |
 | `approval.mode` | `always_prompt` | See [Approvals](#approvals). |
-| `approval.allow` | `[]` | Tools that run without asking in `allowlist_auto` mode. |
-| `approval.deny` | `[]` | Tools that are always refused in `denylist_block` mode. |
-| `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` also covers high-risk tools (`execute`). |
+| `approval.allow` | `[]` | [Rules](#permission-rules) for calls that run without asking in `allowlist_auto` mode. |
+| `approval.deny` | `[]` | [Rules](#permission-rules) for calls that are always refused, in every mode. |
+| `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` on a high-risk call approves the whole tool rather than just that exact call. |
 | `skills.mode` | `on_demand` | `on_demand` or `always`. See [Skills](#skills). |
 | `hooks.timeout_ms` | `500` | Default time limit for hooks that don't set their own. |
 | `[[hooks.commands]]` | none | Shell commands run at points in a turn. See [Hooks](#hooks). |
@@ -336,7 +336,7 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 |---|---|
 | `y` | Approve this one call |
 | `n` | Deny this one call |
-| `a` | Approve this tool for the rest of the session (see [approvals](#approvals)) |
+| `a` | Approve for the rest of the session: this tool, or for a high-risk tool this exact call (see [approvals](#approvals)) |
 | `d` | Deny this tool for the rest of the session |
 | `Esc` | Cancel the whole turn (not just this call) |
 
@@ -445,17 +445,33 @@ How tool calls are approved is set by `approval.mode` in the [configuration file
 | Mode | Behavior |
 |---|---|
 | `always_prompt` (default) | Every call asks you, including the read-only tools. |
-| `allowlist_auto` | Tools listed in `approval.allow` run without asking; everything else asks. |
-| `denylist_block` | Tools listed in `approval.deny` are refused; everything else runs without asking. |
+| `allowlist_auto` | Calls matching an `approval.allow` rule run without asking; everything else asks. |
+| `denylist_block` | Everything runs without asking, except calls matching an `approval.deny` rule. |
 | `dry_run_only` | Nothing runs. Every call is refused, and the model is told so. |
 
-**High-risk tools always ask.** `execute` (and any other high-risk tool) prompts you even if a mode or list would let it run on its own. Only `dry_run_only` refuses it outright.
+`approval.deny` rules apply in **every** mode: a denied call is refused without asking, even if something else would allow it.
+
+#### Permission rules
+
+A rule is a tool name, optionally with a pattern for what the call acts on:
+
+| Rule | Matches |
+|---|---|
+| `read_file` | every `read_file` call |
+| `github__*` | every tool of the `github` MCP server |
+| `execute(cargo test*)` | `execute` calls whose command starts with `cargo test` |
+| `write_file(src/*)` | writes anywhere under `src/` |
+| `edit_file(*.md)` | edits to any Markdown file |
+
+`*` matches any run of characters, including `/`. What the pattern is matched against depends on the tool: the `path` argument for `read_file`, `write_file`, `edit_file`, `list_dir`, `glob` and `grep` (with forward slashes, relative to the workdir as the model wrote it, `.` when omitted), and the command line for `execute`. MCP tools and `todo_write` can only be matched by name. A malformed rule (e.g. a missing `)`) stops the app at startup.
+
+**High-risk tools** (`execute`, and MCP tools their server marks destructive) never run without asking just because of the mode or a bare tool name. Only a rule with a pattern can let them through — `execute(cargo test*)` in `allow` does, `execute` alone doesn't. Only `dry_run_only` refuses them outright.
 
 In the approval dialog you can:
 
 - `y` / `n`: decide for this call only.
-- `a`: approve this tool for the rest of the session, so later calls to it run without asking. **Exception:** `a` does not cover high-risk tools. `execute` asks every time, even after you press `a`.
-- `d`: deny this tool for the rest of the session, so later calls are rejected without asking.
+- `a`: approve for the rest of the session. For most tools this approves the tool, so later calls to it run without asking. For a **high-risk** tool it approves only **this exact call** — the same command line for `execute` — so `cargo test` approved once runs again without asking, but `cargo test && rm -rf target` still asks. (A high-risk MCP tool with no command line keeps asking every time, unless `approval.session_approval_covers_high_risk = true`.)
+- `d`: deny this tool for the rest of the session, so later calls are refused without asking.
 
 Session approvals and denials are forgotten when you start a new session, resume one, or quit.
 

@@ -44,6 +44,11 @@ impl GlobTool {
 
 #[async_trait]
 impl ToolExecutor for GlobTool {
+    /// Rule subject: the path (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        crate::path_subject(arguments, Some("."))
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Find files matching a glob pattern (e.g. \"**/*.rs\") within the project directory.",

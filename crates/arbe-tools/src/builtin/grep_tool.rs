@@ -54,6 +54,11 @@ impl GrepTool {
 
 #[async_trait]
 impl ToolExecutor for GrepTool {
+    /// Rule subject: the path (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        crate::path_subject(arguments, Some("."))
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Search file contents by regex within the project directory, returning matching lines.",

@@ -5,11 +5,13 @@ pub mod builtin;
 pub mod gate;
 pub mod policy;
 pub mod registry;
+pub mod rules;
 pub mod session_approvals;
 
 pub use gate::{Authorization, Authorized, GatedOutcome, authorize, execute_gated};
 pub use policy::{PolicyOutcome, StandardApprovalPolicy};
 pub use registry::ToolRegistry;
+pub use rules::ToolRule;
 pub use schemars;
 pub use session_approvals::SessionApprovals;
 
@@ -26,29 +28,38 @@ pub use tokio_util::sync::CancellationToken;
 /// different modes/lists.
 pub struct ApprovalContext {
     pub policy_mode: ApprovalPolicyMode,
-    pub allowlist: Vec<String>,
-    pub denylist: Vec<String>,
+    /// Calls that may run without asking (see `StandardApprovalPolicy`).
+    pub allowlist: Vec<ToolRule>,
+    /// Calls that are always refused.
+    pub denylist: Vec<ToolRule>,
     /// Session-scoped human decisions, recorded by `execute_gated`.
     pub session: SessionApprovals,
-    /// Whether an "approve for session" answer also covers
-    /// `RiskLevel::High` tools. Off by default: approving `execute` for the
-    /// session would otherwise auto-approve *every* later shell command,
-    /// whatever it is, so high-risk calls keep prompting each time unless
-    /// config explicitly opts in.
+    /// Whether an "approve for session" answer covers a `RiskLevel::High`
+    /// tool as a whole. Off by default: such an answer then approves only
+    /// that exact call (same command line), since approving `execute`
+    /// itself would approve every later shell command.
     pub session_approval_covers_high_risk: bool,
 }
 
 impl ApprovalContext {
     /// A context with empty session memory and the safe high-risk default.
+    /// Rules that don't parse (config validates them first) are taken as
+    /// bare tool names rather than dropped.
     pub fn new(
         policy_mode: ApprovalPolicyMode,
         allowlist: Vec<String>,
         denylist: Vec<String>,
     ) -> Self {
+        let parse = |rules: Vec<String>| -> Vec<ToolRule> {
+            rules
+                .iter()
+                .map(|r| ToolRule::parse(r).unwrap_or_else(|_| ToolRule::exact(r, None)))
+                .collect()
+        };
         Self {
             policy_mode,
-            allowlist,
-            denylist,
+            allowlist: parse(allowlist),
+            denylist: parse(denylist),
             session: SessionApprovals::new(),
             session_approval_covers_high_risk: false,
         }
@@ -60,7 +71,13 @@ impl ApprovalContext {
 /// a human (TUI-FR-2) — it is not itself a final answer, unlike
 /// `arbe_core::ApprovalDecision` which *is* a human's final answer.
 pub trait ApprovalPolicy: Send + Sync {
-    fn decide(&self, invocation: &ToolInvocation, ctx: &ApprovalContext) -> PolicyOutcome;
+    /// `subject` is what the call acts on, from `ToolExecutor::subject`.
+    fn decide(
+        &self,
+        invocation: &ToolInvocation,
+        subject: Option<&str>,
+        ctx: &ApprovalContext,
+    ) -> PolicyOutcome;
 }
 
 /// What the model is told about a tool: a description and a JSON Schema
@@ -192,6 +209,26 @@ pub trait ToolExecutor: Send + Sync {
     fn default_risk(&self) -> RiskLevel {
         RiskLevel::Medium
     }
+
+    /// What a call acts on, for permission rules like `tool(pattern)`: a
+    /// path for file tools, the command line for `execute`. `None` (the
+    /// default) means rules can only match this tool by name.
+    fn subject(&self, _arguments: &Value) -> Option<String> {
+        None
+    }
+}
+
+/// A call's `path` argument as a rule subject: forward slashes, no
+/// leading `./`, `default` when absent (e.g. `"."`).
+pub fn path_subject(arguments: &Value, default: Option<&str>) -> Option<String> {
+    let raw = arguments.get("path").and_then(Value::as_str).or(default)?;
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
+    Some(if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 /// Test-only shorthand: run a tool with a default (never-cancelled)

@@ -44,6 +44,14 @@ impl ExecuteTool {
 
 #[async_trait]
 impl ToolExecutor for ExecuteTool {
+    /// Rule subject: the command line (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|c| c.trim().to_string())
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Run a shell command with the project directory as its working directory. Highest-risk tool — always approval-gated.",

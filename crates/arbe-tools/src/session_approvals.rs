@@ -1,18 +1,23 @@
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use arbe_core::ApprovalDecision;
+use arbe_core::{ApprovalDecision, RiskLevel};
+
+use crate::rules::ToolRule;
 
 /// Session-scoped approval memory: the human's "approve for the rest of
 /// the session" / "always deny for the rest of the session" answers
-/// (TUI-FR-2), keyed by tool name.
+/// (TUI-FR-2), kept as [`ToolRule`]s.
 ///
-/// Recorded by `execute_gated` whenever a human decision resolves a
-/// `RequiresPrompt`, and consulted by `StandardApprovalPolicy` on every
-/// later invocation. Cheaply `Clone` (an `Arc` around a small, uncontended
-/// mutex) so the same memory can be shared by every clone of an
-/// `ApprovalContext` for one session, and so recording works through the
-/// `&ApprovalContext` the gate is handed rather than requiring `&mut`.
+/// - Approving a low/medium-risk call for the session approves the *tool*.
+/// - Approving a high-risk call for the session approves only that *exact
+///   call* (same tool, same subject — e.g. the same command line), since
+///   approving `execute` itself would approve any command.
+/// - Denying for the session denies the tool.
+///
+/// Recorded by the gate whenever a human decision resolves a prompt, and
+/// consulted by `StandardApprovalPolicy` on every later call. Cheaply
+/// `Clone` (an `Arc` around a small mutex) so one memory is shared by
+/// everything holding the session's `ApprovalContext`.
 #[derive(Debug, Clone, Default)]
 pub struct SessionApprovals {
     inner: Arc<Mutex<Inner>>,
@@ -20,8 +25,8 @@ pub struct SessionApprovals {
 
 #[derive(Debug, Default)]
 struct Inner {
-    allowed: HashSet<String>,
-    denied: HashSet<String>,
+    allowed: Vec<ToolRule>,
+    denied: Vec<ToolRule>,
 }
 
 impl SessionApprovals {
@@ -29,30 +34,51 @@ impl SessionApprovals {
         Self::default()
     }
 
-    /// Remembers a session-scoped decision for `tool_name`. The once-only
-    /// variants are deliberately not remembered. A later session-scoped
-    /// decision for the same tool replaces an earlier opposite one.
-    pub fn record(&self, tool_name: &str, decision: ApprovalDecision) {
+    /// Remembers a session-scoped decision about a call. Once-only
+    /// decisions aren't remembered; a later session-scoped decision for a
+    /// tool replaces an earlier opposite one.
+    pub fn record(
+        &self,
+        tool_name: &str,
+        subject: Option<&str>,
+        risk: RiskLevel,
+        decision: ApprovalDecision,
+    ) {
         let mut inner = self.lock();
         match decision {
             ApprovalDecision::ApprovedForSession => {
-                inner.denied.remove(tool_name);
-                inner.allowed.insert(tool_name.to_string());
+                inner.denied.retain(|r| !r.matches(tool_name, subject));
+                let rule = if risk == RiskLevel::High {
+                    ToolRule::exact(tool_name, subject)
+                } else {
+                    ToolRule::exact(tool_name, None)
+                };
+                if !inner.allowed.contains(&rule) {
+                    inner.allowed.push(rule);
+                }
             }
             ApprovalDecision::AlwaysDeniedForSession => {
-                inner.allowed.remove(tool_name);
-                inner.denied.insert(tool_name.to_string());
+                inner.allowed.retain(|r| !r.matches(tool_name, subject));
+                inner.denied.push(ToolRule::exact(tool_name, None));
             }
             ApprovalDecision::ApprovedOnce | ApprovalDecision::DeniedOnce => {}
         }
     }
 
-    pub fn is_allowed(&self, tool_name: &str) -> bool {
-        self.lock().allowed.contains(tool_name)
+    /// The session rule approving this call, if any.
+    pub fn allowed_by(&self, tool_name: &str, subject: Option<&str>) -> Option<ToolRule> {
+        self.lock()
+            .allowed
+            .iter()
+            .find(|r| r.matches(tool_name, subject))
+            .cloned()
     }
 
-    pub fn is_denied(&self, tool_name: &str) -> bool {
-        self.lock().denied.contains(tool_name)
+    pub fn is_denied(&self, tool_name: &str, subject: Option<&str>) -> bool {
+        self.lock()
+            .denied
+            .iter()
+            .any(|r| r.matches(tool_name, subject))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -66,40 +92,65 @@ impl SessionApprovals {
 mod tests {
     use super::*;
 
+    const LOW: RiskLevel = RiskLevel::Low;
+    const HIGH: RiskLevel = RiskLevel::High;
+
     #[test]
     fn once_decisions_are_not_remembered() {
         let s = SessionApprovals::new();
-        s.record("read_file", ApprovalDecision::ApprovedOnce);
-        s.record("execute", ApprovalDecision::DeniedOnce);
-        assert!(!s.is_allowed("read_file"));
-        assert!(!s.is_denied("execute"));
+        s.record("read_file", Some("a"), LOW, ApprovalDecision::ApprovedOnce);
+        s.record("execute", Some("ls"), HIGH, ApprovalDecision::DeniedOnce);
+        assert!(s.allowed_by("read_file", Some("a")).is_none());
+        assert!(!s.is_denied("execute", Some("ls")));
     }
 
     #[test]
-    fn session_decisions_are_remembered_per_tool() {
+    fn approving_a_low_risk_call_approves_the_tool() {
         let s = SessionApprovals::new();
-        s.record("read_file", ApprovalDecision::ApprovedForSession);
-        s.record("execute", ApprovalDecision::AlwaysDeniedForSession);
-        assert!(s.is_allowed("read_file"));
-        assert!(!s.is_allowed("execute"));
-        assert!(s.is_denied("execute"));
-        assert!(!s.is_denied("read_file"));
+        s.record(
+            "read_file",
+            Some("a.rs"),
+            LOW,
+            ApprovalDecision::ApprovedForSession,
+        );
+        assert!(s.allowed_by("read_file", Some("b.rs")).is_some());
+        assert!(s.allowed_by("write_file", Some("a.rs")).is_none());
     }
 
     #[test]
-    fn a_later_opposite_session_decision_replaces_the_earlier_one() {
+    fn approving_a_high_risk_call_approves_only_that_exact_call() {
         let s = SessionApprovals::new();
-        s.record("grep", ApprovalDecision::ApprovedForSession);
-        s.record("grep", ApprovalDecision::AlwaysDeniedForSession);
-        assert!(!s.is_allowed("grep"));
-        assert!(s.is_denied("grep"));
+        s.record(
+            "execute",
+            Some("cargo test"),
+            HIGH,
+            ApprovalDecision::ApprovedForSession,
+        );
+        let rule = s.allowed_by("execute", Some("cargo test")).unwrap();
+        assert!(rule.is_specific());
+        assert!(
+            s.allowed_by("execute", Some("cargo test && rm -rf /"))
+                .is_none()
+        );
+        assert!(s.allowed_by("execute", Some("git push")).is_none());
+    }
+
+    #[test]
+    fn deny_replaces_approve_and_vice_versa() {
+        let s = SessionApprovals::new();
+        s.record("grep", None, LOW, ApprovalDecision::ApprovedForSession);
+        s.record("grep", None, LOW, ApprovalDecision::AlwaysDeniedForSession);
+        assert!(s.allowed_by("grep", None).is_none());
+        assert!(s.is_denied("grep", Some("x")));
+        s.record("grep", None, LOW, ApprovalDecision::ApprovedForSession);
+        assert!(!s.is_denied("grep", None));
     }
 
     #[test]
     fn clones_share_the_same_memory() {
         let a = SessionApprovals::new();
         let b = a.clone();
-        a.record("glob", ApprovalDecision::ApprovedForSession);
-        assert!(b.is_allowed("glob"));
+        a.record("glob", None, LOW, ApprovalDecision::ApprovedForSession);
+        assert!(b.allowed_by("glob", None).is_some());
     }
 }

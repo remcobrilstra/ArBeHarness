@@ -332,6 +332,10 @@ impl RuntimeConfig {
         }
         if let Some(a) = &layer.approval {
             assign(&mut self.policy_mode, a.mode);
+            for rule in a.allow.iter().chain(&a.deny).flatten() {
+                arbe_tools::ToolRule::parse(rule)
+                    .map_err(|e| invalid(path, &format!("approval: {e}")))?;
+            }
             assign(&mut self.allowlist, a.allow.clone());
             assign(&mut self.denylist, a.deny.clone());
             assign(
@@ -1026,6 +1030,30 @@ mod tests {
         let c = RuntimeConfig::load_from_sources(&[], &[project], &no_env, dir.clone()).unwrap();
         assert!(c.hook_commands.is_empty());
         assert!(c.warnings[0].contains("hook commands"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn approval_rules_are_validated() {
+        let dir = temp_dir();
+        let ok = write(
+            &dir,
+            "ok.toml",
+            "[approval]
+mode = \"allowlist_auto\"
+allow = [\"execute(cargo test*)\", \"read_file\"]
+",
+        );
+        assert_eq!(load(&[ok], &no_env).unwrap().allowlist.len(), 2);
+        let bad = write(
+            &dir,
+            "bad.toml",
+            "[approval]
+deny = [\"execute(git push\"]
+",
+        );
+        let err = load(&[bad], &no_env).unwrap_err().to_string();
+        assert!(err.contains("closing"), "{err}");
         std::fs::remove_dir_all(dir).ok();
     }
 

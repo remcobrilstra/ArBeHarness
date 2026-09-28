@@ -179,6 +179,25 @@ mod tests {
     }
 
     #[test]
+    fn rule_subjects_are_the_path_or_the_command() {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry, Path::new("."));
+        let subject =
+            |tool: &str, args: serde_json::Value| registry.get(tool).unwrap().subject(&args);
+        use serde_json::json;
+        assert_eq!(
+            subject("read_file", json!({"path": "./src\\lib.rs"})).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(subject("list_dir", json!({})).as_deref(), Some("."));
+        assert_eq!(
+            subject("execute", json!({"command": "  cargo test  "})).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(subject("todo_write", json!({"todos": []})), None);
+    }
+
+    #[test]
     fn risk_levels_come_from_the_tools() {
         let mut registry = ToolRegistry::new();
         register_all(&mut registry, Path::new("."));

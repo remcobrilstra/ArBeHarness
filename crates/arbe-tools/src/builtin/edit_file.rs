@@ -44,6 +44,11 @@ impl EditFileTool {
 
 #[async_trait]
 impl ToolExecutor for EditFileTool {
+    /// Rule subject: the path (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        crate::path_subject(arguments, None)
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Find-and-replace a substring within an existing file. Fails if `find` doesn't match, or matches more than once unless replace_all is set.",

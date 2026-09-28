@@ -70,15 +70,24 @@ pub fn authorize(
     human_decision: Option<ApprovalDecision>,
 ) -> Result<Authorization, ToolError> {
     let executor = registry.get(&invocation.tool_name)?.clone();
+    let subject = executor.subject(&invocation.arguments);
 
-    let approved = match (policy.decide(&invocation, ctx), human_decision) {
+    let approved = match (
+        policy.decide(&invocation, subject.as_deref(), ctx),
+        human_decision,
+    ) {
         (PolicyOutcome::AutoApprove, _) => true,
         (PolicyOutcome::AutoDeny, _) => false,
         (PolicyOutcome::RequiresPrompt, None) => {
             return Ok(Authorization::NeedsHuman(invocation));
         }
         (PolicyOutcome::RequiresPrompt, Some(decision)) => {
-            ctx.session.record(&invocation.tool_name, decision);
+            ctx.session.record(
+                &invocation.tool_name,
+                subject.as_deref(),
+                invocation.risk,
+                decision,
+            );
             decision.is_approved()
         }
     };

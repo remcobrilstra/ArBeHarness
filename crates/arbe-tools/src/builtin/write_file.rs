@@ -33,6 +33,11 @@ impl WriteFileTool {
 
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
+    /// Rule subject: the path (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        crate::path_subject(arguments, None)
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Create or overwrite a file within the project directory with the given content.",

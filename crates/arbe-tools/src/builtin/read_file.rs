@@ -36,6 +36,11 @@ impl ReadFileTool {
 
 #[async_trait]
 impl ToolExecutor for ReadFileTool {
+    /// Rule subject: the path (see `ToolExecutor::subject`).
+    fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
+        crate::path_subject(arguments, None)
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Read a UTF-8 text file (optionally a 1-indexed inclusive line range) from within the project directory.",
