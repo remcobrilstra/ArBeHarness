@@ -1,7 +1,7 @@
 use arbe_core::{Message, Role};
 
 use crate::history::HistoryEntry;
-use crate::tokens::estimate_tokens;
+use crate::tokens::estimate_message_tokens;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
 /// Assembles a full turn's context in the order from overall design §5.2:
@@ -54,9 +54,9 @@ impl ContextPipeline {
         let fixed_tokens: u64 = preamble
             .iter()
             .chain(memory_messages.iter())
-            .map(|m| estimate_tokens(&m.content))
+            .map(estimate_message_tokens)
             .sum::<u64>()
-            + estimate_tokens(&user_message.content);
+            + estimate_message_tokens(&user_message);
 
         let history_budget = budget_tokens.saturating_sub(fixed_tokens);
         let history_output = strategy.build_context(ContextInput {
@@ -70,7 +70,7 @@ impl ContextPipeline {
         messages.extend(memory_messages);
         messages.push(user_message);
 
-        let estimated_tokens = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+        let estimated_tokens = messages.iter().map(estimate_message_tokens).sum();
 
         ContextOutput {
             messages,
@@ -109,7 +109,7 @@ mod tests {
             10_000,
         );
 
-        let contents: Vec<&str> = out.messages.iter().map(|m| m.content.as_str()).collect();
+        let contents: Vec<String> = out.messages.iter().map(|m| m.text()).collect();
         assert_eq!(
             contents,
             vec![
@@ -138,11 +138,11 @@ mod tests {
             12, // only ~1 token left for history after the preamble + user
         );
         // Only the most recent history entry should fit.
-        let history_contents: Vec<&str> = out
+        let history_contents: Vec<String> = out
             .messages
             .iter()
-            .filter(|m| m.role == Role::User && m.content != "q")
-            .map(|m| m.content.as_str())
+            .filter(|m| m.role == Role::User && m.text() != "q")
+            .map(|m| m.text())
             .collect();
         assert_eq!(history_contents, vec!["bbbb"]);
         assert!(out.truncated);

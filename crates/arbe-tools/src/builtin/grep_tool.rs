@@ -8,7 +8,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Caps how many matching lines a single `grep` call returns.
 const MAX_MATCHES: usize = 500;
@@ -50,7 +50,11 @@ impl GrepTool {
 
 #[async_trait]
 impl ToolExecutor for GrepTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid grep arguments: {e}")))?;
         let search_root = resolve_within_root(&self.root, &args.path)?;
@@ -130,6 +134,7 @@ fn walk_and_search(search_root: &Path, regex: &Regex) -> (Vec<Match>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -217,7 +222,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = GrepTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "pattern": "(unclosed" })))
+            .execute_default(invocation(json!({ "pattern": "(unclosed" })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
@@ -228,7 +233,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = GrepTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "pattern": "x", "path": ".." })))
+            .execute_default(invocation(json!({ "pattern": "x", "path": ".." })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));

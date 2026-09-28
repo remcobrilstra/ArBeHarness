@@ -1,5 +1,7 @@
 # ArBeHarness v1 — Acceptance Criteria Status
 
+> **Frozen 2026-09-28.** This is a historical record of v1 and is no longer maintained. Some items below are out of date: model-initiated tool calls *are* parsed and executed (`Agent::run_tool_loop`, OpenAI and Ollama), and the TUI does have a session picker. Current status lives in the status table of [`v2-implementation-plan.md`](v2-implementation-plan.md).
+
 Honest pass/fail against the acceptance criteria in `v1-harness-spec.md` §7 and `v1-tui-spec.md` §10, as of the end of the Phase 0–7 implementation pass. "Done" means verified (tests or a real run); "Partial" means real but incomplete; caveats are called out explicitly rather than glossed over.
 
 ## Harness spec (§7)

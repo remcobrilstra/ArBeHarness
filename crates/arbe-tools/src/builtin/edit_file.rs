@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Mirrors `read_file::MAX_READ_BYTES` — an edit reads the whole file into
 /// memory before applying the find/replace, so it needs the same guard
@@ -39,7 +39,11 @@ impl EditFileTool {
 
 #[async_trait]
 impl ToolExecutor for EditFileTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid edit_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
@@ -113,6 +117,7 @@ fn apply_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -164,7 +169,7 @@ mod tests {
         let tool = EditFileTool::new(dir.path().to_path_buf());
 
         let result = tool
-            .execute(invocation(
+            .execute_default(invocation(
                 json!({ "path": "f.txt", "find": "bar", "replace": "baz" }),
             ))
             .await
@@ -182,7 +187,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = EditFileTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(
+            .execute_default(invocation(
                 json!({ "path": "../f.txt", "find": "a", "replace": "b" }),
             ))
             .await

@@ -1,15 +1,21 @@
-use arbe_core::{ProviderError, RequestedToolCall, Role};
-use async_trait::async_trait;
-use futures_core::Stream;
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::error_map::{map_http_error, map_transport_error};
+use arbe_core::{ContentBlock, ImageSource, Message, ProviderError, Role, StopReason, Usage};
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
 use crate::sse::{SseDecoder, SseItem};
-use crate::utf8_buffer::Utf8ChunkBuffer;
-use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderCapabilities, TokenChunk};
+use crate::{
+    ModelCapabilities, ModelProvider, ModelRequest, ProviderEvent, ProviderStream, http,
+    next_call_id,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// OpenAI Chat Completions adapter. Also the adapter for any
+/// OpenAI-compatible endpoint (via `with_base_url`).
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
@@ -34,36 +40,53 @@ impl OpenAiProvider {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+// ---------------------------------------------------------------------------
+// Request mapping
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
 struct ChatMessage {
-    role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<ChatContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ChatToolCall>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
 }
 
-/// Wire shape of `message.tool_calls[]` / the request-side echo of a
-/// previously-requested call — identical on both sides of the round trip.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Plain string content, or a list of parts when the message has images.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ChatToolCall {
     id: String,
-    #[serde(rename = "type", default = "function_type")]
-    kind: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
     function: ChatToolCallFunction,
 }
 
-fn function_type() -> String {
-    "function".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ChatToolCallFunction {
     name: String,
-    /// OpenAI encodes call arguments as a JSON string, not an inline
-    /// object, on both the request and response sides.
+    /// OpenAI encodes call arguments as a JSON string, not an inline object.
     arguments: String,
 }
 
@@ -81,13 +104,9 @@ struct ChatToolFunction {
     parameters: serde_json::Value,
 }
 
-fn role_str(role: Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::System => "system",
-        Role::Tool => "tool",
-    }
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,13 +121,116 @@ struct ChatRequest {
     /// unconditionally rather than branching on model name.
     max_completion_tokens: u64,
     stream: bool,
+    /// Asks for a final usage chunk on the stream.
+    stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
 }
 
-fn build_request_body(req: &ModelRequest, stream: bool) -> ChatRequest {
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
+    }
+}
+
+fn image_url(source: &ImageSource, media_type: &str) -> String {
+    match source {
+        ImageSource::Url { url } => url.clone(),
+        ImageSource::Base64 { data } => format!("data:{media_type};base64,{data}"),
+    }
+}
+
+/// The text a tool-result message carries. OpenAI tool messages are
+/// text-only and have no error flag, so errors are marked in the text and
+/// non-text blocks are noted rather than silently dropped.
+fn tool_result_text(content: &[ContentBlock], is_error: bool) -> String {
+    let mut out = String::new();
+    if is_error {
+        out.push_str("[error] ");
+    }
+    for block in content {
+        match block {
+            ContentBlock::Text { text } => out.push_str(text),
+            ContentBlock::Image { .. } => out.push_str("[image omitted]"),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One harness message becomes zero or more chat messages: each tool
+/// result is its own `role: "tool"` message (OpenAI's convention), and the
+/// rest — text, images, tool calls — form one message for the role.
+/// Thinking and opaque blocks have no Chat Completions equivalent and are
+/// dropped.
+fn to_chat_messages(message: &Message) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut parts = Vec::new();
+    let mut has_image = false;
+    let mut tool_calls = Vec::new();
+
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: t } => {
+                text.push_str(t);
+                parts.push(ChatPart::Text { text: t.clone() });
+            }
+            ContentBlock::Image { source, media_type } => {
+                has_image = true;
+                parts.push(ChatPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: image_url(source, media_type),
+                    },
+                });
+            }
+            ContentBlock::ToolUse { id, name, input } => tool_calls.push(ChatToolCall {
+                id: id.clone(),
+                kind: "function",
+                function: ChatToolCallFunction {
+                    name: name.clone(),
+                    arguments: input.to_string(),
+                },
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => out.push(ChatMessage {
+                role: "tool",
+                content: Some(ChatContent::Text(tool_result_text(content, *is_error))),
+                tool_calls: None,
+                tool_call_id: Some(tool_use_id.clone()),
+            }),
+            ContentBlock::Thinking { .. } | ContentBlock::Opaque { .. } => {}
+        }
+    }
+
+    let has_body = !parts.is_empty() || !tool_calls.is_empty();
+    if has_body && message.role != Role::Tool {
+        let content = if has_image {
+            Some(ChatContent::Parts(parts))
+        } else if text.is_empty() && !tool_calls.is_empty() {
+            None
+        } else {
+            Some(ChatContent::Text(text))
+        };
+        out.push(ChatMessage {
+            role: role_str(message.role),
+            content,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        });
+    }
+    out
+}
+
+fn build_request_body(req: &ModelRequest) -> ChatRequest {
     let tools: Vec<ChatTool> = req
         .tools
         .iter()
@@ -124,219 +246,247 @@ fn build_request_body(req: &ModelRequest, stream: bool) -> ChatRequest {
     let tool_choice = if tools.is_empty() { None } else { Some("auto") };
     ChatRequest {
         model: req.model.clone(),
-        messages: req
-            .messages
-            .iter()
-            .map(|m| ChatMessage {
-                role: role_str(m.role).to_string(),
-                content: if m.content.is_empty() && m.tool_calls.is_some() {
-                    None
-                } else {
-                    Some(m.content.clone())
-                },
-                tool_calls: m.tool_calls.as_ref().map(|calls| {
-                    calls
-                        .iter()
-                        .map(|c| ChatToolCall {
-                            id: c.id.clone(),
-                            kind: function_type(),
-                            function: ChatToolCallFunction {
-                                name: c.name.clone(),
-                                arguments: c.arguments.to_string(),
-                            },
-                        })
-                        .collect()
-                }),
-                tool_call_id: m.tool_call_id.clone(),
-            })
-            .collect(),
+        messages: req.messages.iter().flat_map(to_chat_messages).collect(),
         temperature: req.temperature,
         max_completion_tokens: req.max_tokens,
-        stream,
+        stream: true,
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
         tools,
         tool_choice,
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-}
-
-/// Parses a tool call's JSON-string `arguments` into a `Value`. A model
-/// occasionally emits malformed JSON for a call's arguments; rather than
-/// fail the whole response over one bad call, this falls back to wrapping
-/// the raw string so the tool executor's own argument validation reports
-/// the problem (with the original text visible) instead of a provider
-/// parse error swallowing it.
-fn parse_tool_call_arguments(raw: &str) -> serde_json::Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-}
-
-fn parse_response(body: &str) -> Result<ModelResponse, ProviderError> {
-    let parsed: ChatResponse = serde_json::from_str(body)
-        .map_err(|e| ProviderError::Internal(format!("failed to parse OpenAI response: {e}")))?;
-    let message = parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message)
-        .ok_or_else(|| ProviderError::Internal("OpenAI response had no choices".to_string()))?;
-    let tool_calls = message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .map(|tc| RequestedToolCall {
-            id: tc.id,
-            name: tc.function.name,
-            arguments: parse_tool_call_arguments(&tc.function.arguments),
-        })
-        .collect();
-    Ok(ModelResponse {
-        content: message.content.unwrap_or_default(),
-        tool_calls,
-    })
-}
+// ---------------------------------------------------------------------------
+// Stream translation
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
+    #[serde(default)]
     content: Option<String>,
+    /// Reasoning text, as emitted by several OpenAI-compatible servers
+    /// (DeepSeek, vLLM reasoning parsers). OpenAI itself doesn't send it.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
 }
 
-fn parse_stream_payload(payload: &str) -> Result<Option<TokenChunk>, ProviderError> {
+#[derive(Debug, Deserialize)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+/// OpenAI streams tool calls keyed by `index`, with the id and name only on
+/// the first delta for each index; this remembers which id each index got.
+#[derive(Debug, Default)]
+struct StreamState {
+    ids_by_index: HashMap<u32, String>,
+    open_in_order: Vec<String>,
+}
+
+fn map_finish_reason(reason: &str) -> StopReason {
+    match reason {
+        "stop" => StopReason::EndTurn,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        "length" => StopReason::MaxTokens,
+        "content_filter" => StopReason::Refusal,
+        other => StopReason::Other(other.to_string()),
+    }
+}
+
+fn map_usage(usage: ChatUsage) -> Usage {
+    // OpenAI's prompt_tokens includes cached tokens; `Usage::input_tokens`
+    // excludes them, so split them out.
+    let cached = usage
+        .prompt_tokens_details
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
+    Usage {
+        input_tokens: usage.prompt_tokens.saturating_sub(cached),
+        output_tokens: usage.completion_tokens,
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
+    }
+}
+
+/// Translates one SSE `data:` payload into provider events.
+fn translate_chunk(
+    state: &mut StreamState,
+    payload: &str,
+) -> Result<Vec<ProviderEvent>, ProviderError> {
     let chunk: StreamChunk = serde_json::from_str(payload).map_err(|e| {
         ProviderError::Internal(format!("failed to parse OpenAI stream chunk: {e}"))
     })?;
-    let delta = chunk
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.delta.content);
-    Ok(delta.map(|delta| TokenChunk {
-        delta,
-        is_final: false,
-    }))
+    let mut events = Vec::new();
+
+    for choice in chunk.choices {
+        let delta = choice.delta;
+        if let Some(reasoning) = delta.reasoning_content.filter(|r| !r.is_empty()) {
+            events.push(ProviderEvent::ThinkingDelta(reasoning));
+        }
+        if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
+            events.push(ProviderEvent::TextDelta(content));
+        }
+        for call in delta.tool_calls {
+            let (name, arguments) = match call.function {
+                Some(f) => (f.name, f.arguments),
+                None => (None, None),
+            };
+            let id = match state.ids_by_index.get(&call.index) {
+                Some(id) => id.clone(),
+                None => {
+                    // Some compatible servers omit the id; synthesize one.
+                    let id = call
+                        .id
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| next_call_id("openai"));
+                    state.ids_by_index.insert(call.index, id.clone());
+                    state.open_in_order.push(id.clone());
+                    events.push(ProviderEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: name.unwrap_or_default(),
+                    });
+                    id
+                }
+            };
+            if let Some(partial_json) = arguments.filter(|a| !a.is_empty()) {
+                events.push(ProviderEvent::ToolUseInputDelta { id, partial_json });
+            }
+        }
+        if let Some(reason) = choice.finish_reason {
+            for id in state.open_in_order.drain(..) {
+                events.push(ProviderEvent::ToolUseEnd { id });
+            }
+            events.push(ProviderEvent::Stop(map_finish_reason(&reason)));
+        }
+    }
+
+    if let Some(usage) = chunk.usage {
+        events.push(ProviderEvent::Usage(map_usage(usage)));
+    }
+    Ok(events)
 }
 
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
+    fn id(&self) -> &str {
+        "openai"
+    }
+
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        // Per-model values arrive with the model catalog (v2 plan P2.6);
+        // until then, conservative values that hold for current models.
+        ModelCapabilities {
             streaming: true,
             tool_calls: true,
-            json_mode: true,
+            vision: true,
+            thinking: false,
+            prompt_caching: true,
             max_context_tokens: 128_000,
         }
     }
 
-    async fn infer(&self, req: ModelRequest) -> Result<ModelResponse, ProviderError> {
-        let body = build_request_body(&req, false);
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-
-        let status = response.status();
-        let text = response.text().await.map_err(map_transport_error)?;
-        if !status.is_success() {
-            return Err(map_http_error(status, &text));
-        }
-        parse_response(&text)
-    }
-
-    async fn infer_stream(
+    async fn stream(
         &self,
         req: ModelRequest,
-    ) -> Result<
-        Box<dyn Stream<Item = Result<TokenChunk, ProviderError>> + Send + Unpin>,
-        ProviderError,
-    > {
-        let body = build_request_body(&req, true);
-        let response = self
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let body = build_request_body(&req);
+        let request = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
+            .json(&body);
+        let response = http::send(request, &cancel).await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.map_err(map_transport_error)?;
-            return Err(map_http_error(status, &text));
-        }
-
-        let stream = async_stream::stream! {
-            use futures_util::StreamExt;
-
+        let events = async_stream::stream! {
             let mut decoder = SseDecoder::new();
-            let mut utf8_buf = Utf8ChunkBuffer::new();
-            let mut bytes_stream = response.bytes_stream();
-            'outer: while let Some(chunk) = bytes_stream.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
+            let mut state = StreamState::default();
+            let mut chunks = Box::pin(http::text_chunks(response));
+            while let Some(text) = chunks.next().await {
+                let text = match text {
+                    Ok(text) => text,
                     Err(e) => {
-                        yield Err(map_transport_error(e));
-                        break;
+                        yield Err(e);
+                        return;
                     }
                 };
-                let text = utf8_buf.push(&chunk);
                 for item in decoder.push(&text) {
-                    match item {
-                        SseItem::Done => {
-                            // Unlike Ollama (which reports `done` inline on
-                            // the last content chunk), OpenAI's `[DONE]` is
-                            // a separate, content-less sentinel — emit an
-                            // explicit is_final chunk here so `TokenChunk`'s
-                            // is_final contract is meaningful for both
-                            // providers rather than always false for OpenAI.
-                            yield Ok(TokenChunk {
-                                delta: String::new(),
-                                is_final: true,
-                            });
-                            break 'outer;
-                        }
-                        SseItem::Data(payload) => match parse_stream_payload(&payload) {
-                            Ok(Some(token)) => yield Ok(token),
-                            Ok(None) => {}
-                            Err(e) => {
-                                yield Err(e);
-                                break 'outer;
+                    let payload = match item {
+                        SseItem::Done => return,
+                        SseItem::Data(payload) => payload,
+                    };
+                    match translate_chunk(&mut state, &payload) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
                             }
-                        },
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
                     }
                 }
             }
         };
-
-        Ok(Box::new(Box::pin(stream)))
+        Ok(http::cancellable(events, cancel))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbe_core::{Message, ToolSpec};
+    use crate::ResponseAccumulator;
+    use arbe_core::{RequestedToolCall, ToolSpec};
     use serde_json::json;
 
     fn base_req(messages: Vec<Message>) -> ModelRequest {
@@ -349,19 +499,25 @@ mod tests {
         }
     }
 
+    fn body_json(req: &ModelRequest) -> serde_json::Value {
+        serde_json::to_value(build_request_body(req)).unwrap()
+    }
+
     #[test]
-    fn builds_request_body_with_mapped_roles() {
+    fn builds_request_body_with_mapped_roles_and_usage_streaming() {
         let req = base_req(vec![
             Message::new(Role::System, "be terse"),
             Message::new(Role::User, "hi"),
         ]);
-        let body = build_request_body(&req, false);
-        assert_eq!(body.model, "gpt-5");
-        assert_eq!(body.messages[0].role, "system");
-        assert_eq!(body.messages[1].role, "user");
-        assert!(!body.stream);
-        assert!(body.tools.is_empty());
-        assert!(body.tool_choice.is_none());
+        let json = body_json(&req);
+        assert_eq!(json["model"], "gpt-5");
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(json["messages"][0]["content"], "be terse");
+        assert_eq!(json["messages"][1]["role"], "user");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["stream_options"]["include_usage"], true);
+        assert!(json.get("tools").is_none());
+        assert!(json.get("tool_choice").is_none());
     }
 
     #[test]
@@ -372,73 +528,186 @@ mod tests {
             description: "reads a file".to_string(),
             parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         });
-        let body = build_request_body(&req, false);
-        assert_eq!(body.tools.len(), 1);
-        assert_eq!(body.tools[0].function.name, "read_file");
-        assert_eq!(body.tool_choice, Some("auto"));
+        let json = body_json(&req);
+        assert_eq!(json["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(json["tool_choice"], "auto");
     }
 
     #[test]
     fn assistant_tool_call_message_omits_content_and_carries_tool_calls() {
         let req = base_req(vec![Message::assistant_tool_calls(vec![
-            arbe_core::RequestedToolCall {
+            RequestedToolCall {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 arguments: json!({"path": "main.rs"}),
             },
         ])]);
-        let body = build_request_body(&req, false);
-        assert!(body.messages[0].content.is_none());
-        let calls = body.messages[0].tool_calls.as_ref().unwrap();
-        assert_eq!(calls[0].function.name, "read_file");
-        assert_eq!(calls[0].function.arguments, r#"{"path":"main.rs"}"#);
+        let json = body_json(&req);
+        let msg = &json["messages"][0];
+        assert!(msg.get("content").is_none());
+        assert_eq!(msg["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msg["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"main.rs"}"#
+        );
     }
 
     #[test]
-    fn tool_result_message_carries_its_tool_call_id() {
-        let req = base_req(vec![Message::tool_result("call_1", "file contents")]);
-        let body = build_request_body(&req, false);
-        assert_eq!(body.messages[0].role, "tool");
-        assert_eq!(body.messages[0].tool_call_id.as_deref(), Some("call_1"));
+    fn each_tool_result_becomes_its_own_tool_message() {
+        let msg = Message::with_blocks(
+            Role::Tool,
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: vec![ContentBlock::text("file contents")],
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_2".into(),
+                    content: vec![ContentBlock::text("no such file")],
+                    is_error: true,
+                },
+            ],
+        );
+        let json = body_json(&base_req(vec![msg]));
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+        assert_eq!(messages[0]["content"], "file contents");
+        assert_eq!(messages[1]["tool_call_id"], "call_2");
+        assert_eq!(messages[1]["content"], "[error] no such file");
     }
 
     #[test]
-    fn parses_a_non_streaming_response() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello there"}}]}"#;
-        let resp = parse_response(body).unwrap();
-        assert_eq!(resp.content, "hello there");
-        assert!(resp.tool_calls.is_empty());
+    fn images_switch_content_to_parts_with_data_urls() {
+        let msg = Message::with_blocks(
+            Role::User,
+            vec![
+                ContentBlock::text("what is this?"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        data: "AAAA".into(),
+                    },
+                    media_type: "image/png".into(),
+                },
+            ],
+        );
+        let json = body_json(&base_req(vec![msg]));
+        let parts = &json["messages"][0]["content"];
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]
-    fn parses_tool_calls_out_of_a_response() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":null,
-            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"main.rs\"}"}}]
-        }}]}"#;
-        let resp = parse_response(body).unwrap();
-        assert_eq!(resp.content, "");
-        assert_eq!(resp.tool_calls.len(), 1);
-        assert_eq!(resp.tool_calls[0].name, "read_file");
-        assert_eq!(resp.tool_calls[0].arguments, json!({"path": "main.rs"}));
+    fn thinking_blocks_are_not_sent() {
+        let msg = Message::with_blocks(
+            Role::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    text: "hmm".into(),
+                    signature: None,
+                },
+                ContentBlock::text("answer"),
+            ],
+        );
+        let json = body_json(&base_req(vec![msg]));
+        assert_eq!(json["messages"][0]["content"], "answer");
+    }
+
+    fn translate_all(payloads: &[&str]) -> Vec<ProviderEvent> {
+        let mut state = StreamState::default();
+        payloads
+            .iter()
+            .flat_map(|p| translate_chunk(&mut state, p).unwrap())
+            .collect()
     }
 
     #[test]
-    fn response_with_no_choices_is_an_internal_error() {
-        let body = r#"{"choices":[]}"#;
-        assert!(parse_response(body).is_err());
+    fn translates_text_deltas_finish_and_usage() {
+        let events = translate_all(&[
+            r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("Hel".into()),
+                ProviderEvent::TextDelta("lo".into()),
+                ProviderEvent::Stop(StopReason::EndTurn),
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 6,
+                    output_tokens: 2,
+                    cache_read_tokens: 4,
+                    cache_write_tokens: 0,
+                }),
+            ]
+        );
     }
 
     #[test]
-    fn parses_a_stream_delta_chunk() {
-        let payload = r#"{"choices":[{"delta":{"content":"Hel"}}]}"#;
-        let chunk = parse_stream_payload(payload).unwrap().unwrap();
-        assert_eq!(chunk.delta, "Hel");
-        assert!(!chunk.is_final);
+    fn reassembles_streamed_parallel_tool_calls_via_the_accumulator() {
+        let events = translate_all(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"list_dir","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut acc = ResponseAccumulator::new();
+        for e in events {
+            acc.push(e);
+        }
+        let r = acc.finish();
+        let calls = r.message.tool_uses();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].arguments, json!({"path": "a.rs"}));
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
     }
 
     #[test]
-    fn stream_chunk_with_no_content_delta_yields_nothing() {
-        let payload = r#"{"choices":[{"delta":{}}]}"#;
-        assert!(parse_stream_payload(payload).unwrap().is_none());
+    fn a_tool_call_without_an_id_gets_a_synthesized_one() {
+        let events = translate_all(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+        ]);
+        let ProviderEvent::ToolUseStart { id, name } = &events[0] else {
+            panic!("expected a tool use start, got {events:?}");
+        };
+        assert!(id.starts_with("openai-call-"));
+        assert_eq!(name, "glob");
+    }
+
+    #[test]
+    fn reasoning_content_from_compatible_servers_becomes_thinking() {
+        let events = translate_all(&[r#"{"choices":[{"delta":{"reasoning_content":"think"}}]}"#]);
+        assert_eq!(events, vec![ProviderEvent::ThinkingDelta("think".into())]);
+    }
+
+    #[test]
+    fn maps_finish_reasons() {
+        assert_eq!(map_finish_reason("length"), StopReason::MaxTokens);
+        assert_eq!(map_finish_reason("content_filter"), StopReason::Refusal);
+        assert_eq!(
+            map_finish_reason("weird"),
+            StopReason::Other("weird".into())
+        );
+    }
+
+    #[test]
+    fn malformed_chunk_is_an_internal_error() {
+        let mut state = StreamState::default();
+        assert!(matches!(
+            translate_chunk(&mut state, "{not json"),
+            Err(ProviderError::Internal(_))
+        ));
     }
 }

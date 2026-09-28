@@ -3,20 +3,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arbe_core::{
-    ApprovalDecision, HarnessError, LoopMachine, LoopPhase, MemoryError, Message, ProviderError,
-    RiskLevel, Role, RuntimeEvent, SessionId, SessionMeta, SessionStatus, ToolCallId, ToolError,
-    ToolInvocation, ToolSpec, Turn, TurnId,
+    ApprovalDecision, ContentBlock, EventEnvelope, HarnessError, LoopMachine, LoopPhase,
+    MemoryError, Message, ProviderError, RiskLevel, Role, RuntimeEvent, SessionId, SessionMeta,
+    SessionStatus, StopReason, ToolCallId, ToolError, ToolInvocation, ToolResult, ToolSpec, Turn,
+    TurnId, Usage,
 };
 use arbe_hooks::{HookPhase, HookRegistry};
 use arbe_memory::{
     CompactWithSummaryStrategy, ContextPipeline, ContextStrategy, HistoryEntry, TruncationStrategy,
 };
-use arbe_providers::{ModelProvider, ModelRequest, build_provider};
+use arbe_providers::{
+    AccumulatedResponse, CancellationToken, ModelProvider, ModelRequest, ProviderEvent,
+    ResponseAccumulator, build_provider,
+};
 use arbe_skills::SkillScope;
 use arbe_storage::SessionStore;
 use arbe_tools::{
-    ApprovalContext, ApprovalPolicy, GatedOutcome, StandardApprovalPolicy, ToolExecutor,
-    ToolRegistry, execute_gated,
+    ApprovalContext, ApprovalPolicy, GatedOutcome, StandardApprovalPolicy, ToolContext,
+    ToolExecutor, ToolRegistry, execute_gated,
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -72,6 +76,16 @@ impl ToolDecisions {
             None => false,
         }
     }
+}
+
+/// Moves the loop to `to`, turning an illegal transition into a
+/// `HarnessError::Internal` instead of a panic. It's still a harness bug,
+/// so debug builds assert loudly; release builds fail just this turn.
+fn advance(machine: &mut LoopMachine, to: LoopPhase) -> Result<(), HarnessError> {
+    machine.transition(to).map(|_| ()).map_err(|err| {
+        debug_assert!(false, "{err}");
+        HarnessError::Internal(err.to_string())
+    })
 }
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
@@ -137,6 +151,24 @@ fn load_global_skill_instructions() -> Vec<String> {
     }
 }
 
+/// What a turn's model loop produced.
+struct TurnOutcome {
+    /// The final answer's text.
+    text: String,
+    /// Usage summed over every inference call in the turn.
+    usage: Usage,
+    stop_reason: StopReason,
+}
+
+/// A cancelled provider request cancels the turn; anything else is a
+/// provider failure.
+fn provider_error(err: ProviderError) -> HarnessError {
+    match err {
+        ProviderError::Cancelled => HarnessError::Cancelled,
+        other => HarnessError::Provider(other),
+    }
+}
+
 /// The composed agent loop: one turn is context assembly -> inference ->
 /// (no tool-call parsing yet — see the note on `submit_message`) ->
 /// persistence -> events, driven through `LoopMachine` so illegal phase
@@ -149,6 +181,8 @@ pub struct Agent {
     pipeline: ContextPipeline,
     strategy: Box<dyn ContextStrategy>,
     budget_tokens: u64,
+    /// Runaway guard for `run_tool_loop` — see `RuntimeConfig::max_tool_rounds`.
+    max_tool_rounds: u32,
     temperature: f32,
     max_tokens: u64,
     registry: ToolRegistry,
@@ -187,6 +221,8 @@ impl Agent {
 
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
+        let budget_tokens = config
+            .effective_context_budget(provider.capabilities(&config.model).max_context_tokens);
 
         Ok(Self {
             store,
@@ -198,15 +234,19 @@ impl Agent {
                 ..Default::default()
             },
             strategy: build_strategy(&config.memory_strategy),
-            budget_tokens: config.context_budget_tokens,
+            budget_tokens,
+            max_tool_rounds: config.max_tool_rounds,
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             registry,
             policy: Box::new(StandardApprovalPolicy),
             approval_ctx: ApprovalContext {
-                policy_mode: config.policy_mode,
-                allowlist: config.allowlist.clone(),
-                denylist: config.denylist.clone(),
+                session_approval_covers_high_risk: config.session_approval_covers_high_risk,
+                ..ApprovalContext::new(
+                    config.policy_mode,
+                    config.allowlist.clone(),
+                    config.denylist.clone(),
+                )
             },
             hooks: HookRegistry::new(Duration::from_millis(config.hook_timeout_ms)),
             events,
@@ -258,16 +298,15 @@ impl Agent {
         let mut history = Vec::new();
         let mut next_turn_index = 0;
         for turn in turns {
-            if let Some(m) = turn.user_message {
+            // Same shape `run_turn` writes today: the user message and the
+            // final answer (see `submit_message` on the tool trace).
+            for m in [turn.user_message(), turn.final_assistant_message()]
+                .into_iter()
+                .flatten()
+            {
                 history.push(HistoryEntry {
                     turn_index: turn.index,
-                    message: m,
-                });
-            }
-            if let Some(m) = turn.assistant_message {
-                history.push(HistoryEntry {
-                    turn_index: turn.index,
-                    message: m,
+                    message: m.clone(),
                 });
             }
             next_turn_index = next_turn_index.max(turn.index + 1);
@@ -305,7 +344,7 @@ impl Agent {
     /// Lets any client (the TUI, a future CLI) observe the same event
     /// stream this agent publishes to, without coupling to loop internals
     /// (TUI spec §5).
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
         self.events.subscribe()
     }
 
@@ -324,46 +363,50 @@ impl Agent {
         self.store.save_meta(&self.meta)
     }
 
-    /// Runs one full turn: assemble context, run inference (looping through
-    /// approval-gated tool calls if the provider/model want any — see
-    /// `run_tool_loop`), persist, emit events.
-    ///
-    /// Only the direct-response path (no tools requested) streams
-    /// token-by-token via `ModelProvider::infer_stream`. When tools are on
-    /// the table, each round instead uses the non-streaming `infer` — the
-    /// model has to fully decide "call a tool" vs. "answer" before there's
-    /// anything useful to show, and accumulating a *streamed* tool call
-    /// (OpenAI sends its arguments as fragmented JSON-string deltas keyed
-    /// by index) is real complexity this doesn't need yet. The loop's
-    /// final round (the one that returns plain content, no more tool
-    /// calls) still emits that content as a `ModelStreamChunk`, so from
-    /// the TUI/event-consumer side both paths look the same.
+    /// Runs one full turn: assemble context, run the model loop
+    /// (`run_model_loop` — streaming every round, looping through
+    /// approval-gated tool calls when the model asks for them), persist,
+    /// emit events.
     ///
     /// The intermediate tool-calling exchange (the assistant's tool-call
     /// requests and each tool's result) lives only in this turn's local
-    /// `messages` — it is **not** persisted to `history`/`turns.jsonl` or
-    /// replayed into a future turn's context. Only the original user
-    /// message and the final assistant answer are, exactly as for a
-    /// direct-response turn. That means a resumed session sees what the
-    /// agent concluded, not the tool trace that got it there — an
-    /// intentional v1 scope cut (persisting/replaying the full trace would
-    /// mean threading `Message::tool_calls`/`tool_call_id` through
-    /// `ContextPipeline`, memory strategies, and `Turn`'s schema too).
+    /// `messages` — it is **not** yet persisted to `history`/`turns.jsonl`
+    /// or replayed into a future turn's context. Only the user message and
+    /// the final assistant answer are. Persisting the full trace needs the
+    /// memory strategies to keep tool-use/tool-result pairs together when
+    /// trimming (a lone half of a pair is rejected by providers) — v2 plan
+    /// P3.3.
+    ///
+    /// Any error is also published as `RuntimeEvent::RuntimeError`, so an
+    /// event-only consumer learns the turn failed without needing the
+    /// return value.
     pub async fn submit_message(&mut self, content: String) -> Result<String, HarnessError> {
-        let mut machine = LoopMachine::new();
-        machine
-            .transition(LoopPhase::ReceiveUserInput)
-            .expect("agent loop transition graph violated");
         let turn = Turn::new(self.meta.id, self.next_turn_index);
+        let turn_id = turn.id;
+        let result = self.run_turn(turn, content).await;
+        if let Err(err) = &result {
+            self.events.publish(RuntimeEvent::RuntimeError {
+                turn_id: Some(turn_id),
+                reason: err.to_string(),
+            });
+        }
+        result
+    }
+
+    async fn run_turn(&mut self, turn: Turn, content: String) -> Result<String, HarnessError> {
+        let mut machine = LoopMachine::new();
+        advance(&mut machine, LoopPhase::ReceiveUserInput)?;
         let turn_id = turn.id;
         self.events.publish(RuntimeEvent::TurnStarted {
             session_id: self.meta.id,
             turn_id,
         });
+        // Not yet reachable from outside (turn cancellation is v2 plan
+        // P3.5); threaded through inference and tools so it only needs
+        // exposing.
+        let cancel = CancellationToken::new();
 
-        machine
-            .transition(LoopPhase::AssembleContext)
-            .expect("agent loop transition graph violated");
+        advance(&mut machine, LoopPhase::AssembleContext)?;
         self.pipeline.system_instructions =
             vec![build_system_prompt_async(&self.project_dir).await];
         let user_message = Message::new(Role::User, content);
@@ -380,76 +423,41 @@ impl Agent {
             estimated_tokens: context.estimated_tokens,
         });
 
-        machine
-            .transition(LoopPhase::PlanOrDirectRespond)
-            .expect("agent loop transition graph violated");
+        advance(&mut machine, LoopPhase::PlanOrDirectRespond)?;
 
-        let tool_specs: Vec<ToolSpec> = if self.provider.capabilities().tool_calls {
+        let tool_specs: Vec<ToolSpec> = if self.provider.capabilities(&self.meta.model).tool_calls {
             arbe_tools::builtin::tool_specs()
         } else {
             Vec::new()
         };
 
-        let assistant_content = if tool_specs.is_empty() {
-            machine
-                .transition(LoopPhase::ModelInference)
-                .expect("agent loop transition graph violated");
-            self.hooks
-                .run_phase(
-                    HookPhase::BeforeModelCall,
-                    json!({ "turn_id": turn_id.to_string(), "message_count": context.messages.len() }),
-                )
-                .await;
+        let outcome = self
+            .run_model_loop(turn_id, context.messages, tool_specs, &mut machine, &cancel)
+            .await?;
 
-            let request = ModelRequest {
-                model: self.meta.model.clone(),
-                messages: context.messages,
-                temperature: self.temperature,
-                max_tokens: self.max_tokens,
-                tools: Vec::new(),
-            };
-            let mut stream = self
-                .provider
-                .infer_stream(request)
-                .await
-                .map_err(HarnessError::Provider)?;
-
-            let mut acc = String::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(HarnessError::Provider)?;
-                acc.push_str(&chunk.delta);
-                self.events.publish(RuntimeEvent::ModelStreamChunk {
-                    turn_id,
-                    delta: chunk.delta,
-                });
-            }
-
-            self.hooks
-                .run_phase(
-                    HookPhase::AfterModelCall,
-                    json!({ "turn_id": turn_id.to_string(), "response_len": acc.len() }),
-                )
-                .await;
-
-            machine
-                .transition(LoopPhase::InterpretOutput)
-                .expect("agent loop transition graph violated");
-            machine
-                .transition(LoopPhase::PersistTurn)
-                .expect("agent loop transition graph violated");
-            acc
-        } else {
-            self.run_tool_loop(turn_id, context.messages, tool_specs, &mut machine)
-                .await?
-        };
-
-        let assistant_message = Message::new(Role::Assistant, assistant_content.clone());
+        let assistant_message = Message::new(Role::Assistant, outcome.text.clone());
         let mut persisted_turn = turn;
-        persisted_turn.user_message = Some(user_message.clone());
-        persisted_turn.assistant_message = Some(assistant_message.clone());
+        persisted_turn.messages = vec![user_message.clone(), assistant_message.clone()];
+        persisted_turn.usage = outcome.usage;
+        persisted_turn.stop_reason = Some(outcome.stop_reason);
         self.store
             .append_turn(&persisted_turn)
             .map_err(|e| HarnessError::Memory(MemoryError::StoreUnavailable(e.to_string())))?;
+
+        self.meta.usage += outcome.usage;
+        self.meta.touch(SessionStatus::Active);
+        if let Err(err) = self.store.save_meta(&self.meta) {
+            // The turn itself is safely persisted; only the running usage
+            // total/timestamp in meta.json is stale, which isn't worth
+            // failing the turn over.
+            tracing::warn!(%err, "failed to update session metadata");
+        }
+        self.events.publish(RuntimeEvent::UsageUpdated {
+            session_id: self.meta.id,
+            turn_id,
+            turn: outcome.usage,
+            session: self.meta.usage,
+        });
 
         self.history.push(HistoryEntry {
             turn_index: persisted_turn.index,
@@ -461,16 +469,12 @@ impl Agent {
         });
         self.next_turn_index += 1;
 
-        machine
-            .transition(LoopPhase::EmitEvents)
-            .expect("agent loop transition graph violated");
+        advance(&mut machine, LoopPhase::EmitEvents)?;
         self.events.publish(RuntimeEvent::TurnCompleted {
             session_id: self.meta.id,
             turn_id,
         });
-        machine
-            .transition(LoopPhase::Idle)
-            .expect("agent loop transition graph violated");
+        advance(&mut machine, LoopPhase::Idle)?;
 
         self.hooks
             .run_phase(
@@ -479,33 +483,76 @@ impl Agent {
             )
             .await;
 
-        Ok(assistant_content)
+        Ok(outcome.text)
     }
 
-    /// Caps how many model<->tool round trips one turn can take before
-    /// giving up and returning whatever's been learned so far as a plain
-    /// message — a runaway "call a tool, get a result, call another tool"
-    /// loop shouldn't be able to hang a turn forever.
-    const MAX_TOOL_ROUNDS: u32 = 8;
+    /// Streams one inference call, forwarding deltas as `RuntimeEvent`s as
+    /// they arrive, and returns the accumulated response.
+    async fn stream_inference(
+        &self,
+        turn_id: TurnId,
+        request: ModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<AccumulatedResponse, HarnessError> {
+        let mut stream = self
+            .provider
+            .stream(request, cancel.clone())
+            .await
+            .map_err(provider_error)?;
+        let mut acc = ResponseAccumulator::new();
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(provider_error)?;
+            match &event {
+                ProviderEvent::TextDelta(delta) => {
+                    self.events.publish(RuntimeEvent::ModelStreamChunk {
+                        turn_id,
+                        delta: delta.clone(),
+                    })
+                }
+                ProviderEvent::ThinkingDelta(delta) => {
+                    self.events.publish(RuntimeEvent::ThinkingDelta {
+                        turn_id,
+                        delta: delta.clone(),
+                    })
+                }
+                ProviderEvent::ToolUseStart { id, name } => {
+                    self.events.publish(RuntimeEvent::ToolUseStarted {
+                        turn_id,
+                        provider_call_id: id.clone(),
+                        tool_name: name.clone(),
+                    })
+                }
+                ProviderEvent::ToolUseInputDelta { id, partial_json } => {
+                    self.events.publish(RuntimeEvent::ToolUseInputDelta {
+                        turn_id,
+                        provider_call_id: id.clone(),
+                        partial_json: partial_json.clone(),
+                    })
+                }
+                _ => {}
+            }
+            acc.push(event);
+        }
+        Ok(acc.finish())
+    }
 
-    /// Drives the model<->tool round-trip loop for a turn whose provider
-    /// supports tool calling (see `submit_message`'s doc comment for why
-    /// this uses non-streaming `infer` for the decision rounds). Every
-    /// call still passes through `execute_gated` — the same choke point
-    /// the manual `/tool` demo path (`propose_tool_call`/`resolve_tool_call`)
-    /// uses — so a model-initiated call is never less gated than a
-    /// human-initiated one.
-    async fn run_tool_loop(
+    /// Drives the model<->tool loop for one turn. Every round streams (see
+    /// `stream_inference`); a round that requests no tools ends the turn.
+    /// With no tools offered this is exactly one round. Every requested
+    /// call passes through `execute_gated` — the same choke point the
+    /// manual `/tool` path (`propose_tool_call`/`resolve_tool_call`) uses —
+    /// so a model-initiated call is never less gated than a human one.
+    async fn run_model_loop(
         &mut self,
         turn_id: TurnId,
         mut messages: Vec<Message>,
         tool_specs: Vec<ToolSpec>,
         machine: &mut LoopMachine,
-    ) -> Result<String, HarnessError> {
-        for round in 0..Self::MAX_TOOL_ROUNDS {
-            machine
-                .transition(LoopPhase::ModelInference)
-                .expect("agent loop transition graph violated");
+        cancel: &CancellationToken,
+    ) -> Result<TurnOutcome, HarnessError> {
+        let mut usage = Usage::default();
+        for round in 0..self.max_tool_rounds {
+            advance(machine, LoopPhase::ModelInference)?;
             self.hooks
                 .run_phase(
                     HookPhase::BeforeModelCall,
@@ -520,44 +567,35 @@ impl Agent {
                 max_tokens: self.max_tokens,
                 tools: tool_specs.clone(),
             };
-            let response = self
-                .provider
-                .infer(request)
-                .await
-                .map_err(HarnessError::Provider)?;
+            let response = self.stream_inference(turn_id, request, cancel).await?;
+            usage += response.usage;
+            let tool_calls = response.message.tool_uses();
 
             self.hooks
                 .run_phase(
                     HookPhase::AfterModelCall,
-                    json!({ "turn_id": turn_id.to_string(), "response_len": response.content.len(), "tool_calls": response.tool_calls.len() }),
+                    json!({ "turn_id": turn_id.to_string(), "response_len": response.message.text().len(), "tool_calls": tool_calls.len() }),
                 )
                 .await;
 
-            machine
-                .transition(LoopPhase::InterpretOutput)
-                .expect("agent loop transition graph violated");
+            advance(machine, LoopPhase::InterpretOutput)?;
 
-            if response.tool_calls.is_empty() {
-                machine
-                    .transition(LoopPhase::PersistTurn)
-                    .expect("agent loop transition graph violated");
-                // Mirrors the direct-response path's event, so a consumer
-                // (the TUI transcript) doesn't need to know which branch
-                // produced the final content.
-                self.events.publish(RuntimeEvent::ModelStreamChunk {
-                    turn_id,
-                    delta: response.content.clone(),
+            if tool_calls.is_empty() {
+                advance(machine, LoopPhase::PersistTurn)?;
+                return Ok(TurnOutcome {
+                    text: response.message.text(),
+                    usage,
+                    stop_reason: response.stop_reason,
                 });
-                return Ok(response.content);
             }
 
-            machine
-                .transition(LoopPhase::ToolApproval)
-                .expect("agent loop transition graph violated");
-            messages.push(Message::assistant_tool_calls(response.tool_calls.clone()));
+            advance(machine, LoopPhase::ToolApproval)?;
+            // The whole assistant message goes back: any text the model
+            // wrote alongside its tool calls is part of the conversation.
+            messages.push(response.message);
 
             let mut any_executed = false;
-            for call in response.tool_calls {
+            for call in tool_calls {
                 let risk = arbe_tools::builtin::default_risk_for(&call.name);
                 let invocation = ToolInvocation {
                     id: ToolCallId::new(),
@@ -576,34 +614,62 @@ impl Agent {
                     risk,
                 });
 
-                let outcome = self.resolve_gated_call(turn_id, invocation).await?;
-
-                let result_text = match &outcome {
-                    GatedOutcome::Executed(result) => {
-                        any_executed = true;
-                        self.events.publish(RuntimeEvent::ToolExecuted {
-                            turn_id,
-                            tool_call_id: invocation_id,
-                            tool_name: call.name.clone(),
-                            result: result.clone(),
-                        });
-                        serde_json::to_string(&result.output).unwrap_or_default()
-                    }
-                    GatedOutcome::Denied => {
-                        let reason = "denied by approval policy".to_string();
-                        self.events.publish(RuntimeEvent::ToolCallDenied {
-                            turn_id,
-                            tool_call_id: invocation_id,
-                            tool_name: call.name.clone(),
-                            reason: reason.clone(),
-                        });
-                        reason
-                    }
-                    // `resolve_gated_call` never returns this — it always
-                    // resolves a `PendingApproval` before returning.
-                    GatedOutcome::PendingApproval => "still awaiting approval".to_string(),
-                };
-                messages.push(Message::tool_result(call.id, result_text));
+                let (result_text, is_error) =
+                    match self.resolve_gated_call(turn_id, invocation, cancel).await {
+                        Ok(GatedOutcome::Executed(result)) => {
+                            any_executed = true;
+                            self.events.publish(RuntimeEvent::ToolExecuted {
+                                turn_id,
+                                tool_call_id: invocation_id,
+                                tool_name: call.name.clone(),
+                                result: result.clone(),
+                            });
+                            (
+                                serde_json::to_string(&result.output).unwrap_or_default(),
+                                result.is_error,
+                            )
+                        }
+                        Ok(GatedOutcome::Denied) => {
+                            let reason = "denied by approval policy".to_string();
+                            self.events.publish(RuntimeEvent::ToolCallDenied {
+                                turn_id,
+                                tool_call_id: invocation_id,
+                                tool_name: call.name.clone(),
+                                reason: reason.clone(),
+                            });
+                            (reason, true)
+                        }
+                        // `resolve_gated_call` always resolves a pending
+                        // approval before returning.
+                        Ok(GatedOutcome::PendingApproval) => {
+                            ("still awaiting approval".to_string(), true)
+                        }
+                        // Cancellation ends the turn. Any other tool failure
+                        // (bad arguments, unknown tool, runtime error) goes
+                        // back to the model as an error result so it can
+                        // correct itself, instead of failing the whole turn.
+                        Err(ToolError::Cancelled) => return Err(HarnessError::Cancelled),
+                        Err(err) => {
+                            any_executed = true;
+                            let message = err.to_string();
+                            self.events.publish(RuntimeEvent::ToolExecuted {
+                                turn_id,
+                                tool_call_id: invocation_id,
+                                tool_name: call.name.clone(),
+                                result: ToolResult {
+                                    id: invocation_id,
+                                    output: json!({ "error": message }),
+                                    is_error: true,
+                                },
+                            });
+                            (message, true)
+                        }
+                    };
+                messages.push(Message::tool_result_blocks(
+                    call.id,
+                    vec![ContentBlock::text(result_text)],
+                    is_error,
+                ));
             }
 
             if !any_executed {
@@ -612,37 +678,37 @@ impl Agent {
                 // straight to `PersistTurn` (nothing did) — mirrors the
                 // same branch `resolve_tool_call`'s manual path takes on a
                 // denial.
-                machine
-                    .transition(LoopPhase::PersistTurn)
-                    .expect("agent loop transition graph violated");
+                advance(machine, LoopPhase::PersistTurn)?;
                 let fallback =
                     "I don't have permission to run the tool(s) needed to answer that.".to_string();
                 self.events.publish(RuntimeEvent::ModelStreamChunk {
                     turn_id,
                     delta: fallback.clone(),
                 });
-                return Ok(fallback);
+                return Ok(TurnOutcome {
+                    text: fallback,
+                    usage,
+                    stop_reason: StopReason::ToolUse,
+                });
             }
 
-            machine
-                .transition(LoopPhase::ToolExecution)
-                .expect("agent loop transition graph violated");
-            machine
-                .transition(LoopPhase::PostToolReflection)
-                .expect("agent loop transition graph violated");
+            advance(machine, LoopPhase::ToolExecution)?;
+            advance(machine, LoopPhase::PostToolReflection)?;
             // Loops back to ModelInference for the next round.
         }
 
-        machine
-            .transition(LoopPhase::PersistTurn)
-            .expect("agent loop transition graph violated");
+        advance(machine, LoopPhase::PersistTurn)?;
         let fallback =
             "I wasn't able to finish that within the allotted tool-call steps.".to_string();
         self.events.publish(RuntimeEvent::ModelStreamChunk {
             turn_id,
             delta: fallback.clone(),
         });
-        Ok(fallback)
+        Ok(TurnOutcome {
+            text: fallback,
+            usage,
+            stop_reason: StopReason::Other("max_tool_rounds".to_string()),
+        })
     }
 
     /// Runs one invocation through `execute_gated`; if the policy requires
@@ -657,17 +723,19 @@ impl Agent {
         &mut self,
         turn_id: TurnId,
         invocation: ToolInvocation,
-    ) -> Result<GatedOutcome, HarnessError> {
+        cancel: &CancellationToken,
+    ) -> Result<GatedOutcome, ToolError> {
         let id = invocation.id;
+        let tool_ctx = ToolContext::new(cancel.clone());
         let first_pass = execute_gated(
             &self.registry,
             self.policy.as_ref(),
             &self.approval_ctx,
             invocation.clone(),
             None,
+            &tool_ctx,
         )
-        .await
-        .map_err(HarnessError::Tool)?;
+        .await?;
         if !matches!(first_pass, GatedOutcome::PendingApproval) {
             return Ok(first_pass);
         }
@@ -685,9 +753,9 @@ impl Agent {
             &self.approval_ctx,
             invocation,
             Some(decision),
+            &tool_ctx,
         )
         .await
-        .map_err(HarnessError::Tool)
     }
 
     /// A cheap, independently-lockable handle for supplying decisions on
@@ -756,6 +824,7 @@ impl Agent {
             &self.approval_ctx,
             invocation.clone(),
             Some(decision),
+            &ToolContext::default(),
         )
         .await?;
         match &outcome {
@@ -785,107 +854,122 @@ impl Agent {
 mod tests {
     use super::*;
     use arbe_core::{ApprovalPolicyMode, ToolResult};
-    use arbe_providers::{ModelResponse, ProviderCapabilities, TokenChunk};
+    use arbe_providers::{ModelCapabilities, ProviderStream};
     use async_trait::async_trait;
-    use futures_core::Stream;
     use std::path::PathBuf;
 
+    fn fake_capabilities(tool_calls: bool) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls,
+            vision: false,
+            thinking: false,
+            prompt_caching: false,
+            max_context_tokens: 8_000,
+        }
+    }
+
+    fn scripted(events: Vec<ProviderEvent>) -> ProviderStream {
+        Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+    }
+
+    /// Streams "hel" + "lo" as a plain answer, every time.
     struct FakeProvider;
 
     #[async_trait]
     impl ModelProvider for FakeProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                streaming: true,
-                tool_calls: false,
-                json_mode: false,
-                max_context_tokens: 8_000,
-            }
+        fn id(&self) -> &str {
+            "fake"
         }
 
-        async fn infer(&self, _req: ModelRequest) -> Result<ModelResponse, ProviderError> {
-            Ok(ModelResponse {
-                content: "hi".to_string(),
-                tool_calls: Vec::new(),
-            })
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            fake_capabilities(false)
         }
 
-        async fn infer_stream(
+        async fn stream(
             &self,
             _req: ModelRequest,
-        ) -> Result<
-            Box<dyn Stream<Item = Result<TokenChunk, ProviderError>> + Send + Unpin>,
-            ProviderError,
-        > {
-            let chunks = vec![
-                Ok(TokenChunk {
-                    delta: "hel".to_string(),
-                    is_final: false,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            Ok(scripted(vec![
+                ProviderEvent::TextDelta("hel".to_string()),
+                ProviderEvent::TextDelta("lo".to_string()),
+                ProviderEvent::Usage(Usage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    ..Default::default()
                 }),
-                Ok(TokenChunk {
-                    delta: "lo".to_string(),
-                    is_final: true,
-                }),
-            ];
-            Ok(Box::new(Box::pin(futures_util::stream::iter(chunks))))
+                ProviderEvent::Stop(StopReason::EndTurn),
+            ]))
         }
     }
 
-    /// A provider that requests one `echo` tool call on its first `infer`
-    /// call, then returns plain final content on the next — exercises
-    /// `run_tool_loop`'s round-trip without a real model.
+    /// Requests one `echo` tool call (with some text alongside it) on its
+    /// first call, then answers "final answer" — exercises the model loop's
+    /// round trip without a real model. Records every request it receives.
     struct FakeToolCallingProvider {
         call_count: std::sync::atomic::AtomicU32,
+        requests: Arc<std::sync::Mutex<Vec<ModelRequest>>>,
     }
 
     impl FakeToolCallingProvider {
         fn new() -> Self {
             Self {
                 call_count: std::sync::atomic::AtomicU32::new(0),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
 
     #[async_trait]
     impl ModelProvider for FakeToolCallingProvider {
-        fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                streaming: true,
-                tool_calls: true,
-                json_mode: false,
-                max_context_tokens: 8_000,
-            }
+        fn id(&self) -> &str {
+            "fake"
         }
 
-        async fn infer(&self, _req: ModelRequest) -> Result<ModelResponse, ProviderError> {
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            fake_capabilities(true)
+        }
+
+        async fn stream(
+            &self,
+            req: ModelRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(req);
             let round = self
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if round == 0 {
-                Ok(ModelResponse {
-                    content: String::new(),
-                    tool_calls: vec![arbe_core::RequestedToolCall {
+            let usage = ProviderEvent::Usage(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            });
+            Ok(if round == 0 {
+                scripted(vec![
+                    ProviderEvent::TextDelta("Let me check.".to_string()),
+                    ProviderEvent::ToolUseStart {
                         id: "call_1".to_string(),
                         name: "echo".to_string(),
-                        arguments: json!({"x": 1}),
-                    }],
-                })
+                    },
+                    ProviderEvent::ToolUseInputDelta {
+                        id: "call_1".to_string(),
+                        partial_json: "{\"x\":".to_string(),
+                    },
+                    ProviderEvent::ToolUseInputDelta {
+                        id: "call_1".to_string(),
+                        partial_json: "1}".to_string(),
+                    },
+                    usage,
+                    ProviderEvent::Stop(StopReason::ToolUse),
+                ])
             } else {
-                Ok(ModelResponse {
-                    content: "final answer".to_string(),
-                    tool_calls: Vec::new(),
-                })
-            }
-        }
-
-        async fn infer_stream(
-            &self,
-            _req: ModelRequest,
-        ) -> Result<
-            Box<dyn Stream<Item = Result<TokenChunk, ProviderError>> + Send + Unpin>,
-            ProviderError,
-        > {
-            unimplemented!("run_tool_loop never streams — see submit_message's doc comment")
+                scripted(vec![
+                    ProviderEvent::TextDelta("final answer".to_string()),
+                    usage,
+                    ProviderEvent::Stop(StopReason::EndTurn),
+                ])
+            })
         }
     }
 
@@ -893,7 +977,11 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for EchoExecutor {
-        async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+        async fn execute(
+            &self,
+            invocation: ToolInvocation,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
             Ok(ToolResult {
                 id: invocation.id,
                 output: invocation.arguments,
@@ -922,15 +1010,12 @@ mod tests {
             pipeline: ContextPipeline::default(),
             strategy: Box::new(TruncationStrategy),
             budget_tokens: 8_000,
+            max_tool_rounds: 50,
             temperature: 0.2,
             max_tokens: 100,
             registry: ToolRegistry::new(),
             policy: Box::new(StandardApprovalPolicy),
-            approval_ctx: ApprovalContext {
-                policy_mode: ApprovalPolicyMode::AlwaysPrompt,
-                allowlist: vec![],
-                denylist: vec![],
-            },
+            approval_ctx: ApprovalContext::new(ApprovalPolicyMode::AlwaysPrompt, vec![], vec![]),
             hooks: HookRegistry::new(Duration::from_millis(500)),
             events,
             history: Vec::new(),
@@ -958,15 +1043,12 @@ mod tests {
 
         let turns = store.list_turns(meta.id).unwrap();
         assert_eq!(turns.len(), 1);
-        assert_eq!(
-            turns[0].assistant_message.as_ref().unwrap().content,
-            "hello"
-        );
+        assert_eq!(turns[0].final_assistant_message().unwrap().text(), "hello");
 
         let mut saw_stream_chunk = false;
         let mut saw_turn_completed = false;
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match event.event {
                 RuntimeEvent::ModelStreamChunk { .. } => saw_stream_chunk = true,
                 RuntimeEvent::TurnCompleted { .. } => saw_turn_completed = true,
                 _ => {}
@@ -1044,7 +1126,7 @@ mod tests {
         let mut saw_proposed = false;
         let mut saw_requested = false;
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match event.event {
                 RuntimeEvent::ToolCallProposed { .. } => saw_proposed = true,
                 RuntimeEvent::ToolApprovalRequested { .. } => saw_requested = true,
                 _ => {}
@@ -1096,16 +1178,15 @@ mod tests {
         let mut history = Vec::new();
         let mut next_turn_index = 0;
         for turn in turns {
-            if let Some(m) = turn.user_message {
+            // Same shape `run_turn` writes today: the user message and the
+            // final answer (see `submit_message` on the tool trace).
+            for m in [turn.user_message(), turn.final_assistant_message()]
+                .into_iter()
+                .flatten()
+            {
                 history.push(HistoryEntry {
                     turn_index: turn.index,
-                    message: m,
-                });
-            }
-            if let Some(m) = turn.assistant_message {
-                history.push(HistoryEntry {
-                    turn_index: turn.index,
-                    message: m,
+                    message: m.clone(),
                 });
             }
             next_turn_index = next_turn_index.max(turn.index + 1);
@@ -1147,10 +1228,7 @@ mod tests {
         let turns = store.list_turns(meta.id).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[1].index, 1);
-        assert_eq!(
-            turns[1].user_message.as_ref().unwrap().content,
-            "after recovery"
-        );
+        assert_eq!(turns[1].user_message().unwrap().text(), "after recovery");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1213,13 +1291,13 @@ mod tests {
             !truncation_context
                 .messages
                 .iter()
-                .any(|m| m.content.contains("compacted"))
+                .any(|m| m.text().contains("compacted"))
         );
         assert!(
             compact_context
                 .messages
                 .iter()
-                .any(|m| m.content.contains("compacted"))
+                .any(|m| m.text().contains("compacted"))
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1266,6 +1344,63 @@ mod tests {
         std::fs::remove_dir_all(&project_dir).ok();
     }
 
+    /// A provider whose every call fails, for error-path tests.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl ModelProvider for FailingProvider {
+        fn id(&self) -> &str {
+            "failing"
+        }
+
+        fn capabilities(&self, _model: &str) -> ModelCapabilities {
+            fake_capabilities(false)
+        }
+
+        async fn stream(
+            &self,
+            _req: ModelRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            Err(ProviderError::Auth("bad key".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_publishes_a_runtime_error_event_with_its_turn_id() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut rx = events.subscribe();
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        agent.provider = Box::new(FailingProvider);
+
+        let err = agent.submit_message("hi".to_string()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            HarnessError::Provider(ProviderError::Auth(_))
+        ));
+
+        let mut started = None;
+        let mut errored = None;
+        while let Ok(event) = rx.try_recv() {
+            match event.event {
+                RuntimeEvent::TurnStarted { turn_id, .. } => started = Some(turn_id),
+                RuntimeEvent::RuntimeError { turn_id, reason } => {
+                    assert!(reason.contains("bad key"));
+                    errored = turn_id;
+                }
+                _ => {}
+            }
+        }
+        assert!(started.is_some());
+        assert_eq!(started, errored);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn run_tool_loop_auto_executes_an_allowlisted_tool_and_returns_final_content() {
         let (store, dir) = temp_store();
@@ -1276,14 +1411,131 @@ mod tests {
         let mut agent = agent_with_fake_provider(store, meta, events);
         agent.provider = Box::new(FakeToolCallingProvider::new());
         agent.register_tool("echo", Arc::new(EchoExecutor));
-        agent.approval_ctx = ApprovalContext {
-            policy_mode: ApprovalPolicyMode::AllowlistAuto,
-            allowlist: vec!["echo".to_string()],
-            denylist: vec![],
-        };
+        agent.approval_ctx = ApprovalContext::new(
+            ApprovalPolicyMode::AllowlistAuto,
+            vec!["echo".to_string()],
+            vec![],
+        );
 
         let reply = agent.submit_message("use echo".to_string()).await.unwrap();
         assert_eq!(reply, "final answer");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tool_round_sends_back_the_whole_assistant_message_and_the_tool_result() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        let provider = FakeToolCallingProvider::new();
+        let requests = provider.requests.clone();
+        agent.provider = Box::new(provider);
+        agent.register_tool("echo", Arc::new(EchoExecutor));
+        agent.approval_ctx = ApprovalContext::new(
+            ApprovalPolicyMode::AllowlistAuto,
+            vec!["echo".to_string()],
+            vec![],
+        );
+
+        agent.submit_message("use echo".to_string()).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = &requests[1].messages;
+        let assistant = &second[second.len() - 2];
+        assert_eq!(assistant.role, Role::Assistant);
+        // Text the model wrote alongside its tool call is kept, and the
+        // streamed argument fragments were reassembled.
+        assert_eq!(assistant.text(), "Let me check.");
+        assert_eq!(assistant.tool_uses()[0].arguments, json!({"x": 1}));
+        let result = second.last().unwrap();
+        assert_eq!(result.role, Role::Tool);
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        } = &result.content[0]
+        else {
+            panic!("expected a tool result, got {result:?}");
+        };
+        assert_eq!(tool_use_id, "call_1");
+        assert!(!is_error);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_call_goes_back_to_the_model_instead_of_failing_the_turn() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut agent = agent_with_fake_provider(store, meta, events);
+        let provider = FakeToolCallingProvider::new();
+        let requests = provider.requests.clone();
+        agent.provider = Box::new(provider);
+        // `echo` is deliberately not registered: the call fails validation.
+
+        let reply = agent.submit_message("use echo".to_string()).await.unwrap();
+        assert_eq!(reply, "final answer");
+
+        let requests = requests.lock().unwrap();
+        let result = requests[1].messages.last().unwrap();
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &result.content[0]
+        else {
+            panic!("expected a tool result, got {result:?}");
+        };
+        assert!(is_error);
+        assert!(
+            Message::with_blocks(Role::Tool, content.clone())
+                .text()
+                .contains("no tool registered")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn usage_is_recorded_on_the_turn_and_the_session_and_published() {
+        let (store, dir) = temp_store();
+        let meta = store
+            .create_session("default", "fake", "fake-model")
+            .unwrap();
+        let events = Arc::new(EventBus::default());
+        let mut rx = events.subscribe();
+        let mut agent = agent_with_fake_provider(store.clone(), meta.clone(), events);
+        agent.provider = Box::new(FakeToolCallingProvider::new());
+        agent.register_tool("echo", Arc::new(EchoExecutor));
+        agent.approval_ctx = ApprovalContext::new(
+            ApprovalPolicyMode::AllowlistAuto,
+            vec!["echo".to_string()],
+            vec![],
+        );
+
+        agent.submit_message("use echo".to_string()).await.unwrap();
+
+        // Two inference rounds of 10 in / 5 out each.
+        let turns = store.list_turns(meta.id).unwrap();
+        assert_eq!(turns[0].usage.input_tokens, 20);
+        assert_eq!(turns[0].usage.output_tokens, 10);
+        assert_eq!(turns[0].stop_reason, Some(StopReason::EndTurn));
+        let saved = store.load_meta(meta.id).unwrap();
+        assert_eq!(saved.usage.total_tokens(), 30);
+
+        let mut published = None;
+        while let Ok(envelope) = rx.try_recv() {
+            if let RuntimeEvent::UsageUpdated { session, .. } = envelope.event {
+                published = Some(session);
+            }
+        }
+        assert_eq!(published.unwrap().total_tokens(), 30);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1298,11 +1550,11 @@ mod tests {
         let mut agent = agent_with_fake_provider(store, meta, events);
         agent.provider = Box::new(FakeToolCallingProvider::new());
         agent.register_tool("echo", Arc::new(EchoExecutor));
-        agent.approval_ctx = ApprovalContext {
-            policy_mode: ApprovalPolicyMode::DenylistBlock,
-            allowlist: vec![],
-            denylist: vec!["echo".to_string()],
-        };
+        agent.approval_ctx = ApprovalContext::new(
+            ApprovalPolicyMode::DenylistBlock,
+            vec![],
+            vec!["echo".to_string()],
+        );
 
         let reply = agent.submit_message("use echo".to_string()).await.unwrap();
         assert!(reply.contains("don't have permission"));
@@ -1338,6 +1590,7 @@ mod tests {
                 .await
                 .expect("timed out waiting for ToolApprovalRequested")
                 .unwrap()
+                .event
             {
                 RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => break tool_call_id,
                 _ => continue,

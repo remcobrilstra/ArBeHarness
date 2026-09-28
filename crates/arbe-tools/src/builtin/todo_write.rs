@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Caps how many todos a single call can hold, so a runaway list can't
 /// flood every subsequent turn's context (this tool's own output gets fed
@@ -67,7 +67,11 @@ impl Default for TodoWriteTool {
 
 #[async_trait]
 impl ToolExecutor for TodoWriteTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid todo_write arguments: {e}")))?;
 
@@ -127,6 +131,7 @@ impl ToolExecutor for TodoWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
 
     fn invocation(args: serde_json::Value) -> ToolInvocation {
@@ -143,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn writes_and_snapshots_the_full_list() {
         let tool = TodoWriteTool::new();
-        tool.execute(invocation(json!({
+        tool.execute_default(invocation(json!({
             "todos": [
                 { "content": "first", "status": "pending" },
                 { "content": "second", "status": "in_progress" },
@@ -160,12 +165,12 @@ mod tests {
     #[tokio::test]
     async fn a_later_call_replaces_the_whole_list_not_appends() {
         let tool = TodoWriteTool::new();
-        tool.execute(invocation(json!({
+        tool.execute_default(invocation(json!({
             "todos": [{ "content": "first", "status": "pending" }]
         })))
         .await
         .unwrap();
-        tool.execute(invocation(json!({
+        tool.execute_default(invocation(json!({
             "todos": [{ "content": "only", "status": "completed" }]
         })))
         .await
@@ -180,7 +185,7 @@ mod tests {
     async fn rejects_more_than_one_in_progress_todo() {
         let tool = TodoWriteTool::new();
         let err = tool
-            .execute(invocation(json!({
+            .execute_default(invocation(json!({
                 "todos": [
                     { "content": "a", "status": "in_progress" },
                     { "content": "b", "status": "in_progress" },
@@ -195,7 +200,7 @@ mod tests {
     async fn rejects_empty_content() {
         let tool = TodoWriteTool::new();
         let err = tool
-            .execute(invocation(json!({
+            .execute_default(invocation(json!({
                 "todos": [{ "content": "  ", "status": "pending" }]
             })))
             .await
@@ -210,7 +215,7 @@ mod tests {
             .map(|i| json!({ "content": format!("t{i}"), "status": "pending" }))
             .collect();
         let err = tool
-            .execute(invocation(json!({ "todos": todos })))
+            .execute_default(invocation(json!({ "todos": todos })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
@@ -220,7 +225,7 @@ mod tests {
     async fn invalid_arguments_are_a_validation_error() {
         let tool = TodoWriteTool::new();
         let err = tool
-            .execute(invocation(json!({ "not_todos": [] })))
+            .execute_default(invocation(json!({ "not_todos": [] })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
@@ -230,7 +235,7 @@ mod tests {
     async fn reports_counts_by_status() {
         let tool = TodoWriteTool::new();
         let result = tool
-            .execute(invocation(json!({
+            .execute_default(invocation(json!({
                 "todos": [
                     { "content": "a", "status": "pending" },
                     { "content": "b", "status": "pending" },

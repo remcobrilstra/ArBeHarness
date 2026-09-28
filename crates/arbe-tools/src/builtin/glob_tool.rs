@@ -8,7 +8,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Caps how many matches a single `glob` call returns, so a broad pattern
 /// over a large tree can't flood the model's context in one call.
@@ -42,7 +42,11 @@ impl GlobTool {
 
 #[async_trait]
 impl ToolExecutor for GlobTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid glob arguments: {e}")))?;
         let search_root = resolve_within_root(&self.root, &args.path)?;
@@ -121,6 +125,7 @@ fn walk_and_match(search_root: &Path, matcher: &GlobMatcher) -> (Vec<String>, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -193,7 +198,7 @@ mod tests {
         let tool = GlobTool::new(dir.path().to_path_buf());
 
         let result = tool
-            .execute(invocation(json!({ "pattern": "*.rs" })))
+            .execute_default(invocation(json!({ "pattern": "*.rs" })))
             .await
             .unwrap();
 
@@ -205,7 +210,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = GlobTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "pattern": "*", "path": ".." })))
+            .execute_default(invocation(json!({ "pattern": "*", "path": ".." })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));

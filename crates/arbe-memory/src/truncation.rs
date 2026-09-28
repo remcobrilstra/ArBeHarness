@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::history::HistoryEntry;
-use crate::tokens::estimate_tokens;
+use crate::tokens::estimate_message_tokens;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
 /// Decides, index by index, which history entries survive the budget:
@@ -21,7 +21,7 @@ pub(crate) fn select_kept(
     let pinned_set: HashSet<u64> = pinned_turn_indices.iter().copied().collect();
     let costs: Vec<u64> = history
         .iter()
-        .map(|e| estimate_tokens(&e.message.content))
+        .map(|e| estimate_message_tokens(&e.message))
         .collect();
 
     let mut keep = vec![false; history.len()];
@@ -79,7 +79,7 @@ impl ContextStrategy for TruncationStrategy {
             .map(|(e, _)| e.message.clone())
             .collect();
 
-        let estimated_tokens = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+        let estimated_tokens = messages.iter().map(estimate_message_tokens).sum();
 
         ContextOutput {
             messages,
@@ -126,7 +126,7 @@ mod tests {
         };
         let out = strategy.build_context(input);
         assert_eq!(out.messages.len(), 1);
-        assert_eq!(out.messages[0].content, "cccc");
+        assert_eq!(out.messages[0].text(), "cccc");
         assert!(out.truncated);
     }
 
@@ -142,7 +142,7 @@ mod tests {
         // Pinned turn 0 always kept; budget of 1 is fully consumed by it
         // (cost 1), so no unpinned entries fit.
         assert_eq!(out.messages.len(), 1);
-        assert_eq!(out.messages[0].content, "aaaa");
+        assert_eq!(out.messages[0].text(), "aaaa");
         assert!(out.truncated);
     }
 
@@ -156,8 +156,8 @@ mod tests {
         };
         let out = strategy.build_context(input);
         assert_eq!(out.messages.len(), 2);
-        assert_eq!(out.messages[0].content, "bbbb");
-        assert_eq!(out.messages[1].content, "cccc");
+        assert_eq!(out.messages[0].text(), "bbbb");
+        assert_eq!(out.messages[1].text(), "cccc");
     }
 
     #[test]

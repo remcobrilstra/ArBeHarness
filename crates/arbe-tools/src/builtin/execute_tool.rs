@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Default and maximum allowed `timeout_secs` — a command with no timeout
 /// still needs *some* bound so a runaway process can't hang the loop
@@ -41,7 +41,11 @@ impl ExecuteTool {
 
 #[async_trait]
 impl ToolExecutor for ExecuteTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid execute arguments: {e}")))?;
         let timeout_secs = args
@@ -56,16 +60,40 @@ impl ToolExecutor for ExecuteTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Own process group, so the whole tree (the shell *and* whatever it
+        // started) can be killed together — see `kill_process_tree`.
+        #[cfg(unix)]
+        command.process_group(0);
 
         let child = command
             .spawn()
             .map_err(|e| ToolError::RuntimeFailure(format!("failed to spawn command: {e}")))?;
+        let pid = child.id();
 
-        let output =
-            tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-                .await
-                .map_err(|_| ToolError::Timeout)?
-                .map_err(|e| ToolError::RuntimeFailure(format!("command execution failed: {e}")))?;
+        // Pinned outside the `select!` so the child stays alive (and
+        // findable) until its tree is killed below; dropping `wait` first
+        // would kill only the shell and orphan its children.
+        let mut wait = Box::pin(tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        ));
+        let outcome = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
+            output = &mut wait => match output {
+                Err(_elapsed) => Err(ToolError::Timeout),
+                Ok(result) => result.map_err(|e| {
+                    ToolError::RuntimeFailure(format!("command execution failed: {e}"))
+                }),
+            },
+        };
+        if outcome.is_err()
+            && let Some(pid) = pid
+        {
+            kill_process_tree(pid).await;
+        }
+        drop(wait);
+        let output = outcome?;
 
         let exit_code = output.status.code();
         let is_error = exit_code != Some(0);
@@ -80,6 +108,35 @@ impl ToolExecutor for ExecuteTool {
             is_error,
         })
     }
+}
+
+/// Kills a command's whole process tree. Killing just the direct child
+/// (the shell) isn't enough: on Windows `cmd /C` never replaces itself, so
+/// the real program survives as an orphan, and on Unix any compound
+/// command (`a && b`, pipelines) does the same. A survivor keeps running
+/// after a timeout/cancel and holds the output pipes open. Best effort —
+/// failures are ignored, since the tree may already have exited.
+async fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    let mut killer = {
+        let mut c = Command::new("taskkill");
+        c.args(["/T", "/F", "/PID", &pid.to_string()]);
+        c
+    };
+    #[cfg(unix)]
+    let mut killer = {
+        // The child leads its own process group (`process_group(0)` at
+        // spawn), so its pgid is its pid; a negative target kills the group.
+        let mut c = Command::new("kill");
+        c.args(["-KILL", "--", &format!("-{pid}")]);
+        c
+    };
+    let _ = killer
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 /// Wraps `command` in the platform shell, so callers can use pipes,
@@ -101,6 +158,7 @@ fn shell_command(command: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -121,7 +179,7 @@ mod tests {
         let tool = ExecuteTool::new(dir.path().to_path_buf());
 
         let result = tool
-            .execute(invocation(json!({ "command": "echo hello" })))
+            .execute_default(invocation(json!({ "command": "echo hello" })))
             .await
             .unwrap();
 
@@ -136,7 +194,7 @@ mod tests {
         let tool = ExecuteTool::new(dir.path().to_path_buf());
 
         let result = tool
-            .execute(invocation(json!({ "command": "exit 3" })))
+            .execute_default(invocation(json!({ "command": "exit 3" })))
             .await
             .unwrap();
 
@@ -152,7 +210,7 @@ mod tests {
 
         let list_command = if cfg!(windows) { "dir /b" } else { "ls" };
         let result = tool
-            .execute(invocation(json!({ "command": list_command })))
+            .execute_default(invocation(json!({ "command": list_command })))
             .await
             .unwrap();
 
@@ -179,7 +237,7 @@ mod tests {
         };
 
         let err = tool
-            .execute(invocation(
+            .execute_default(invocation(
                 json!({ "command": sleep_command, "timeout_secs": 1 }),
             ))
             .await
@@ -189,10 +247,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_the_context_stops_a_running_command_promptly() {
+        let dir = tempdir().unwrap();
+        let tool = ExecuteTool::new(dir.path().to_path_buf());
+        let sleep_command = if cfg!(windows) {
+            "ping -n 31 127.0.0.1"
+        } else {
+            "sleep 30"
+        };
+        let ctx = ToolContext::default();
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = tool
+            .execute(
+                invocation(json!({ "command": sleep_command, "timeout_secs": 60 })),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
     async fn invalid_arguments_are_a_validation_error() {
         let dir = tempdir().unwrap();
         let tool = ExecuteTool::new(dir.path().to_path_buf());
-        let err = tool.execute(invocation(json!({}))).await.unwrap_err();
+        let err = tool
+            .execute_default(invocation(json!({})))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
     }
 }

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Files larger than this are rejected rather than read in full — keeps a
 /// single tool call from pulling an entire large binary/log into the
@@ -33,7 +33,11 @@ impl ReadFileTool {
 
 #[async_trait]
 impl ToolExecutor for ReadFileTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid read_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
@@ -98,6 +102,7 @@ fn slice_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -156,7 +161,7 @@ mod tests {
 
         let tool = ReadFileTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(invocation(json!({ "path": "hello.txt" })))
+            .execute_default(invocation(json!({ "path": "hello.txt" })))
             .await
             .unwrap();
 
@@ -171,7 +176,7 @@ mod tests {
 
         let tool = ReadFileTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(invocation(
+            .execute_default(invocation(
                 json!({ "path": "f.txt", "start_line": 2, "end_line": 2 }),
             ))
             .await
@@ -185,7 +190,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "path": "../outside.txt" })))
+            .execute_default(invocation(json!({ "path": "../outside.txt" })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
@@ -196,7 +201,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "path": "nope.txt" })))
+            .execute_default(invocation(json!({ "path": "nope.txt" })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::RuntimeFailure(_)));
@@ -206,7 +211,10 @@ mod tests {
     async fn invalid_arguments_are_a_validation_error() {
         let dir = tempdir().unwrap();
         let tool = ReadFileTool::new(dir.path().to_path_buf());
-        let err = tool.execute(invocation(json!({}))).await.unwrap_err();
+        let err = tool
+            .execute_default(invocation(json!({})))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
     }
 }

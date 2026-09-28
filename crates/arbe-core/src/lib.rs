@@ -10,15 +10,19 @@ pub mod message;
 pub mod session;
 pub mod tool;
 pub mod turn;
+pub mod usage;
 
-pub use error::{ConfigError, HarnessError, HookError, MemoryError, ProviderError, ToolError};
-pub use event::{RuntimeCommand, RuntimeEvent};
+pub use error::{
+    ConfigError, HarnessError, HookError, MemoryError, ProviderError, ToolError, UserFacing,
+};
+pub use event::{EventEnvelope, RuntimeCommand, RuntimeEvent};
 pub use ids::{SessionId, ToolCallId, TurnId};
 pub use loop_state::{IllegalTransition, LoopMachine, LoopPhase};
-pub use message::{Message, Role};
+pub use message::{ContentBlock, ImageSource, Message, Role};
 pub use session::{SessionMeta, SessionStatus};
 pub use tool::{
     ApprovalDecision, ApprovalPolicyMode, RequestedToolCall, RiskLevel, ToolInvocation, ToolResult,
     ToolSpec,
 };
-pub use turn::Turn;
+pub use turn::{TURN_SCHEMA_VERSION, Turn};
+pub use usage::{StopReason, Usage};

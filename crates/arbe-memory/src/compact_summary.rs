@@ -1,6 +1,6 @@
 use arbe_core::{Message, Role};
 
-use crate::tokens::estimate_tokens;
+use crate::tokens::estimate_message_tokens;
 use crate::truncation::select_kept;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
@@ -46,7 +46,7 @@ impl ContextStrategy for CompactWithSummaryStrategy {
                 .map(|(e, _)| e.message.clone()),
         );
 
-        let estimated_tokens = messages.iter().map(|m| estimate_tokens(&m.content)).sum();
+        let estimated_tokens = messages.iter().map(estimate_message_tokens).sum();
 
         ContextOutput {
             messages,
@@ -90,8 +90,8 @@ mod tests {
         });
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, Role::System);
-        assert!(out.messages[0].content.contains("2 earlier message"));
-        assert_eq!(out.messages[1].content, "cccc");
+        assert!(out.messages[0].text().contains("2 earlier message"));
+        assert_eq!(out.messages[1].text(), "cccc");
         assert!(out.truncated);
     }
 }

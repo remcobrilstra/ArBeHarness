@@ -228,13 +228,46 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A session written by v1 of the harness (plain-string message content,
+    /// separate `user_message`/`assistant_message`, no `schema_version`)
+    /// still loads, and a v2 turn appended after it coexists in the log.
+    #[test]
+    fn a_v1_turns_log_still_loads_and_accepts_v2_appends() {
+        let (store, dir) = temp_store();
+        let meta = store.create_session("default", "ollama", "llama3").unwrap();
+        let v1_line = format!(
+            r#"{{"id":"6f1c7e1a-5a8a-4e53-9d7f-1f6f2d6a9b10","session_id":"{}","index":0,"user_message":{{"role":"user","content":"hello","timestamp":"2026-08-01T00:00:00Z"}},"assistant_message":{{"role":"assistant","content":"hi there","timestamp":"2026-08-01T00:00:01Z"}},"tool_calls":[],"tool_results":[],"created_at":"2026-08-01T00:00:00Z"}}"#,
+            meta.id
+        );
+        fs::write(store.turns_path(meta.id), format!("{v1_line}\n")).unwrap();
+
+        let mut next = Turn::new(meta.id, 1);
+        next.messages
+            .push(arbe_core::Message::new(Role::User, "again"));
+        store.append_turn(&next).unwrap();
+
+        let turns = store.list_turns(meta.id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].schema_version, 1);
+        assert_eq!(turns[0].user_message().unwrap().text(), "hello");
+        assert_eq!(
+            turns[0].final_assistant_message().unwrap().text(),
+            "hi there"
+        );
+        assert_eq!(turns[1].schema_version, arbe_core::TURN_SCHEMA_VERSION);
+        assert_eq!(turns[1].user_message().unwrap().text(), "again");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn append_and_list_turns_survives_recovery() {
         let (store, dir) = temp_store();
         let meta = store.create_session("default", "openai", "gpt-5").unwrap();
 
         let mut turn = Turn::new(meta.id, 0);
-        turn.user_message = Some(arbe_core::Message::new(Role::User, "hello"));
+        turn.messages
+            .push(arbe_core::Message::new(Role::User, "hello"));
         store.append_turn(&turn).unwrap();
 
         // Simulate a forced interruption: no explicit close happened,
@@ -244,7 +277,7 @@ mod tests {
 
         assert_eq!(recovered_meta.id, meta.id);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].user_message.as_ref().unwrap().content, "hello");
+        assert_eq!(turns[0].user_message().unwrap().text(), "hello");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -255,7 +288,8 @@ mod tests {
         let meta = store.create_session("default", "openai", "gpt-5").unwrap();
 
         let mut turn = Turn::new(meta.id, 0);
-        turn.user_message = Some(arbe_core::Message::new(Role::User, "hello"));
+        turn.messages
+            .push(arbe_core::Message::new(Role::User, "hello"));
         store.append_turn(&turn).unwrap();
 
         // Simulate a crash mid-append: a second, torn line with no closing
@@ -270,7 +304,7 @@ mod tests {
 
         let turns = store.list_turns(meta.id).unwrap();
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].user_message.as_ref().unwrap().content, "hello");
+        assert_eq!(turns[0].user_message().unwrap().text(), "hello");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -283,7 +317,8 @@ mod tests {
 
         append_line(&path, "not valid json").unwrap();
         let mut turn = Turn::new(meta.id, 0);
-        turn.user_message = Some(arbe_core::Message::new(Role::User, "hello"));
+        turn.messages
+            .push(arbe_core::Message::new(Role::User, "hello"));
         store.append_turn(&turn).unwrap();
 
         let err = store.list_turns(meta.id).unwrap_err();

@@ -9,13 +9,9 @@ arbe-core = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-futures-core = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
-bytes = { workspace = true }
-thiserror = { workspace = true }
 async-stream = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
-
+tokio-util = { workspace = true }
+tracing = { workspace = true }

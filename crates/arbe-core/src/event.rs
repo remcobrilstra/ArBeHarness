@@ -3,6 +3,17 @@ use serde_json::Value;
 
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::tool::{ApprovalDecision, RiskLevel, ToolResult};
+use crate::usage::Usage;
+
+/// A published `RuntimeEvent` plus its position in the bus's stream.
+/// `seq` increases by exactly one per published event, so a consumer can
+/// detect dropped events (a gap) without relying on the transport to tell
+/// it — important once events cross a process boundary (headless mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub seq: u64,
+    pub event: RuntimeEvent,
+}
 
 /// Events emitted by the runtime for UI/debug tooling to consume
 /// (TUI spec §5, harness spec FR-10). The TUI must never depend on
@@ -24,6 +35,26 @@ pub enum RuntimeEvent {
     ModelStreamChunk {
         turn_id: TurnId,
         delta: String,
+    },
+    /// A fragment of the model's reasoning, for UIs that show it.
+    ThinkingDelta {
+        turn_id: TurnId,
+        delta: String,
+    },
+    /// The model has started emitting a tool call. `provider_call_id` is
+    /// the provider's id for it — the harness's own `ToolCallId` is only
+    /// assigned once the call is complete (`ToolCallProposed`).
+    ToolUseStarted {
+        turn_id: TurnId,
+        provider_call_id: String,
+        tool_name: String,
+    },
+    /// A fragment of a streaming tool call's JSON arguments, so a UI can
+    /// show them forming.
+    ToolUseInputDelta {
+        turn_id: TurnId,
+        provider_call_id: String,
+        partial_json: String,
     },
     ToolCallProposed {
         turn_id: TurnId,
@@ -47,6 +78,32 @@ pub enum RuntimeEvent {
         tool_call_id: ToolCallId,
         tool_name: String,
         reason: String,
+    },
+    /// A running tool's progress report (e.g. a long command's output).
+    ToolProgress {
+        turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        update: String,
+    },
+    /// Token usage after an inference call: this turn's running total and
+    /// the session's.
+    UsageUpdated {
+        session_id: SessionId,
+        turn_id: TurnId,
+        turn: Usage,
+        session: Usage,
+    },
+    /// Older context was compacted to fit the budget.
+    CompactionPerformed {
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+        compacted_messages: u64,
+    },
+    /// The turn was cancelled before completing; what it produced so far
+    /// has been persisted.
+    TurnCancelled {
+        session_id: SessionId,
+        turn_id: TurnId,
     },
     TurnCompleted {
         session_id: SessionId,
@@ -81,6 +138,10 @@ pub enum RuntimeCommand {
         session_id: SessionId,
     },
     TerminateSession {
+        session_id: SessionId,
+    },
+    /// Cancel the session's in-flight turn, if any.
+    CancelTurn {
         session_id: SessionId,
     },
 }

@@ -37,6 +37,8 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
+    use crate::ToolContext;
     use arbe_core::{RiskLevel, ToolCallId, ToolInvocation, ToolResult, TurnId};
     use async_trait::async_trait;
     use serde_json::json;
@@ -45,7 +47,11 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for EchoExecutor {
-        async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+        async fn execute(
+            &self,
+            invocation: ToolInvocation,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
             Ok(ToolResult {
                 id: invocation.id,
                 output: invocation.arguments,
@@ -81,7 +87,7 @@ mod tests {
 
         assert!(registry.contains("echo"));
         let executor = registry.get("echo").unwrap();
-        let result = executor.execute(invocation("echo")).await.unwrap();
+        let result = executor.execute_default(invocation("echo")).await.unwrap();
         assert_eq!(result.output, json!({"a": 1}));
     }
 }

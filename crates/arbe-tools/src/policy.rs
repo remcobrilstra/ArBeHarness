@@ -20,6 +20,13 @@ pub enum PolicyOutcome {
 ///   auto-approves (a permissive default that blocks only known-bad tools).
 /// - `DryRunOnly`: nothing ever executes — every invocation auto-denies,
 ///   since there is no dry-run execution engine yet to "simulate" it.
+///
+/// Session-scoped human decisions (`ApprovalContext::session`) layer on
+/// top: an "always deny for session" tool auto-denies regardless of mode,
+/// and an "approve for session" tool turns a `RequiresPrompt` into
+/// `AutoApprove` — but never overrides a config-level `AutoDeny`, and only
+/// covers `RiskLevel::High` tools when
+/// `ApprovalContext::session_approval_covers_high_risk` is set.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StandardApprovalPolicy;
 
@@ -29,6 +36,10 @@ impl ApprovalPolicy for StandardApprovalPolicy {
         invocation: &arbe_core::ToolInvocation,
         ctx: &ApprovalContext,
     ) -> PolicyOutcome {
+        if ctx.session.is_denied(&invocation.tool_name) {
+            return PolicyOutcome::AutoDeny;
+        }
+
         let outcome = match ctx.policy_mode {
             ApprovalPolicyMode::AlwaysPrompt => PolicyOutcome::RequiresPrompt,
             ApprovalPolicyMode::AllowlistAuto => {
@@ -53,8 +64,16 @@ impl ApprovalPolicy for StandardApprovalPolicy {
         // to let its *name* through — it still always needs a human
         // decision. DryRunOnly's AutoDeny is untouched: it's already the
         // maximally safe outcome, nothing safer to fall back to.
-        if invocation.risk == RiskLevel::High && outcome == PolicyOutcome::AutoApprove {
+        let high_risk = invocation.risk == RiskLevel::High;
+        if high_risk && outcome == PolicyOutcome::AutoApprove {
             return PolicyOutcome::RequiresPrompt;
+        }
+
+        if outcome == PolicyOutcome::RequiresPrompt
+            && ctx.session.is_allowed(&invocation.tool_name)
+            && (!high_risk || ctx.session_approval_covers_high_risk)
+        {
+            return PolicyOutcome::AutoApprove;
         }
         outcome
     }
@@ -82,11 +101,71 @@ mod tests {
     }
 
     fn ctx(mode: ApprovalPolicyMode, allowlist: &[&str], denylist: &[&str]) -> ApprovalContext {
-        ApprovalContext {
-            policy_mode: mode,
-            allowlist: allowlist.iter().map(|s| s.to_string()).collect(),
-            denylist: denylist.iter().map(|s| s.to_string()).collect(),
-        }
+        ApprovalContext::new(
+            mode,
+            allowlist.iter().map(|s| s.to_string()).collect(),
+            denylist.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn session_approval_turns_a_prompt_into_auto_approve() {
+        let policy = StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::AlwaysPrompt, &[], &[]);
+        c.session
+            .record("read_file", arbe_core::ApprovalDecision::ApprovedForSession);
+        assert_eq!(
+            policy.decide(&invocation("read_file"), &c),
+            PolicyOutcome::AutoApprove
+        );
+        assert_eq!(
+            policy.decide(&invocation("write_file"), &c),
+            PolicyOutcome::RequiresPrompt
+        );
+    }
+
+    #[test]
+    fn session_deny_auto_denies_even_under_a_permissive_mode() {
+        let policy = StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::DenylistBlock, &[], &[]);
+        c.session
+            .record("grep", arbe_core::ApprovalDecision::AlwaysDeniedForSession);
+        assert_eq!(
+            policy.decide(&invocation("grep"), &c),
+            PolicyOutcome::AutoDeny
+        );
+    }
+
+    #[test]
+    fn session_approval_never_overrides_a_config_level_deny() {
+        let policy = StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::DenylistBlock, &[], &["rm_rf"]);
+        c.session
+            .record("rm_rf", arbe_core::ApprovalDecision::ApprovedForSession);
+        assert_eq!(
+            policy.decide(&invocation("rm_rf"), &c),
+            PolicyOutcome::AutoDeny
+        );
+        let dry = ctx(ApprovalPolicyMode::DryRunOnly, &[], &[]);
+        dry.session
+            .record("read_file", arbe_core::ApprovalDecision::ApprovedForSession);
+        assert_eq!(
+            policy.decide(&invocation("read_file"), &dry),
+            PolicyOutcome::AutoDeny
+        );
+    }
+
+    #[test]
+    fn session_approval_does_not_cover_high_risk_by_default() {
+        let policy = StandardApprovalPolicy;
+        let mut c = ctx(ApprovalPolicyMode::AlwaysPrompt, &[], &[]);
+        c.session
+            .record("execute", arbe_core::ApprovalDecision::ApprovedForSession);
+        let call = invocation_with_risk("execute", RiskLevel::High);
+        assert_eq!(policy.decide(&call, &c), PolicyOutcome::RequiresPrompt);
+
+        c.session_approval_covers_high_risk = true;
+        assert_eq!(policy.decide(&call, &c), PolicyOutcome::AutoApprove);
     }
 
     #[test]

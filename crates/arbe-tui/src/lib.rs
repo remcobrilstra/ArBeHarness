@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use arbe_runtime::arbe_core::{
-    ApprovalDecision, Role, RuntimeEvent, SessionId, ToolCallId, ToolResult,
+    ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, ToolCallId, ToolResult,
 };
 use arbe_runtime::arbe_storage::SessionStore;
 use arbe_runtime::arbe_tools::ToolExecutor;
@@ -125,7 +125,7 @@ fn event_loop(
     handle: &Handle,
     config: &RuntimeConfig,
     events: &Arc<EventBus>,
-    events_rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
     outcome_tx: &Sender<AgentOutcome>,
     outcome_rx: &Receiver<AgentOutcome>,
 ) -> io::Result<()> {
@@ -160,13 +160,14 @@ fn event_loop(
 
 fn drain_runtime_events(
     app: &mut App,
-    events_rx: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
 ) {
     loop {
-        match events_rx.try_recv() {
+        match events_rx.try_recv().map(|envelope| envelope.event) {
             Ok(RuntimeEvent::ContextBuilt {
                 estimated_tokens, ..
             }) => {
+                app.last_estimated_tokens = estimated_tokens;
                 app.activity = Some(format!(
                     "calling model (~{estimated_tokens} tokens context)…"
                 ));
@@ -545,11 +546,11 @@ fn resume_session(
             let turns = store.list_turns(session_id).unwrap_or_default();
             swap_in_agent(app, agent, tool_decisions, handle, new_agent);
             for turn in turns {
-                if let Some(m) = turn.user_message {
-                    app.push_line(Role::User, m.content);
+                if let Some(m) = turn.user_message() {
+                    app.push_line(Role::User, m.text());
                 }
-                if let Some(m) = turn.assistant_message {
-                    app.push_line(Role::Assistant, m.content);
+                if let Some(m) = turn.final_assistant_message() {
+                    app.push_line(Role::Assistant, m.text());
                 }
             }
             app.notice = Some(format!("resumed session {session_id}"));
@@ -632,9 +633,12 @@ mod tests {
         let session_id = app.session_id;
         let turn_id = TurnId::new();
 
-        tx.send(RuntimeEvent::TurnCompleted {
-            session_id,
-            turn_id,
+        tx.send(EventEnvelope {
+            seq: 0,
+            event: RuntimeEvent::TurnCompleted {
+                session_id,
+                turn_id,
+            },
         })
         .unwrap();
         app.working = true;
@@ -653,9 +657,12 @@ mod tests {
         let session_id = app.session_id;
 
         for _ in 0..10 {
-            let _ = tx.send(RuntimeEvent::TurnCompleted {
-                session_id,
-                turn_id: TurnId::new(),
+            let _ = tx.send(EventEnvelope {
+                seq: 0,
+                event: RuntimeEvent::TurnCompleted {
+                    session_id,
+                    turn_id: TurnId::new(),
+                },
             });
         }
 

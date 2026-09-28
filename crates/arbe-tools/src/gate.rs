@@ -1,6 +1,6 @@
 use arbe_core::{ApprovalDecision, ToolError, ToolInvocation, ToolResult};
 
-use crate::{ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolRegistry};
+use crate::{ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolContext, ToolRegistry};
 
 /// What happened to a gated invocation. Deliberately distinct from
 /// `Result<ToolResult, ToolError>` alone: `PendingApproval` is not a
@@ -20,12 +20,17 @@ pub enum GatedOutcome {
 /// non-negotiable approval-gate rule). `human_decision` is `None` on the
 /// first pass through a turn; once the runtime collects a decision from a
 /// `PendingApproval` outcome, it re-calls this with `Some(decision)`.
+///
+/// A session-scoped human decision (`ApprovedForSession` /
+/// `AlwaysDeniedForSession`) is recorded into `ctx.session` here, so later
+/// invocations of the same tool are decided by the policy without asking.
 pub async fn execute_gated(
     registry: &ToolRegistry,
     policy: &dyn ApprovalPolicy,
     ctx: &ApprovalContext,
     invocation: ToolInvocation,
     human_decision: Option<ApprovalDecision>,
+    tool_ctx: &ToolContext,
 ) -> Result<GatedOutcome, ToolError> {
     let executor = registry.get(&invocation.tool_name)?.clone();
 
@@ -33,7 +38,10 @@ pub async fn execute_gated(
         (PolicyOutcome::AutoApprove, _) => true,
         (PolicyOutcome::AutoDeny, _) => false,
         (PolicyOutcome::RequiresPrompt, None) => return Ok(GatedOutcome::PendingApproval),
-        (PolicyOutcome::RequiresPrompt, Some(decision)) => decision.is_approved(),
+        (PolicyOutcome::RequiresPrompt, Some(decision)) => {
+            ctx.session.record(&invocation.tool_name, decision);
+            decision.is_approved()
+        }
     };
 
     if !approved {
@@ -41,7 +49,7 @@ pub async fn execute_gated(
     }
 
     executor
-        .execute(invocation)
+        .execute(invocation, tool_ctx)
         .await
         .map(GatedOutcome::Executed)
 }
@@ -58,7 +66,11 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for EchoExecutor {
-        async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+        async fn execute(
+            &self,
+            invocation: ToolInvocation,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
             Ok(ToolResult {
                 id: invocation.id,
                 output: invocation.arguments,
@@ -67,7 +79,7 @@ mod tests {
         }
     }
 
-    use crate::ToolExecutor;
+    use crate::{ToolContext, ToolExecutor};
 
     fn invocation() -> ToolInvocation {
         ToolInvocation {
@@ -87,11 +99,92 @@ mod tests {
     }
 
     fn ctx(mode: ApprovalPolicyMode) -> ApprovalContext {
-        ApprovalContext {
-            policy_mode: mode,
-            allowlist: vec![],
-            denylist: vec![],
-        }
+        ApprovalContext::new(mode, vec![], vec![])
+    }
+
+    #[tokio::test]
+    async fn approve_for_session_executes_later_calls_without_asking() {
+        let policy = crate::StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::AlwaysPrompt);
+        let first = execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            Some(ApprovalDecision::ApprovedForSession),
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, GatedOutcome::Executed(_)));
+
+        let second = execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            None,
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second, GatedOutcome::Executed(_)));
+    }
+
+    #[tokio::test]
+    async fn always_deny_for_session_denies_later_calls_without_asking() {
+        let policy = crate::StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::AlwaysPrompt);
+        let first = execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            Some(ApprovalDecision::AlwaysDeniedForSession),
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, GatedOutcome::Denied));
+
+        let second = execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            None,
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second, GatedOutcome::Denied));
+    }
+
+    #[tokio::test]
+    async fn approve_once_is_not_remembered() {
+        let policy = crate::StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::AlwaysPrompt);
+        execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            Some(ApprovalDecision::ApprovedOnce),
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        let second = execute_gated(
+            &registry(),
+            &policy,
+            &c,
+            invocation(),
+            None,
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second, GatedOutcome::PendingApproval));
     }
 
     #[tokio::test]
@@ -104,6 +197,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             None,
+            &ToolContext::default(),
         )
         .await
         .unwrap_err();
@@ -119,6 +213,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             None,
+            &ToolContext::default(),
         )
         .await
         .unwrap();
@@ -134,6 +229,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             Some(ApprovalDecision::ApprovedOnce),
+            &ToolContext::default(),
         )
         .await
         .unwrap();
@@ -149,6 +245,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             Some(ApprovalDecision::DeniedOnce),
+            &ToolContext::default(),
         )
         .await
         .unwrap();
@@ -164,6 +261,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::DryRunOnly),
             invocation(),
             None,
+            &ToolContext::default(),
         )
         .await
         .unwrap();

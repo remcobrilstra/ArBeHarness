@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 /// Caps how many entries a single `list_dir` call returns, so a huge
 /// directory can't flood the model's context in one call.
@@ -40,7 +40,11 @@ impl ListDirTool {
 
 #[async_trait]
 impl ToolExecutor for ListDirTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid list_dir arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
@@ -80,6 +84,7 @@ impl ToolExecutor for ListDirTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -102,7 +107,7 @@ mod tests {
         std::fs::write(dir.path().join("c.txt"), "").unwrap();
 
         let tool = ListDirTool::new(dir.path().to_path_buf());
-        let result = tool.execute(invocation(json!({}))).await.unwrap();
+        let result = tool.execute_default(invocation(json!({}))).await.unwrap();
 
         let entries = result.output["entries"].as_array().unwrap();
         let names: Vec<&str> = entries
@@ -120,7 +125,7 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "").unwrap();
 
         let tool = ListDirTool::new(dir.path().to_path_buf());
-        let result = tool.execute(invocation(json!({}))).await.unwrap();
+        let result = tool.execute_default(invocation(json!({}))).await.unwrap();
 
         assert_eq!(result.output["entries"].as_array().unwrap().len(), 1);
     }
@@ -133,7 +138,7 @@ mod tests {
 
         let tool = ListDirTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(invocation(json!({ "path": "sub" })))
+            .execute_default(invocation(json!({ "path": "sub" })))
             .await
             .unwrap();
 
@@ -146,7 +151,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = ListDirTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "path": ".." })))
+            .execute_default(invocation(json!({ "path": ".." })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
@@ -157,7 +162,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = ListDirTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(json!({ "path": "nope" })))
+            .execute_default(invocation(json!({ "path": "nope" })))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::RuntimeFailure(_)));

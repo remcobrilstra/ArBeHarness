@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arbe_core::{ToolError, ToolInvocation, ToolResult};
-use arbe_tools::{ToolExecutor, ToolRegistry};
+use arbe_tools::{ToolContext, ToolExecutor, ToolRegistry};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -20,7 +20,16 @@ pub struct McpToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for McpToolExecutor {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    /// Ignores `ctx.cancel` for now: `McpClient` reads responses in order
+    /// off one stdio stream, so abandoning a request mid-flight would leave
+    /// its response queued and break the next call. Proper cancellation
+    /// (`notifications/cancelled` + an id-keyed response map) comes with
+    /// the concurrent client rewrite (v2 plan P4.5).
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let mut client = self.client.lock().await;
         let output = client
             .call_tool(&self.tool_name, invocation.arguments)

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::path_guard::{resolve_within_root, verify_no_symlink_escape};
-use crate::ToolExecutor;
+use crate::{ToolContext, ToolExecutor};
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -30,7 +30,11 @@ impl WriteFileTool {
 
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
-    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid write_file arguments: {e}")))?;
         let path = resolve_within_root(&self.root, &args.path)?;
@@ -53,6 +57,7 @@ impl ToolExecutor for WriteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecuteWithDefaultContext;
     use arbe_core::{RiskLevel, ToolCallId, TurnId};
     use tempfile::tempdir;
 
@@ -73,7 +78,7 @@ mod tests {
         let tool = WriteFileTool::new(dir.path().to_path_buf());
 
         let result = tool
-            .execute(invocation(json!({ "path": "new.txt", "content": "hi" })))
+            .execute_default(invocation(json!({ "path": "new.txt", "content": "hi" })))
             .await
             .unwrap();
 
@@ -89,7 +94,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = WriteFileTool::new(dir.path().to_path_buf());
 
-        tool.execute(invocation(json!({ "path": "a/b/c.txt", "content": "x" })))
+        tool.execute_default(invocation(json!({ "path": "a/b/c.txt", "content": "x" })))
             .await
             .unwrap();
 
@@ -105,7 +110,7 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "old").unwrap();
         let tool = WriteFileTool::new(dir.path().to_path_buf());
 
-        tool.execute(invocation(json!({ "path": "f.txt", "content": "new" })))
+        tool.execute_default(invocation(json!({ "path": "f.txt", "content": "new" })))
             .await
             .unwrap();
 
@@ -120,7 +125,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let tool = WriteFileTool::new(dir.path().to_path_buf());
         let err = tool
-            .execute(invocation(
+            .execute_default(invocation(
                 json!({ "path": "../escape.txt", "content": "x" }),
             ))
             .await

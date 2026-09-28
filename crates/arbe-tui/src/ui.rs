@@ -232,7 +232,7 @@ fn risk_label(risk: RiskLevel) -> &'static str {
 
 fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::PendingApproval) {
     let width = area.width.saturating_sub(10).clamp(30, 70);
-    let height = 11u16.min(area.height.saturating_sub(4));
+    let height = 13u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup = Rect {
@@ -260,6 +260,17 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
         Line::from(""),
         Line::from("[y] approve once   [n] deny once"),
         Line::from("[a] approve for session   [d] always deny for session"),
+        // "Approve for session" doesn't cover high-risk tools unless config
+        // opts in (arbe_tools::ApprovalContext::session_approval_covers_high_risk),
+        // so say so rather than let [a] look broken when it asks again.
+        if approval.risk == RiskLevel::High {
+            Line::from(Span::styled(
+                "(high risk: [a] still asks again next call unless config allows it)",
+                Style::default().fg(Color::DarkGray),
+            ))
+        } else {
+            Line::from("")
+        },
         Line::from(Span::styled(
             format!("auto-deny in {seconds_left}s if no response"),
             Style::default().fg(Color::DarkGray),
