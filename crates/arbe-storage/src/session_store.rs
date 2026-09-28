@@ -1,11 +1,20 @@
 use std::fs;
 use std::path::PathBuf;
 
-use arbe_core::{RuntimeEvent, SessionId, SessionMeta, SessionStatus, Turn};
+use arbe_core::{Message, RuntimeEvent, SessionId, SessionMeta, SessionStatus, Turn, TurnId};
+use serde::{Deserialize, Serialize};
 
 use crate::atomic::{append_line, write_atomic};
 use crate::error::StorageError;
 use crate::paths;
+
+/// One message of an in-progress turn, as written to `in_flight.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InFlightMessage {
+    pub turn_id: TurnId,
+    pub turn_index: u64,
+    pub message: Message,
+}
 
 /// Filesystem-backed session persistence rooted at `~/.arbe/sessions/`
 /// (harness spec FR-1, §5). `meta.json` is written atomically on every
@@ -44,6 +53,10 @@ impl SessionStore {
 
     fn events_path(&self, id: SessionId) -> PathBuf {
         self.session_dir(id).join("events.jsonl")
+    }
+
+    fn in_flight_path(&self, id: SessionId) -> PathBuf {
+        self.session_dir(id).join("in_flight.jsonl")
     }
 
     /// Creates a new session directory and persists its initial metadata.
@@ -114,6 +127,42 @@ impl SessionStore {
     pub fn list_turns(&self, id: SessionId) -> Result<Vec<Turn>, StorageError> {
         let path = self.turns_path(id);
         read_jsonl(&path)
+    }
+
+    /// Write-ahead log for the turn in progress: each message is appended
+    /// here as soon as it exists, so a crash mid-turn loses at most the
+    /// message being produced. When the turn completes, its `Turn` record
+    /// goes to `turns.jsonl` and this log is cleared
+    /// ([`clear_in_flight`](Self::clear_in_flight)) — so it only ever holds
+    /// one turn's messages, and leftovers on startup mean a turn was
+    /// interrupted.
+    pub fn append_in_flight(
+        &self,
+        id: SessionId,
+        entry: &InFlightMessage,
+    ) -> Result<(), StorageError> {
+        let path = self.in_flight_path(id);
+        let line = serde_json::to_string(entry).map_err(|source| StorageError::Serde {
+            path: path.display().to_string(),
+            source,
+        })?;
+        append_line(&path, &line)
+    }
+
+    pub fn read_in_flight(&self, id: SessionId) -> Result<Vec<InFlightMessage>, StorageError> {
+        read_jsonl(&self.in_flight_path(id))
+    }
+
+    pub fn clear_in_flight(&self, id: SessionId) -> Result<(), StorageError> {
+        let path = self.in_flight_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StorageError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
     }
 
     pub fn append_event(&self, id: SessionId, event: &RuntimeEvent) -> Result<(), StorageError> {
@@ -256,6 +305,38 @@ mod tests {
         );
         assert_eq!(turns[1].schema_version, arbe_core::TURN_SCHEMA_VERSION);
         assert_eq!(turns[1].user_message().unwrap().text(), "again");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_flight_log_appends_reads_back_and_clears() {
+        let (store, dir) = temp_store();
+        let meta = store.create_session("default", "ollama", "m").unwrap();
+        assert!(store.read_in_flight(meta.id).unwrap().is_empty());
+        // Clearing a log that doesn't exist is fine.
+        store.clear_in_flight(meta.id).unwrap();
+
+        let turn_id = TurnId::new();
+        for text in ["question", "answer"] {
+            store
+                .append_in_flight(
+                    meta.id,
+                    &InFlightMessage {
+                        turn_id,
+                        turn_index: 4,
+                        message: arbe_core::Message::new(Role::User, text),
+                    },
+                )
+                .unwrap();
+        }
+        let entries = store.read_in_flight(meta.id).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].message.text(), "answer");
+        assert_eq!(entries[0].turn_index, 4);
+
+        store.clear_in_flight(meta.id).unwrap();
+        assert!(store.read_in_flight(meta.id).unwrap().is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }

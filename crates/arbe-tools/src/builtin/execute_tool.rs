@@ -41,6 +41,11 @@ impl ExecuteTool {
 
 #[async_trait]
 impl ToolExecutor for ExecuteTool {
+    /// Not parallel-safe: it runs an arbitrary command.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

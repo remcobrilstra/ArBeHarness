@@ -52,13 +52,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(format!(" workdir: {} ", app.project_dir)),
         Line::from(format!(
-            " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  ~tokens: {} ",
+            " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  context: ~{}  |  used: {} ",
             app.profile,
             app.provider_name,
             app.model,
             app.session_id,
             phase,
-            app.last_estimated_tokens
+            app.last_estimated_tokens,
+            app.session_tokens
         )),
     ];
     let style = if app.working {
@@ -195,6 +196,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         "approval pending — see modal"
     } else if app.session_picker.is_some() {
         "session picker — see modal"
+    } else if app.working {
+        "Esc: cancel turn | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+C: quit"
     } else {
         "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
     };

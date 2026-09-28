@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::tool::{ApprovalDecision, RiskLevel, ToolResult};
-use crate::usage::Usage;
+use crate::usage::{StopReason, Usage};
 
 /// A published `RuntimeEvent` plus its position in the bus's stream.
 /// `seq` increases by exactly one per published event, so a consumer can
@@ -116,6 +116,8 @@ pub enum RuntimeEvent {
     TurnCompleted {
         session_id: SessionId,
         turn_id: TurnId,
+        /// Why the turn ended — a normal answer, or a loop guard.
+        stop_reason: StopReason,
     },
     RuntimeError {
         turn_id: Option<TurnId>,

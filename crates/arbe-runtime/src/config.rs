@@ -39,6 +39,13 @@ pub struct RuntimeConfig {
     /// (`ARBE_MAX_TOOL_ROUNDS`, default 50). Real multi-step work routinely
     /// needs dozens of tool calls; this is a runaway guard, not a budget.
     pub max_tool_rounds: u32,
+    /// Loop guard: stop the turn once its total token usage (all rounds)
+    /// passes this. `None` (default) = no ceiling. `ARBE_MAX_TURN_TOKENS`.
+    pub max_turn_tokens: Option<u64>,
+    /// Longest tool result (in chars) sent back to the model; longer
+    /// output keeps its head and tail with a marker in between.
+    /// `ARBE_MAX_TOOL_OUTPUT_CHARS`, default 50 000 (~12k tokens).
+    pub max_tool_output_chars: usize,
     /// Retry/backoff for transient provider failures. `ARBE_MAX_RETRIES`
     /// overrides the retry count (0 disables retrying).
     pub retry: RetryPolicy,
@@ -93,6 +100,9 @@ impl RuntimeConfig {
             hook_timeout_ms: 500,
             session_approval_covers_high_risk: false,
             max_tool_rounds: env_parse("ARBE_MAX_TOOL_ROUNDS").unwrap_or(DEFAULT_MAX_TOOL_ROUNDS),
+            max_turn_tokens: env_parse("ARBE_MAX_TURN_TOKENS"),
+            max_tool_output_chars: env_parse("ARBE_MAX_TOOL_OUTPUT_CHARS")
+                .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_CHARS),
             retry: RetryPolicy {
                 max_retries: env_parse("ARBE_MAX_RETRIES")
                     .unwrap_or(RetryPolicy::default().max_retries),
@@ -124,6 +134,7 @@ impl RuntimeConfig {
 }
 
 const DEFAULT_MAX_TOOL_ROUNDS: u32 = 50;
+const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
 
 /// Parses `"Name: value; Other: value"`. Entries without a `:` or with an
 /// empty name are ignored rather than failing startup.

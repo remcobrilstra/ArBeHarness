@@ -216,6 +216,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn side_effecting_builtins_are_not_parallel_safe() {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry, Path::new("."));
+        for (name, expected) in [
+            ("read_file", true),
+            ("list_dir", true),
+            ("glob", true),
+            ("grep", true),
+            ("write_file", false),
+            ("edit_file", false),
+            ("execute", false),
+            ("todo_write", false),
+        ] {
+            assert_eq!(
+                registry.get(name).unwrap().parallel_safe(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn registers_every_declared_tool_name() {
         let mut registry = ToolRegistry::new();
         register_all(&mut registry, Path::new("."));

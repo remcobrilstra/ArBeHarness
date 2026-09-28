@@ -39,6 +39,11 @@ impl EditFileTool {
 
 #[async_trait]
 impl ToolExecutor for EditFileTool {
+    /// Not parallel-safe: it rewrites a file.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

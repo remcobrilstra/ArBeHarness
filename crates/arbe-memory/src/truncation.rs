@@ -1,18 +1,25 @@
 use std::collections::HashSet;
 
+use arbe_core::{ContentBlock, Role};
+
 use crate::history::HistoryEntry;
 use crate::tokens::estimate_message_tokens;
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
-/// Decides, index by index, which history entries survive the budget:
-/// pinned turns are always kept, then the most recent unpinned entries are
-/// added (newest first) until the budget runs out. Returns per-index
-/// `keep` flags (in original chronological order) plus the total estimated
-/// token cost of everything that got dropped.
+/// Decides which history entries survive the budget, **a whole turn at a
+/// time**: a turn's tool calls and their results are never split (a lone
+/// half of a pair is rejected by providers).
 ///
-/// Shared by [`TruncationStrategy`] (drop silently) and
-/// [`crate::CompactWithSummaryStrategy`] (drop + insert a summary), since
-/// both need the identical selection rule to stay deterministic.
+/// Pinned turns are always kept in full. Then, newest turn first, each
+/// turn is kept in full if it fits; otherwise in *condensed* form — just
+/// its opening user message and, if it's a plain answer, its final
+/// assistant message — if that fits; otherwise selection stops, so what's
+/// kept is always a contiguous recent stretch of the conversation (plus
+/// pinned turns).
+///
+/// Returns per-index `keep` flags (chronological order) and the estimated
+/// token cost of everything dropped. Shared by [`TruncationStrategy`] and
+/// [`crate::CompactWithSummaryStrategy`] so both select identically.
 pub(crate) fn select_kept(
     history: &[HistoryEntry],
     budget_tokens: u64,
@@ -23,34 +30,95 @@ pub(crate) fn select_kept(
         .iter()
         .map(|e| estimate_message_tokens(&e.message))
         .collect();
+    let turns = group_turns(history);
 
     let mut keep = vec![false; history.len()];
     let mut budget = budget_tokens;
-    for (i, entry) in history.iter().enumerate() {
-        if pinned_set.contains(&entry.turn_index) {
-            keep[i] = true;
-            budget = budget.saturating_sub(costs[i]);
+    for turn in &turns {
+        if pinned_set.contains(&history[turn.start].turn_index) {
+            keep[turn.start..turn.end].fill(true);
+            budget = budget.saturating_sub(turn.cost(&costs));
         }
     }
 
-    for i in (0..history.len()).rev() {
-        if keep[i] {
+    for turn in turns.iter().rev() {
+        if pinned_set.contains(&history[turn.start].turn_index) {
             continue;
         }
-        if costs[i] <= budget {
-            keep[i] = true;
-            budget -= costs[i];
+        let full_cost = turn.cost(&costs);
+        if full_cost <= budget {
+            keep[turn.start..turn.end].fill(true);
+            budget -= full_cost;
+            continue;
         }
+        let condensed = condensed_entries(history, turn);
+        let condensed_cost: u64 = condensed.iter().map(|&i| costs[i]).sum();
+        if !condensed.is_empty() && condensed_cost <= budget {
+            for i in condensed {
+                keep[i] = true;
+            }
+        }
+        // Whether condensed or dropped, this turn didn't fit whole: stop
+        // here so older turns never appear without the ones after them.
+        break;
     }
 
     let dropped_tokens = costs
         .iter()
-        .enumerate()
-        .filter(|(i, _)| !keep[*i])
-        .map(|(_, c)| c)
+        .zip(&keep)
+        .filter(|(_, kept)| !**kept)
+        .map(|(c, _)| c)
         .sum();
 
     (keep, dropped_tokens)
+}
+
+/// A run of consecutive entries sharing one `turn_index`: `start..end`.
+struct TurnSpan {
+    start: usize,
+    end: usize,
+}
+
+impl TurnSpan {
+    fn cost(&self, costs: &[u64]) -> u64 {
+        costs[self.start..self.end].iter().sum()
+    }
+}
+
+fn group_turns(history: &[HistoryEntry]) -> Vec<TurnSpan> {
+    let mut turns: Vec<TurnSpan> = Vec::new();
+    for (i, entry) in history.iter().enumerate() {
+        match turns.last_mut() {
+            Some(t) if history[t.start].turn_index == entry.turn_index => t.end = i + 1,
+            _ => turns.push(TurnSpan {
+                start: i,
+                end: i + 1,
+            }),
+        }
+    }
+    turns
+}
+
+/// A turn reduced to what reads coherently on its own: the first user
+/// message, plus the final assistant message when it's a plain answer
+/// (no tool calls, which would need their results alongside).
+fn condensed_entries(history: &[HistoryEntry], turn: &TurnSpan) -> Vec<usize> {
+    let plain = |i: &usize| {
+        !history[*i].message.content.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            )
+        })
+    };
+    let first_user = (turn.start..turn.end)
+        .find(|&i| history[i].message.role == Role::User)
+        .filter(plain);
+    let final_answer = (turn.start..turn.end)
+        .rev()
+        .find(|&i| history[i].message.role == Role::Assistant)
+        .filter(plain);
+    first_user.into_iter().chain(final_answer).collect()
 }
 
 /// Drops the oldest unpinned messages once the budget is exceeded, keeping
@@ -158,6 +226,57 @@ mod tests {
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].text(), "bbbb");
         assert_eq!(out.messages[1].text(), "cccc");
+    }
+
+    fn tool_turn(turn_index: u64, answer: &str, tool_output: &str) -> Vec<HistoryEntry> {
+        let call = arbe_core::RequestedToolCall {
+            id: format!("c{turn_index}"),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+        };
+        [
+            Message::new(Role::User, "question"),
+            Message::assistant_tool_calls(vec![call]),
+            Message::tool_result(format!("c{turn_index}"), tool_output),
+            Message::new(Role::Assistant, answer),
+        ]
+        .into_iter()
+        .map(|message| HistoryEntry {
+            turn_index,
+            message,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_turn_that_fits_is_kept_whole_with_its_tool_pairs() {
+        let history = tool_turn(0, "done", "short");
+        let (keep, dropped) = select_kept(&history, 1_000, &[]);
+        assert_eq!(keep, vec![true; 4]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn a_turn_too_big_to_keep_whole_is_condensed_to_question_and_answer() {
+        let history = tool_turn(0, "done", &"x".repeat(4_000));
+        let (keep, _) = select_kept(&history, 100, &[]);
+        // user + final answer kept; the tool call and its huge result go
+        // together, never one without the other.
+        assert_eq!(keep, vec![true, false, false, true]);
+    }
+
+    #[test]
+    fn selection_stops_at_the_first_turn_that_does_not_fit_whole() {
+        let mut history = vec![entry(0, "tiny")];
+        history.extend(tool_turn(1, "done", &"x".repeat(4_000)));
+        history.extend(tool_turn(2, "ok", "short"));
+        let (keep, _) = select_kept(&history, 100, &[]);
+        // Turn 2 whole, turn 1 condensed — and turn 0 (which would fit)
+        // is not kept, so history stays contiguous.
+        assert_eq!(
+            keep,
+            vec![false, true, false, false, true, true, true, true, true]
+        );
     }
 
     #[test]

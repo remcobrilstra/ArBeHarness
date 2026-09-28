@@ -10,4 +10,4 @@ pub mod paths;
 pub mod session_store;
 
 pub use error::StorageError;
-pub use session_store::SessionStore;
+pub use session_store::{InFlightMessage, SessionStore};

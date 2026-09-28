@@ -44,6 +44,15 @@ pub enum StopReason {
     Refusal,
     /// The harness cancelled the request (user interrupt, shutdown).
     Cancelled,
+    /// The process stopped mid-turn (crash, kill); the turn was recovered
+    /// from its in-flight log on the next resume.
+    Interrupted,
+    /// Loop guard: the turn used `max_tool_rounds` model<->tool rounds.
+    ToolRoundLimit,
+    /// Loop guard: the turn's token usage passed its configured ceiling.
+    TurnTokenLimit,
+    /// Loop guard: the model kept requesting the exact same tool call.
+    RepeatedToolCall,
     /// A provider-specific reason the harness doesn't model.
     Other(String),
 }

@@ -7,7 +7,7 @@ pub mod config;
 pub mod event_bus;
 pub mod system_prompt;
 
-pub use agent::{Agent, ToolDecisions};
+pub use agent::Agent;
 pub use config::RuntimeConfig;
 pub use event_bus::EventBus;
 

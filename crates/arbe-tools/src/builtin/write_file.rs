@@ -30,6 +30,11 @@ impl WriteFileTool {
 
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
+    /// Not parallel-safe: it writes a file.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

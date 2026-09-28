@@ -15,11 +15,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use arbe_runtime::arbe_core::{
-    ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, ToolCallId, ToolResult,
+    ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, StopReason, ToolCallId,
+    ToolResult,
 };
 use arbe_runtime::arbe_storage::SessionStore;
 use arbe_runtime::arbe_tools::ToolExecutor;
-use arbe_runtime::{Agent, EventBus, RuntimeConfig, ToolDecisions};
+use arbe_runtime::{Agent, EventBus, RuntimeConfig};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,31 +29,26 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex as AsyncMutex;
 
 use app::{APPROVAL_TIMEOUT_TICKS, App, PendingApproval, ProposedToolCall, SessionPicker};
 
 /// Result of a spawned agent call, delivered back to the render loop so it
-/// never has to block on the async work itself. Tool-call *results*
-/// aren't carried here — they arrive as `RuntimeEvent::ToolExecuted`/
-/// `ToolCallDenied` (see `drain_runtime_events`), which covers both the
-/// manual `/tool` path and a model-initiated one uniformly. This variant
-/// exists only to surface a hard failure resolving the call itself (a
-/// dropped lock, an unknown id).
+/// never has to block on the async work itself. Tool results and turn
+/// progress arrive as `RuntimeEvent`s (see `drain_runtime_events`); these
+/// only carry a hard failure of the call itself (e.g. `Busy`).
 enum AgentOutcome {
     ChatDone(Result<String, String>),
-    ToolResolved(ToolCallId, String, Result<(), String>),
+    ToolInvoked(Result<(), String>),
 }
 
 /// Runs the TUI until the user quits. Blocking: call this from a dedicated
 /// OS thread (e.g. `tokio::task::spawn_blocking`) — it drives its own
-/// render/input loop and uses `handle` to run the agent's async methods
-/// from that thread via `Handle::block_on`/`Handle::spawn`.
+/// render/input loop and uses `handle` to spawn the agent's async methods.
 ///
-/// `config`/`events` are the same values the caller used to build `agent`
-/// with `Agent::create` — the TUI needs them to start new sessions or
-/// resume old ones (TUI-FR-3) without the caller having to reconstruct
-/// them.
+/// The agent is shared as a plain `Arc` (all of its methods take `&self`),
+/// so answering an approval or cancelling a turn works while a turn is
+/// running. `config`/`events` are the values `agent` was built with; they
+/// are needed to start new sessions or resume old ones (TUI-FR-3).
 pub fn run(
     agent: Agent,
     handle: Handle,
@@ -60,17 +56,14 @@ pub fn run(
     events: Arc<EventBus>,
 ) -> io::Result<()> {
     let mut events_rx = agent.subscribe_events();
-    let profile = agent.profile().to_string();
-    let provider_name = agent.provider_name().to_string();
-    let model = agent.model().to_string();
-    let project_dir = agent.project_dir().display().to_string();
-    let session_id = agent.session_id();
-    // Held separately from `agent`'s lock — see `ToolDecisions`'s doc
-    // comment in arbe-runtime for why supplying a decision must never
-    // need to acquire the same lock a paused `submit_message` call holds.
-    let tool_decisions = std::sync::Mutex::new(agent.tool_decisions());
-
-    let agent = Arc::new(AsyncMutex::new(agent));
+    let mut app = App::new(
+        agent.session_id(),
+        agent.profile().to_string(),
+        agent.provider_name().to_string(),
+        agent.model().to_string(),
+        agent.project_dir().display().to_string(),
+    );
+    let mut agent = Arc::new(agent);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -78,14 +71,12 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(session_id, profile, provider_name, model, project_dir);
     let (outcome_tx, outcome_rx) = channel::<AgentOutcome>();
 
     let result = event_loop(
         &mut terminal,
         &mut app,
-        &agent,
-        &tool_decisions,
+        &mut agent,
         &handle,
         &config,
         &events,
@@ -98,21 +89,16 @@ pub fn run(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    // Flush session state on exit (TUI-FR-3: "exit safely with state flush").
-    if let Ok(mut guard) = agent.try_lock() {
-        let _ = guard.close();
-    }
+    // Stop any in-flight turn (it persists what it has) and flush session
+    // state (TUI-FR-3: "exit safely with state flush").
+    agent.cancel_turn();
+    let _ = agent.close();
 
     result
 }
 
-/// Registers a local tool so the `/tool` demo command has something real
-/// to execute (see `app.rs`/README for how to add more).
-pub fn register_demo_tool(
-    agent: &mut Agent,
-    name: impl Into<String>,
-    executor: Arc<dyn ToolExecutor>,
-) {
+/// Registers a local tool so the `/tool` command has something to run.
+pub fn register_demo_tool(agent: &Agent, name: impl Into<String>, executor: Arc<dyn ToolExecutor>) {
     agent.register_tool(name, executor);
 }
 
@@ -120,8 +106,7 @@ pub fn register_demo_tool(
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
+    agent: &mut Arc<Agent>,
     handle: &Handle,
     config: &RuntimeConfig,
     events: &Arc<EventBus>,
@@ -132,7 +117,7 @@ fn event_loop(
     loop {
         drain_runtime_events(app, events_rx);
         drain_outcomes(app, outcome_rx);
-        tick_approval_timeout(app, agent, tool_decisions, handle, outcome_tx);
+        tick_approval_timeout(app, agent);
 
         terminal.draw(|f| ui::draw(f, app))?;
 
@@ -144,18 +129,28 @@ fn event_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(
-                key,
-                app,
-                agent,
-                tool_decisions,
-                handle,
-                config,
-                events,
-                outcome_tx,
-            );
+            handle_key(key, app, agent, handle, config, events, outcome_tx);
         }
     }
+}
+
+/// A short, human description of why a turn stopped other than by
+/// answering normally; `None` for an ordinary end.
+fn stop_notice(reason: &StopReason) -> Option<String> {
+    Some(
+        match reason {
+            StopReason::EndTurn | StopReason::StopSequence | StopReason::ToolUse => return None,
+            StopReason::MaxTokens => "the answer hit the output token limit",
+            StopReason::Refusal => "the model declined to answer",
+            StopReason::Cancelled => "turn cancelled",
+            StopReason::Interrupted => "turn was interrupted",
+            StopReason::ToolRoundLimit => "stopped: too many tool rounds in one turn",
+            StopReason::TurnTokenLimit => "stopped: the turn's token budget ran out",
+            StopReason::RepeatedToolCall => "stopped: the model kept repeating the same tool call",
+            StopReason::Other(other) => return Some(format!("stopped: {other}")),
+        }
+        .to_string(),
+    )
 }
 
 fn drain_runtime_events(
@@ -183,13 +178,34 @@ fn drain_runtime_events(
                     "{reason} — retrying in {secs}s (attempt {attempt})…"
                 ));
             }
+            Ok(RuntimeEvent::ThinkingDelta { .. }) => {
+                app.activity = Some("thinking…".to_string());
+            }
             Ok(RuntimeEvent::ModelStreamChunk { delta, .. }) => {
                 app.activity = None;
                 app.append_assistant_delta(&delta);
             }
-            Ok(RuntimeEvent::TurnCompleted { .. }) => {
+            Ok(RuntimeEvent::ToolUseStarted { tool_name, .. }) => {
+                app.activity = Some(format!("preparing {tool_name} call…"));
+            }
+            Ok(RuntimeEvent::ToolProgress { update, .. }) => {
+                app.activity = Some(update);
+            }
+            Ok(RuntimeEvent::UsageUpdated { session, .. }) => {
+                app.session_tokens = session.total_tokens();
+            }
+            Ok(RuntimeEvent::TurnCompleted { stop_reason, .. }) => {
                 app.working = false;
                 app.activity = None;
+                if let Some(notice) = stop_notice(&stop_reason) {
+                    app.notice = Some(notice);
+                }
+            }
+            Ok(RuntimeEvent::TurnCancelled { .. }) => {
+                app.working = false;
+                app.activity = None;
+                app.pending_approval = None;
+                app.notice = Some("turn cancelled".to_string());
             }
             Ok(RuntimeEvent::RuntimeError { reason, .. }) => {
                 app.working = false;
@@ -267,7 +283,7 @@ fn drain_runtime_events(
 /// Caps how much of a tool's output gets echoed into the transcript — a
 /// broad `grep`/`glob`/`read_file` call can return a lot of text, and the
 /// point here is visibility into what the agent did, not a full result
-/// dump (that's still available by inspecting the tool call itself).
+/// dump.
 const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
 
 fn format_tool_result(tool_name: &str, result: &ToolResult) -> String {
@@ -291,55 +307,27 @@ fn drain_outcomes(app: &mut App, outcome_rx: &Receiver<AgentOutcome>) {
             AgentOutcome::ChatDone(Err(err)) => {
                 app.working = false;
                 app.activity = None;
-                app.status_message = Some(err);
+                // Cancellation is reported by the TurnCancelled event.
+                if err != "cancelled" {
+                    app.status_message = Some(err);
+                }
             }
-            AgentOutcome::ChatDone(Ok(_)) => {}
-            AgentOutcome::ToolResolved(id, tool_name, Err(err)) => {
-                app.status_message = Some(format!("tool call {id} ({tool_name}) failed: {err}"))
+            AgentOutcome::ChatDone(Ok(_)) | AgentOutcome::ToolInvoked(Ok(())) => {}
+            AgentOutcome::ToolInvoked(Err(err)) => {
+                app.status_message = Some(format!("tool call failed: {err}"));
             }
-            AgentOutcome::ToolResolved(_, _, Ok(())) => {}
         }
     }
 }
 
-/// Resolves a pending approval with `decision`, dispatching to whichever
-/// of the two pending-approval mechanisms actually has `id`:
-/// - A model-initiated call paused inside `Agent::run_tool_loop` — supplied
-///   via `ToolDecisions`, which needs no `Agent` lock at all (see its doc
-///   comment for why that matters: `run_tool_loop` is holding that lock
-///   for the whole turn, including this wait).
-/// - The manual `/tool` demo path (`Agent::propose_tool_call`) — falls
-///   back to `resolve_tool_call`, which *does* need the lock, briefly,
-///   since it calls `execute_gated` itself rather than unblocking an
-///   already-in-flight call.
-fn resolve_approval(
-    id: ToolCallId,
-    tool_name: String,
-    decision: ApprovalDecision,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
-    handle: &Handle,
-    outcome_tx: &Sender<AgentOutcome>,
-) {
-    let supplied = tool_decisions
-        .lock()
-        .expect("tool decisions mutex poisoned")
-        .supply(id, decision);
-    if supplied {
-        return;
+/// Delivers a decision to the paused tool call. Model-initiated and
+/// `/tool` calls wait on the same mailbox, so there's one path for both.
+fn resolve_approval(app: &mut App, agent: &Agent, id: ToolCallId, decision: ApprovalDecision) {
+    if !agent.supply_tool_decision(id, decision) {
+        app.status_message = Some(format!(
+            "tool call {id} is no longer waiting for a decision"
+        ));
     }
-
-    let agent = agent.clone();
-    let tx = outcome_tx.clone();
-    handle.spawn(async move {
-        let mut a = agent.lock().await;
-        let result = a
-            .resolve_tool_call(id, decision)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        let _ = tx.send(AgentOutcome::ToolResolved(id, tool_name, result));
-    });
 }
 
 /// Decrements the pending approval's countdown once per render-loop tick
@@ -347,13 +335,7 @@ fn resolve_approval(
 /// on expiry, per TUI spec §9 ("if approval prompt times out: default
 /// action from policy, recommended deny... show user what action was
 /// applied").
-fn tick_approval_timeout(
-    app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
-    handle: &Handle,
-    outcome_tx: &Sender<AgentOutcome>,
-) {
+fn tick_approval_timeout(app: &mut App, agent: &Agent) {
     let Some(approval) = app.pending_approval.as_mut() else {
         return;
     };
@@ -367,23 +349,14 @@ fn tick_approval_timeout(
     app.status_message = Some(format!(
         "tool call {id} ({tool_name}) timed out — auto-denied"
     ));
-    resolve_approval(
-        id,
-        tool_name,
-        ApprovalDecision::DeniedOnce,
-        agent,
-        tool_decisions,
-        handle,
-        outcome_tx,
-    );
+    agent.supply_tool_decision(id, ApprovalDecision::DeniedOnce);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: crossterm::event::KeyEvent,
     app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
+    agent: &mut Arc<Agent>,
     handle: &Handle,
     config: &RuntimeConfig,
     events: &Arc<EventBus>,
@@ -395,19 +368,17 @@ fn handle_key(
             KeyCode::Char('n') => Some(ApprovalDecision::DeniedOnce),
             KeyCode::Char('a') => Some(ApprovalDecision::ApprovedForSession),
             KeyCode::Char('d') => Some(ApprovalDecision::AlwaysDeniedForSession),
+            KeyCode::Esc => {
+                // Esc on the prompt cancels the whole turn, not just the call.
+                app.pending_approval = None;
+                agent.cancel_turn();
+                return;
+            }
             _ => None,
         };
         if let Some(decision) = decision {
             app.pending_approval = None;
-            resolve_approval(
-                approval.id,
-                approval.tool_name.clone(),
-                decision,
-                agent,
-                tool_decisions,
-                handle,
-                outcome_tx,
-            );
+            resolve_approval(app, agent, approval.id, decision);
         }
         return;
     }
@@ -431,15 +402,7 @@ fn handle_key(
                     .as_ref()
                     .and_then(|p| p.selected_session());
                 if let Some(session_id) = selected {
-                    resume_session(
-                        app,
-                        agent,
-                        tool_decisions,
-                        handle,
-                        config,
-                        events,
-                        session_id,
-                    );
+                    resume_session(app, agent, config, events, session_id);
                 } else {
                     app.session_picker = None;
                 }
@@ -451,14 +414,17 @@ fn handle_key(
 
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => app.should_quit = true,
+        (_, KeyCode::Esc) if app.working => {
+            if agent.cancel_turn() {
+                app.activity = Some("cancelling…".to_string());
+            }
+        }
         (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
             app.clear_transcript();
             app.scroll = 0;
             app.follow_tail = true;
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-            new_session(app, agent, tool_decisions, handle, config, events)
-        }
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, config, events),
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app),
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.scroll_up((app.last_viewport_height / 2).max(1))
@@ -485,50 +451,39 @@ fn handle_key(
     }
 }
 
-/// Replaces the running agent in place (new session / resume) and resets
-/// the transcript view to match. `handle` for locking only — the caller
-/// has already built `new_agent` against the same shared `EventBus`, so
-/// the existing `events_rx` subscription in `event_loop` keeps working
-/// without resubscribing. Also re-points `tool_decisions` at the new
-/// agent's own mailbox — each `Agent` has its own `ToolDecisions`, so the
-/// old handle would silently `supply()` into a mailbox nothing reads from
-/// anymore.
-fn swap_in_agent(
-    app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
-    handle: &Handle,
-    new_agent: Agent,
-) {
+/// Replaces the running agent (new session / resume) and resets the view.
+/// The old agent's turn, if any, is cancelled (it persists what it has) and
+/// its session closed. The new agent shares the same `EventBus`, so the
+/// existing event subscription keeps working.
+fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
+    agent.cancel_turn();
+    let _ = agent.close();
     app.session_id = new_agent.session_id();
     app.profile = new_agent.profile().to_string();
     app.provider_name = new_agent.provider_name().to_string();
     app.model = new_agent.model().to_string();
+    app.session_tokens = new_agent.usage().total_tokens();
     app.clear_transcript();
     app.pending_approval = None;
     app.proposed_tool_calls.clear();
     app.status_message = None;
     app.notice = None;
+    app.working = false;
+    app.activity = None;
     app.scroll = 0;
     app.follow_tail = true;
-    *tool_decisions
-        .lock()
-        .expect("tool decisions mutex poisoned") = new_agent.tool_decisions();
-    let mut guard = handle.block_on(agent.lock());
-    *guard = new_agent;
+    *agent = Arc::new(new_agent);
 }
 
 fn new_session(
     app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
-    handle: &Handle,
+    agent: &mut Arc<Agent>,
     config: &RuntimeConfig,
     events: &Arc<EventBus>,
 ) {
     match Agent::create(config, SessionStore::new(), events.clone()) {
         Ok(new_agent) => {
-            swap_in_agent(app, agent, tool_decisions, handle, new_agent);
+            swap_in_agent(app, agent, new_agent);
             app.notice = Some("started a new session".to_string());
         }
         Err(err) => app.status_message = Some(format!("failed to start new session: {err}")),
@@ -544,9 +499,7 @@ fn open_session_picker(app: &mut App) {
 
 fn resume_session(
     app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
-    tool_decisions: &std::sync::Mutex<ToolDecisions>,
-    handle: &Handle,
+    agent: &mut Arc<Agent>,
     config: &RuntimeConfig,
     events: &Arc<EventBus>,
     session_id: SessionId,
@@ -555,10 +508,14 @@ fn resume_session(
     match Agent::resume(config, store.clone(), session_id, events.clone()) {
         Ok(new_agent) => {
             let turns = store.list_turns(session_id).unwrap_or_default();
-            swap_in_agent(app, agent, tool_decisions, handle, new_agent);
+            swap_in_agent(app, agent, new_agent);
             for turn in turns {
                 if let Some(m) = turn.user_message() {
                     app.push_line(Role::User, m.text());
+                }
+                let tool_calls: usize = turn.messages.iter().map(|m| m.tool_uses().len()).sum();
+                if tool_calls > 0 {
+                    app.push_line(Role::Tool, format!("({tool_calls} tool call(s))"));
                 }
                 if let Some(m) = turn.final_assistant_message() {
                     app.push_line(Role::Assistant, m.text());
@@ -573,7 +530,7 @@ fn resume_session(
 
 fn submit_input(
     app: &mut App,
-    agent: &Arc<AsyncMutex<Agent>>,
+    agent: &Arc<Agent>,
     handle: &Handle,
     outcome_tx: &Sender<AgentOutcome>,
 ) {
@@ -592,21 +549,18 @@ fn submit_input(
         let name = name.to_string();
         let arguments: serde_json::Value =
             serde_json::from_str(args_text).unwrap_or(serde_json::json!({}));
-
         let agent = agent.clone();
-        // propose_tool_call itself is synchronous, but the agent lives
-        // behind an async mutex shared with the render loop's other spawned
-        // tasks (chat turns hold this lock for their entire streaming
-        // duration) — block_on here would freeze the whole render loop
-        // (no redraws, no input) until any in-flight turn finishes, so this
-        // goes through handle.spawn like every other agent call instead.
+        let tx = outcome_tx.clone();
+        // Same gated path as a model-initiated call: its approval prompt
+        // and result arrive as runtime events.
         handle.spawn(async move {
-            let mut a = agent.lock().await;
-            a.propose_tool_call(name, arguments, arbe_runtime::arbe_core::RiskLevel::Medium);
+            let result = agent
+                .invoke_tool(name, arguments)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AgentOutcome::ToolInvoked(result));
         });
-        // The resulting ToolCallProposed/ToolApprovalRequested events
-        // arrive on the next drain_runtime_events and populate
-        // app.pending_approval from there (see event_loop).
         return;
     }
 
@@ -616,8 +570,10 @@ fn submit_input(
     let agent = agent.clone();
     let tx = outcome_tx.clone();
     handle.spawn(async move {
-        let mut a = agent.lock().await;
-        let result = a.submit_message(content).await.map_err(|e| e.to_string());
+        let result = agent
+            .submit_message(content)
+            .await
+            .map_err(|e| e.to_string());
         let _ = tx.send(AgentOutcome::ChatDone(result));
     });
 }
@@ -638,6 +594,49 @@ mod tests {
     }
 
     #[test]
+    fn stop_notices_explain_guarded_stops_but_not_normal_ends() {
+        assert_eq!(stop_notice(&StopReason::EndTurn), None);
+        assert!(
+            stop_notice(&StopReason::ToolRoundLimit)
+                .unwrap()
+                .contains("tool rounds")
+        );
+        assert_eq!(
+            stop_notice(&StopReason::Other("x".into())).as_deref(),
+            Some("stopped: x")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_turn_clears_working_state_and_any_open_prompt() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut app = test_app();
+        app.working = true;
+        app.pending_approval = Some(PendingApproval {
+            id: ToolCallId::new(),
+            tool_name: "execute".into(),
+            arguments_pretty: "{}".into(),
+            risk: arbe_runtime::arbe_core::RiskLevel::High,
+            source_turn: TurnId::new(),
+            ticks_remaining: 10,
+        });
+        tx.send(EventEnvelope {
+            seq: 0,
+            event: RuntimeEvent::TurnCancelled {
+                session_id: app.session_id,
+                turn_id: TurnId::new(),
+            },
+        })
+        .unwrap();
+
+        drain_runtime_events(&mut app, &mut rx);
+
+        assert!(!app.working);
+        assert!(app.pending_approval.is_none());
+        assert_eq!(app.notice.as_deref(), Some("turn cancelled"));
+    }
+
+    #[test]
     fn drain_runtime_events_applies_a_normal_event() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
         let mut app = test_app();
@@ -649,6 +648,7 @@ mod tests {
             event: RuntimeEvent::TurnCompleted {
                 session_id,
                 turn_id,
+                stop_reason: StopReason::EndTurn,
             },
         })
         .unwrap();
@@ -673,6 +673,7 @@ mod tests {
                 event: RuntimeEvent::TurnCompleted {
                     session_id,
                     turn_id: TurnId::new(),
+                    stop_reason: StopReason::EndTurn,
                 },
             });
         }

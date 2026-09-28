@@ -164,6 +164,9 @@ pub enum HarnessError {
     /// The turn was cancelled (user interrupt or shutdown).
     #[error("cancelled")]
     Cancelled,
+    /// Another turn is already running in this session.
+    #[error("a turn is already in progress")]
+    Busy,
 }
 
 impl UserFacing for ToolError {
@@ -201,6 +204,7 @@ impl UserFacing for HarnessError {
             Self::Tool(e) => e.likely_fix(),
             Self::Config(e) => e.likely_fix(),
             Self::Internal(_) => Some("this is a harness bug; please report it".to_string()),
+            Self::Busy => Some("wait for the current turn to finish, or cancel it".to_string()),
             Self::Memory(_) | Self::Hook(_) | Self::Cancelled => None,
         }
     }

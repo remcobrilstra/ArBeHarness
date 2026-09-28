@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use arbe_core::{ApprovalDecision, ToolError, ToolInvocation, ToolResult};
 
-use crate::{ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolContext, ToolRegistry};
+use crate::{
+    ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolContext, ToolExecutor, ToolRegistry,
+};
 
 /// What happened to a gated invocation. Deliberately distinct from
 /// `Result<ToolResult, ToolError>` alone: `PendingApproval` is not a
@@ -15,15 +19,81 @@ pub enum GatedOutcome {
     PendingApproval,
 }
 
-/// The single choke point every tool invocation must pass through — no
-/// tool ever calls `ToolExecutor::execute` directly (overall design's
-/// non-negotiable approval-gate rule). `human_decision` is `None` on the
-/// first pass through a turn; once the runtime collects a decision from a
-/// `PendingApproval` outcome, it re-calls this with `Some(decision)`.
+/// Proof that an invocation passed the approval gate. Only [`authorize`]
+/// can create one (its fields are private), and executing a tool through
+/// the gate requires one — so approval and execution can happen at
+/// different times (e.g. approve several calls one by one, then run them
+/// concurrently) without opening a path that skips approval.
+pub struct Authorized {
+    invocation: ToolInvocation,
+    executor: Arc<dyn ToolExecutor>,
+}
+
+impl Authorized {
+    pub fn invocation(&self) -> &ToolInvocation {
+        &self.invocation
+    }
+
+    /// Whether this tool may run concurrently with others (see
+    /// `ToolExecutor::parallel_safe`).
+    pub fn parallel_safe(&self) -> bool {
+        self.executor.parallel_safe()
+    }
+
+    pub async fn execute(self, tool_ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+        self.executor.execute(self.invocation, tool_ctx).await
+    }
+}
+
+/// The gate's verdict on one invocation.
+pub enum Authorization {
+    Approved(Authorized),
+    Denied(ToolInvocation),
+    /// The policy wants a human decision: call [`authorize`] again with
+    /// `Some(decision)` once there is one.
+    NeedsHuman(ToolInvocation),
+}
+
+/// The approval half of the gate — the single choke point every tool
+/// invocation must pass through (overall design's non-negotiable
+/// approval-gate rule). `human_decision` is `None` on the first pass; after
+/// `NeedsHuman`, the runtime collects a decision and calls again with it.
 ///
 /// A session-scoped human decision (`ApprovedForSession` /
 /// `AlwaysDeniedForSession`) is recorded into `ctx.session` here, so later
 /// invocations of the same tool are decided by the policy without asking.
+pub fn authorize(
+    registry: &ToolRegistry,
+    policy: &dyn ApprovalPolicy,
+    ctx: &ApprovalContext,
+    invocation: ToolInvocation,
+    human_decision: Option<ApprovalDecision>,
+) -> Result<Authorization, ToolError> {
+    let executor = registry.get(&invocation.tool_name)?.clone();
+
+    let approved = match (policy.decide(&invocation, ctx), human_decision) {
+        (PolicyOutcome::AutoApprove, _) => true,
+        (PolicyOutcome::AutoDeny, _) => false,
+        (PolicyOutcome::RequiresPrompt, None) => {
+            return Ok(Authorization::NeedsHuman(invocation));
+        }
+        (PolicyOutcome::RequiresPrompt, Some(decision)) => {
+            ctx.session.record(&invocation.tool_name, decision);
+            decision.is_approved()
+        }
+    };
+
+    Ok(if approved {
+        Authorization::Approved(Authorized {
+            invocation,
+            executor,
+        })
+    } else {
+        Authorization::Denied(invocation)
+    })
+}
+
+/// [`authorize`] and, if approved, execute — in one call.
 pub async fn execute_gated(
     registry: &ToolRegistry,
     policy: &dyn ApprovalPolicy,
@@ -32,26 +102,14 @@ pub async fn execute_gated(
     human_decision: Option<ApprovalDecision>,
     tool_ctx: &ToolContext,
 ) -> Result<GatedOutcome, ToolError> {
-    let executor = registry.get(&invocation.tool_name)?.clone();
-
-    let approved = match (policy.decide(&invocation, ctx), human_decision) {
-        (PolicyOutcome::AutoApprove, _) => true,
-        (PolicyOutcome::AutoDeny, _) => false,
-        (PolicyOutcome::RequiresPrompt, None) => return Ok(GatedOutcome::PendingApproval),
-        (PolicyOutcome::RequiresPrompt, Some(decision)) => {
-            ctx.session.record(&invocation.tool_name, decision);
-            decision.is_approved()
-        }
-    };
-
-    if !approved {
-        return Ok(GatedOutcome::Denied);
+    match authorize(registry, policy, ctx, invocation, human_decision)? {
+        Authorization::Approved(authorized) => authorized
+            .execute(tool_ctx)
+            .await
+            .map(GatedOutcome::Executed),
+        Authorization::Denied(_) => Ok(GatedOutcome::Denied),
+        Authorization::NeedsHuman(_) => Ok(GatedOutcome::PendingApproval),
     }
-
-    executor
-        .execute(invocation, tool_ctx)
-        .await
-        .map(GatedOutcome::Executed)
 }
 
 #[cfg(test)]
@@ -96,6 +154,44 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register("echo", Arc::new(EchoExecutor));
         r
+    }
+
+    #[tokio::test]
+    async fn authorize_asks_for_a_human_then_hands_back_an_executable_approval() {
+        let policy = crate::StandardApprovalPolicy;
+        let c = ctx(ApprovalPolicyMode::AlwaysPrompt);
+        let Authorization::NeedsHuman(invocation) =
+            authorize(&registry(), &policy, &c, invocation(), None).unwrap()
+        else {
+            panic!("expected NeedsHuman");
+        };
+        let Authorization::Approved(approved) = authorize(
+            &registry(),
+            &policy,
+            &c,
+            invocation,
+            Some(ApprovalDecision::ApprovedOnce),
+        )
+        .unwrap() else {
+            panic!("expected Approved");
+        };
+        assert!(approved.parallel_safe());
+        let result = approved.execute(&ToolContext::default()).await.unwrap();
+        assert_eq!(result.output, json!({"a": 1}));
+    }
+
+    #[test]
+    fn authorize_denies_and_returns_the_invocation() {
+        let policy = crate::StandardApprovalPolicy;
+        let outcome = authorize(
+            &registry(),
+            &policy,
+            &ctx(ApprovalPolicyMode::DryRunOnly),
+            invocation(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Authorization::Denied(inv) if inv.tool_name == "echo"));
     }
 
     fn ctx(mode: ApprovalPolicyMode) -> ApprovalContext {

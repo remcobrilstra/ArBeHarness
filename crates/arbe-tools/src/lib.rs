@@ -7,7 +7,7 @@ pub mod policy;
 pub mod registry;
 pub mod session_approvals;
 
-pub use gate::{GatedOutcome, execute_gated};
+pub use gate::{Authorization, Authorized, GatedOutcome, authorize, execute_gated};
 pub use policy::{PolicyOutcome, StandardApprovalPolicy};
 pub use registry::ToolRegistry;
 pub use session_approvals::SessionApprovals;
@@ -98,6 +98,14 @@ pub trait ToolExecutor: Send + Sync {
         invocation: ToolInvocation,
         ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Whether this tool may run concurrently with other calls from the
+    /// same model response. Tools with side effects that could conflict
+    /// (writing files, running commands, replacing shared state) return
+    /// `false` and run on their own, in order.
+    fn parallel_safe(&self) -> bool {
+        true
+    }
 }
 
 /// Test-only shorthand: run a tool with a default (never-cancelled)

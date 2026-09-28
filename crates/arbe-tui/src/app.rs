@@ -129,6 +129,8 @@ pub struct App {
     pub session_picker: Option<SessionPicker>,
     pub should_quit: bool,
     pub last_estimated_tokens: u64,
+    /// Provider-reported tokens used by the whole session so far.
+    pub session_tokens: u64,
     /// Top-line offset into the (unwrapped) transcript content.
     pub scroll: u16,
     /// When true, the transcript view stays pinned to the newest content
@@ -171,6 +173,7 @@ impl App {
             session_picker: None,
             should_quit: false,
             last_estimated_tokens: 0,
+            session_tokens: 0,
             scroll: 0,
             follow_tail: true,
             last_viewport_height: 0,

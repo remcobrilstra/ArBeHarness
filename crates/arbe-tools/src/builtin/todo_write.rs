@@ -67,6 +67,11 @@ impl Default for TodoWriteTool {
 
 #[async_trait]
 impl ToolExecutor for TodoWriteTool {
+    /// Not parallel-safe: it replaces the shared todo list.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,
