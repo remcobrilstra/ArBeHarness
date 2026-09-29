@@ -56,6 +56,10 @@ impl LoadSkillTool {
 
 #[async_trait]
 impl ToolExecutor for LoadSkillTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

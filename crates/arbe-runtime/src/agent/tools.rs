@@ -232,6 +232,20 @@ async fn approve_call(
     call: &RequestedToolCall,
     cancel: &CancellationToken,
 ) -> Option<Slot> {
+    // The session's mode comes first: a tool it doesn't allow is refused
+    // before hooks run or anyone is asked. (Unknown tools fall through to
+    // the gate, which reports them.)
+    if let Ok(executor) = registry.get(&call.name)
+        && !agent.mode_allows(&call.name, executor.as_ref())
+    {
+        return Some(denied(
+            agent,
+            turn_id,
+            ToolCallId::new(),
+            &call.name,
+            agent.mode.refusal(&call.name),
+        ));
+    }
     let hook_result = hooks::run(
         agent,
         HookPhase::BeforeToolExecute,
@@ -322,12 +336,14 @@ async fn approve_call(
     Some(match authorization {
         Ok(Authorization::Approved(authorized)) => Slot::Approved { authorized, id },
         Ok(Authorization::Denied(_)) => {
-            let reason = if decided_by_human {
-                "denied by the user"
+            let reason = if decided_by_human && agent.mode.is_exit_tool(&call.name) {
+                agent.mode.exit_declined()
+            } else if decided_by_human {
+                "denied by the user".to_string()
             } else {
-                "denied by approval policy"
+                "denied by approval policy".to_string()
             };
-            denied(agent, turn_id, id, &call.name, reason.to_string())
+            denied(agent, turn_id, id, &call.name, reason)
         }
         // `NeedsHuman` after a human decision can't happen; treat it as
         // denied rather than looping.

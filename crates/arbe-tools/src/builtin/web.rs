@@ -59,6 +59,10 @@ impl WebFetchTool {
 
 #[async_trait]
 impl ToolExecutor for WebFetchTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Rule subject: the URL, so rules can allow sites.
     fn subject(&self, arguments: &Value) -> Option<String> {
         arguments
@@ -341,6 +345,10 @@ async fn json_body(response: reqwest::Response) -> Result<Value, ToolError> {
 
 #[async_trait]
 impl ToolExecutor for WebSearchTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Rule subject: the query.
     fn subject(&self, arguments: &Value) -> Option<String> {
         arguments

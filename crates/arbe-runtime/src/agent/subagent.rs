@@ -48,6 +48,8 @@ pub(super) struct Lineage {
     pub slots: Arc<Semaphore>,
     /// The session that started this one.
     pub parent: Option<SessionId>,
+    /// The tree's mode: a subagent works under its parent's.
+    pub mode: Arc<super::modes::ModeState>,
 }
 
 impl Lineage {
@@ -60,6 +62,7 @@ impl Lineage {
             session_approvals: SessionApprovals::new(),
             slots: Arc::new(Semaphore::new(config.subagent_max_concurrent)),
             parent: None,
+            mode: Arc::new(super::modes::ModeState::new(config.mode.as_deref())),
         }
     }
 
@@ -139,6 +142,10 @@ impl TaskTool {
 
 #[async_trait]
 impl ToolExecutor for TaskTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

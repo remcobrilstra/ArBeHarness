@@ -82,6 +82,10 @@ impl AskUserTool {
 
 #[async_trait]
 impl ToolExecutor for AskUserTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

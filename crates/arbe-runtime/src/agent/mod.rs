@@ -17,6 +17,7 @@ mod ask;
 mod compaction;
 mod hooks;
 mod memory;
+pub mod modes;
 mod nested;
 mod skills;
 mod subagent;
@@ -65,6 +66,8 @@ struct Settings {
     temperature: f32,
     max_tokens: u64,
     budget_tokens: u64,
+    /// 0 for a top-level agent, 1+ for subagents.
+    depth: u32,
     /// The model's context window (for reporting; budgeting uses
     /// `budget_tokens`).
     context_window: u64,
@@ -127,6 +130,8 @@ pub struct Agent {
     decisions: Arc<ToolDecisions>,
     /// Answers to `ask_user` questions; shared like `decisions`.
     questions: Arc<ask::QuestionMailbox>,
+    /// The session's mode; shared with subagents like `decisions`.
+    mode: Arc<modes::ModeState>,
     /// Held for the duration of a turn (or a manual tool call); `try_lock`
     /// failing is what makes a concurrent submission `Busy`.
     turn_lock: tokio::sync::Mutex<()>,
@@ -161,6 +166,7 @@ struct Parts {
     redactor: Redactor,
     decisions: Arc<ToolDecisions>,
     questions: Arc<ask::QuestionMailbox>,
+    mode: Arc<modes::ModeState>,
 }
 
 /// Records in `meta.json` where the session works, which profile, provider
@@ -181,6 +187,11 @@ fn mark_open(meta: &mut SessionMeta, config: &RuntimeConfig, store: &SessionStor
     if let Err(err) = store.save_meta(meta) {
         tracing::warn!(%err, "failed to update session metadata");
     }
+}
+
+/// `meta.json`'s `mode`: absent for the default mode.
+fn saved_mode(mode: &str) -> Option<String> {
+    (mode != modes::DEFAULT_MODE).then(|| mode.to_string())
 }
 
 /// Adds a model call's usage to the session's totals, and its cost when
@@ -374,6 +385,7 @@ impl Agent {
             redactor: parts.redactor,
             decisions: parts.decisions,
             questions: parts.questions,
+            mode: parts.mode,
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
             state: Mutex::new(SessionState {
@@ -455,6 +467,18 @@ impl Agent {
         if let Some(allowed) = &config.tools {
             registry.retain(|name| tool_allowed(allowed, name));
         }
+        // After the allow-set: leaving a mode is part of the mode, not a
+        // tool a profile opts into. Only the top-level agent can.
+        if lineage.depth == 0 {
+            for spec in modes::builtin_modes() {
+                if let Some(tool) =
+                    modes::ExitModeTool::new(lineage.mode.clone(), &spec, events.clone(), meta.id)
+                {
+                    let name = spec.exit.map(|e| e.tool).unwrap_or_default();
+                    registry.register(name, Arc::new(tool));
+                }
+            }
+        }
         let capabilities = provider.capabilities(&config.model);
         let budget_tokens = config.effective_context_budget(capabilities.max_context_tokens);
 
@@ -494,6 +518,7 @@ impl Agent {
                 temperature: config.temperature,
                 max_tokens: config.max_tokens,
                 budget_tokens,
+                depth: lineage.depth,
                 context_window: capabilities.max_context_tokens,
                 max_tool_rounds: config.max_tool_rounds,
                 max_turn_tokens: config.max_turn_tokens,
@@ -541,6 +566,7 @@ impl Agent {
             redactor: redactor_for(config),
             decisions: lineage.decisions,
             questions: lineage.questions,
+            mode: lineage.mode,
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }
@@ -622,6 +648,8 @@ impl Agent {
                 config.model.clone(),
             )
             .map_err(|e| ProviderError::Internal(format!("failed to create session: {e}")))?;
+        let lineage = subagent::Lineage::root(config);
+        meta.mode = saved_mode(&lineage.mode.name());
         mark_open(&mut meta, config, &store);
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
@@ -635,7 +663,7 @@ impl Agent {
             Vec::new(),
             0,
             None,
-            subagent::Lineage::root(config),
+            lineage,
         )
     }
 
@@ -722,6 +750,12 @@ impl Agent {
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
         });
+        // A resumed session keeps its own mode, whatever new sessions
+        // start in.
+        let lineage = subagent::Lineage::root(config);
+        let _ = lineage
+            .mode
+            .set(meta.mode.as_deref().unwrap_or(modes::DEFAULT_MODE));
         Self::assemble(
             config,
             providers,
@@ -731,7 +765,7 @@ impl Agent {
             history,
             next_turn_index,
             summary,
-            subagent::Lineage::root(config),
+            lineage,
         )
     }
 
@@ -777,6 +811,67 @@ impl Agent {
     /// status display (TUI-FR-4); `0` before the first turn.
     pub fn last_estimated_tokens(&self) -> u64 {
         self.state().last_estimated_tokens
+    }
+
+    /// The session's current mode (`default`, `plan`, ...).
+    pub fn mode(&self) -> String {
+        self.mode.name()
+    }
+
+    /// Every mode this session can switch to.
+    pub fn modes(&self) -> Vec<modes::ModeInfo> {
+        self.mode.infos()
+    }
+
+    /// Switches the session's mode (and its subagents'). Works during a
+    /// turn: which tools may run changes at once; the prompt follows from
+    /// the next turn. Publishes `ModeChanged` if the mode changed.
+    pub fn set_mode(&self, name: &str) -> Result<(), HarnessError> {
+        let changed = self.mode.set(name).map_err(HarnessError::Internal)?;
+        self.sync_mode();
+        if changed {
+            self.events.publish(RuntimeEvent::ModeChanged {
+                session_id: self.session_id(),
+                mode: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Records the current mode in `meta.json` if it changed (also after
+    /// the model's exit tool switched it).
+    fn sync_mode(&self) {
+        let mode = saved_mode(&self.mode.name());
+        let mut state = self.state();
+        if state.meta.mode != mode {
+            state.meta.mode = mode;
+            if let Err(err) = self.store.save_meta(&state.meta) {
+                tracing::warn!(%err, "failed to save the session's mode");
+            }
+        }
+    }
+
+    /// The tools the model is offered right now: those the current mode
+    /// allows, and none if the model can't call tools.
+    fn offered_tool_specs(&self) -> Vec<arbe_core::ToolSpec> {
+        if !self.provider.capabilities(&self.settings.model).tool_calls {
+            return Vec::new();
+        }
+        let registry = self.registry_snapshot();
+        registry
+            .specs()
+            .into_iter()
+            .filter(|spec| {
+                registry
+                    .get(&spec.name)
+                    .is_ok_and(|executor| self.mode_allows(&spec.name, executor.as_ref()))
+            })
+            .collect()
+    }
+
+    /// Whether the model may use `name` in the current mode.
+    fn mode_allows(&self, name: &str, executor: &dyn ToolExecutor) -> bool {
+        self.mode.allows(name, executor, self.settings.depth == 0)
     }
 
     /// What the most recent model request's context was made of, by

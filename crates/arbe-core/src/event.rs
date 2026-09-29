@@ -33,6 +33,13 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         estimated_tokens: u64,
     },
+    /// The session switched modes (e.g. into or out of `plan`), by the
+    /// user's choice or because they approved the model's request to
+    /// leave the mode.
+    ModeChanged {
+        session_id: SessionId,
+        mode: String,
+    },
     /// What the next model request's context is made of, sent before
     /// every model call of a turn (the context grows with each tool
     /// round). Token figures are calibrated estimates.

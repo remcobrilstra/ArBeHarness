@@ -125,6 +125,10 @@ fn build_harness(cli: &Cli) -> Result<Harness, String> {
     if let Some(profile) = &cli.profile {
         builder = builder.profile(profile);
     }
+    // Validated with the rest of the configuration.
+    if let Some(mode) = &cli.session_mode {
+        builder = builder.setting("ARBE_MODE", mode);
+    }
     if let Some(provider) = &cli.provider {
         builder = builder.provider(provider);
     }
@@ -157,6 +161,12 @@ async fn interactive(harness: Harness, cli: &Cli, prompt: Option<String>) -> i32
         && let Err(err) = agent.set_title(name.clone())
     {
         eprintln!("failed to name the session: {err}");
+    }
+    // A resumed session keeps its own mode unless --mode says otherwise.
+    if let (Some(mode), Some(_)) = (&cli.session_mode, cli.resume)
+        && let Err(err) = agent.set_mode(mode)
+    {
+        eprintln!("failed to set the mode: {err}");
     }
 
     let handle = tokio::runtime::Handle::current();

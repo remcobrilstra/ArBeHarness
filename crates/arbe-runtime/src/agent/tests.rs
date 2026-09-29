@@ -247,6 +247,7 @@ fn test_parts(
             temperature: 0.2,
             max_tokens: 100,
             budget_tokens: 8_000,
+            depth: 0,
             context_window: 16_000,
             max_tool_rounds: 50,
             max_turn_tokens: None,
@@ -278,6 +279,7 @@ fn test_parts(
         redactor: crate::redact::Redactor::default(),
         decisions: Default::default(),
         questions: Default::default(),
+        mode: Arc::new(super::modes::ModeState::new(None)),
     }
 }
 
@@ -1146,7 +1148,18 @@ async fn the_general_profile_agent_only_has_its_allowed_tools() {
         Arc::new(EventBus::default()),
     )
     .unwrap();
-    assert_eq!(agent.registry_snapshot().names(), vec!["todo_write"]);
+    // Plus plan mode's exit tool, which belongs to the mode, not the
+    // profile — and is only offered in plan mode.
+    assert_eq!(
+        agent.registry_snapshot().names(),
+        vec!["exit_plan_mode", "todo_write"]
+    );
+    let offered: Vec<String> = agent
+        .offered_tool_specs()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(offered, ["todo_write"]);
     let message = agent
         .invoke_tool("execute", json!({"command": "echo hi"}))
         .await
@@ -2144,4 +2157,212 @@ async fn cost_is_tracked_when_the_models_prices_are_known() {
         plain.store.load_meta(plain.session_id).unwrap().cost_usd,
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Modes
+// ---------------------------------------------------------------------------
+
+/// A read-only tool, for plan mode.
+struct ReaderTool;
+
+#[async_trait]
+impl ToolExecutor for ReaderTool {
+    async fn execute(
+        &self,
+        invocation: ToolInvocation,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult {
+            id: invocation.id,
+            output: json!("file contents"),
+            is_error: false,
+            attachments: Vec::new(),
+        })
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+}
+
+/// Plan mode with its exit tool, a read-only `reader` and a writing
+/// `echo`, both auto-approved (so only the mode can stop them).
+fn in_plan_mode(parts: &mut Parts) {
+    allow(&["reader", "echo"])(parts);
+    parts.mode = Arc::new(modes::ModeState::new(Some(modes::PLAN_MODE)));
+    let plan = parts.mode.current();
+    let exit = modes::ExitModeTool::new(
+        parts.mode.clone(),
+        &plan,
+        parts.events.clone(),
+        parts.meta.id,
+    )
+    .unwrap();
+    parts
+        .registry
+        .register(modes::EXIT_PLAN_MODE_TOOL, Arc::new(exit));
+    parts.registry.register("reader", Arc::new(ReaderTool));
+    parts.registry.register("echo", Arc::new(EchoExecutor));
+}
+
+fn tool_names(request: &ModelRequest) -> Vec<String> {
+    let mut names: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn plan_mode_offers_only_read_only_tools_and_refuses_the_rest() {
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "echo", json!({"x": 1})), ("c2", "reader", json!({}))]),
+            answer("here is what I found"),
+        ],
+        answer("unused"),
+    );
+    let requests = provider.requests.clone();
+    let (t, _rx) = test_agent_with(provider, in_plan_mode);
+
+    t.agent.submit_message("look around".into()).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(tool_names(&requests[0]), ["exit_plan_mode", "reader"]);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|m| m.role == Role::System && m.text().starts_with("# Plan mode")),
+        "the mode's instructions are in the prompt"
+    );
+    let results = requests[1].messages.last().unwrap();
+    let (_, refused, is_error) = tool_result_of(results, 0);
+    assert!(is_error);
+    assert!(
+        refused.contains("isn't available in plan mode"),
+        "{refused}"
+    );
+    assert_eq!(tool_result_of(results, 1).1, "file contents");
+    assert_eq!(t.agent.mode(), "plan");
+}
+
+#[tokio::test]
+async fn an_approved_plan_ends_plan_mode_within_the_turn() {
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "exit_plan_mode", json!({"plan": "1. change x"}))]),
+            tool_calls(&[("c2", "echo", json!({"x": 1}))]),
+            answer("done"),
+        ],
+        answer("unused"),
+    );
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, in_plan_mode);
+    let agent = t.agent.clone();
+    let turn = tokio::spawn(async move { agent.submit_message("plan it".into()).await });
+
+    // Even with auto-approval configured, the plan is always put to the user.
+    let id = wait_for(&mut rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    })
+    .await;
+    assert!(
+        t.agent
+            .supply_tool_decision(id, ApprovalDecision::ApprovedOnce)
+    );
+    assert_eq!(turn.await.unwrap().unwrap(), "done");
+
+    assert_eq!(t.agent.mode(), "default");
+    let requests = requests.lock().unwrap();
+    // The next round of the same turn has every tool (and no exit tool).
+    assert_eq!(tool_names(&requests[1]), ["echo", "reader"]);
+    let (_, approved, _) = tool_result_of(requests[1].messages.last().unwrap(), 0);
+    assert!(approved.contains("approved the plan"), "{approved}");
+    let (_, echoed, is_error) = tool_result_of(requests[2].messages.last().unwrap(), 0);
+    assert!(!is_error, "{echoed}");
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::ModeChanged { mode, .. } if mode == "default"))
+    );
+    assert_eq!(t.store.load_meta(t.session_id).unwrap().mode, None);
+}
+
+#[tokio::test]
+async fn a_declined_plan_keeps_plan_mode() {
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "exit_plan_mode", json!({"plan": "1. rewrite it all"}))]),
+            answer("what should change?"),
+        ],
+        answer("unused"),
+    );
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, in_plan_mode);
+    let agent = t.agent.clone();
+    let turn = tokio::spawn(async move { agent.submit_message("plan it".into()).await });
+    let id = wait_for(&mut rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    })
+    .await;
+    t.agent
+        .supply_tool_decision(id, ApprovalDecision::DeniedOnce);
+    turn.await.unwrap().unwrap();
+
+    assert_eq!(t.agent.mode(), "plan");
+    let requests = requests.lock().unwrap();
+    let (_, declined, is_error) = tool_result_of(requests[1].messages.last().unwrap(), 0);
+    assert!(is_error);
+    assert!(declined.contains("still in plan mode"), "{declined}");
+    assert_eq!(tool_names(&requests[1]), ["exit_plan_mode", "reader"]);
+}
+
+#[test]
+fn the_mode_is_set_saved_and_kept_on_resume() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::defaults(project.path().to_path_buf());
+    config.home = home.path().to_path_buf();
+    config.mode = Some("plan".into());
+    let store = SessionStore::with_root(home.path().join("sessions"));
+    let events = Arc::new(EventBus::new(64));
+    let mut rx = events.subscribe();
+
+    // New sessions start in the configured mode, and can leave it.
+    let agent = Agent::create(&config, store.clone(), events.clone()).unwrap();
+    assert_eq!(agent.mode(), "plan");
+    assert_eq!(
+        store.load_meta(agent.session_id()).unwrap().mode.as_deref(),
+        Some("plan")
+    );
+    assert!(
+        agent
+            .registry_snapshot()
+            .get(modes::EXIT_PLAN_MODE_TOOL)
+            .is_ok()
+    );
+    assert!(agent.set_mode("yolo").is_err());
+    agent.set_mode("default").unwrap();
+    agent.set_mode("default").unwrap();
+    assert_eq!(store.load_meta(agent.session_id()).unwrap().mode, None);
+    let changes = drain(&mut rx)
+        .into_iter()
+        .filter(|e| matches!(e, RuntimeEvent::ModeChanged { .. }))
+        .count();
+    assert_eq!(changes, 1, "only an actual change is announced");
+
+    // Resuming keeps the session's own mode, not the configured one.
+    let id = agent.session_id();
+    agent.close().ok();
+    drop(agent);
+    let resumed = Agent::resume(&config, store.clone(), id, events.clone()).unwrap();
+    assert_eq!(resumed.mode(), "default");
+    resumed.set_mode("plan").unwrap();
+    resumed.close().ok();
+    drop(resumed);
+    config.mode = None;
+    let again = Agent::resume(&config, store, id, events).unwrap();
+    assert_eq!(again.mode(), "plan");
+    assert_eq!(again.modes().len(), 2);
 }

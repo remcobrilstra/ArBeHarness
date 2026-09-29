@@ -20,16 +20,17 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P3 | Agent loop v2 | Done | 10 / 10 | All exit criteria met; the TUI was accepted by the maintainer after using it against grok-4.7 (2026-09-29) |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 7 / 7 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
-| P6 | Multi-purpose & embedding | In progress | 7 / 8 | All exit criteria met. P6.1–P6.5, P6.7, P6.8 done (OpenTelemetry export deferred); P6.6 plan mode postponed by the maintainer. Desktop control designed (`docs/desktop-control-design.md`), awaiting review |
+| P6 | Multi-purpose & embedding | Done | 8 / 8 | All tasks and exit criteria done (OpenTelemetry export deferred). Desktop control designed (`docs/desktop-control-design.md`), awaiting review |
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
-**Current focus:** everything open is listed under **Pending work** in `docs/v2-status.md`: OpenAI/Anthropic live runs (keys), `v0.2.0` tag + binaries, plan mode (postponed), desktop control (awaiting review)
+**Current focus:** everything open is listed under **Pending work** in `docs/v2-status.md`: OpenAI/Anthropic live runs (keys), `v0.2.0` tag + binaries, desktop control (awaiting review)
 **Last updated:** 2026-09-30 · test count: 495 on Windows, 497 on Linux (+24 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-30 — P6.6 plan mode, on a general session-mode mechanism.** `default` and `plan` modes; the model leaves plan mode through `exit_plan_mode`, which the user approves. P6 complete.
 - **2026-09-30 — P5.7 context accounting.** Per-request context breakdown by source (event, `/context`, header %, `session/context`); tool definitions now counted against the budget; calibration learns from every round and adopts its first observation. Groundwork for further context-management work.
 - **2026-09-30 — P3 closed, pending work consolidated.** The maintainer accepted the TUI (P3's last exit criterion). All open items now live in one list: `docs/v2-status.md` → Pending work. `v2` merged into `main`.
 
@@ -318,7 +319,34 @@ Make the harness configurable from files and connect the parts v1 built but neve
   - *Done (2026-09-30):* `arbe-tools/src/builtin/processes.rs` — a per-registry (= per-session) `ProcessTable` shared by `execute` (`background: true` → handle `bg-N`), `process_output` (new output since the last read, capped 256 KB kept / 32 KB per read, optional `wait_secs`, list without a handle; `requires_approval() = false`) and `process_kill` (kills the tree, Low risk). Dropping the table kills every process tree still running (blocking `taskkill /T` / `kill -KILL -pgid`), so they die with the session; max 16 per session. Tested on Windows and Linux; live: grok-4.7 started `python -m http.server`, confirmed it served, and stopped it.
 - [x] **P6.5 `ask_user` tool.** A structured clarifying question (with options) that pauses the turn like an approval does and resumes with the answer.
   - *Done (2026-09-29):* `agent/ask.rs` — `ask_user {question, options?, allow_free_text?}` publishes `RuntimeEvent::UserQuestionAsked` and waits on a `QuestionMailbox` (shared through the subagent `Lineage`, like approval decisions); `Agent::answer_question` / `Session::answer` / JSON-RPC `question/answer`. New `ToolExecutor::requires_approval()` (default true): `false` skips the human prompt but still goes through the gate (deny rules, dry-run apply). `meta.json` activity `awaiting_answer`. TUI question dialog (options or typed answer); `--print` answers "no user available, state your assumption". Verified live: grok-4.7 asked Python-vs-Go and followed the answer.
-- [ ] **P6.6 Plan mode.** A read-only mode (write/execute tools auto-denied) with `exit_plan_mode` requiring user approval of the plan — implemented as a profile/policy overlay, not a new `LoopPhase`.
+- [x] **P6.6 Plan mode.** A read-only mode (write/execute tools auto-denied) with `exit_plan_mode` requiring user approval of the plan — implemented as a profile/policy overlay, not a new `LoopPhase`.
+  - *Done (2026-09-30), as the first of general **session modes**:*
+    - **Modes as data.** `agent/modes.rs` holds `ModeSpec { name, description, instructions, tools: All | ReadOnly { also }, exit: { tool, to } }` and `builtin_modes()` = `default`, `plan`. A new mode is a list entry.
+    - **Read-only marker.** `ToolExecutor::read_only()` (default `false`) is set on read_file, list_dir, glob, grep, todo_write, process_output, web_fetch, web_search, ask_user, load_skill and task. MCP tools use their server's `readOnlyHint`.
+    - **Shared state.** `ModeState` lives in the subagent `Lineage`, so subagents share their parent's mode. The exit tool is top-level only.
+    - **Enforcement.** Tools are offered per round by mode (`Agent::offered_tool_specs`), so a mid-turn switch takes effect on the next round. `tools::approve_call` refuses a disallowed call before hooks or approval run.
+    - **Instructions.** The mode's instructions go into the system prompt as a second system message.
+    - **`exit_plan_mode`** is high risk, so it always asks. Its call carries the plan and the approval is the review; running it switches the mode and publishes `ModeChanged`. When the user declines, the model gets a tailored reason.
+    - **Persistence.** `meta.json` has `mode` (absent = default), synced on set and at turn commit, and resume restores it.
+    - **Entry points:**
+      - Config `mode` (top level or profile), `ARBE_MODE`, `--mode` (also switches a resumed session).
+      - `Agent`/`Session` `mode()`, `modes()`, `set_mode()`; headless `session/set_mode`.
+      - TUI: header `MODE: PLAN`, `Shift+Tab` cycles, `/mode [name]`, `/plan`.
+    - **Plan display.** The plan is rendered as Markdown in the transcript, with a bottom-anchored approval dialog (y/n only, 10-minute timeout, scrollable).
+  - *Tests:* `modes.rs` unit tests. Agent tests:
+    - `plan_mode_offers_only_read_only_tools_and_refuses_the_rest`
+    - `an_approved_plan_ends_plan_mode_within_the_turn`
+    - `a_declined_plan_keeps_plan_mode`
+    - `the_mode_is_set_saved_and_kept_on_resume`
+
+    Plus headless `a_session_switches_modes`, a TUI plan-display test and CLI parsing.
+  - *Live (grok-4.7, `--print --mode plan`):*
+    - **Approved:** read, planned, approved, then mode → default mid-turn. The model edited `calc.py` and verified it.
+    - **Declined:** nothing changed and the mode stayed plan. Found: with no user, the model resubmitted six times, which led to an instruction to stop when `ask_user` reports no user.
+  - *Not done:*
+    - Custom modes from config (`[modes.<name>]`); the structure is ready.
+    - Updating the system prompt mid-turn after a switch (the exit tool's result tells the model instead).
+    - Feedback text with a declined plan (the TUI's `n` sends no comment; the model asks via `ask_user`).
 - [x] **P6.7 Web tools (optional, `general` profile).** `web_fetch` (HTML → text, size-capped) and a pluggable `web_search` backend configured in config; medium risk.
   - *Done (2026-09-30):* `arbe-tools/src/builtin/web.rs` — `web_fetch` (http/https only, 3 MB read cap, `html2text` for HTML + `<title>`, text/JSON as-is, binaries refused, 4xx/5xx are `is_error` results; rule subject = URL) and `web_search` over Brave / Tavily / SearXNG, normalized to `{title, url, snippet}` (rule subject = query). `[web.search]` config (`backend`, `api_key_env`, `base_url`), validated at load; stripped from untrusted project config; key redacted. Both in the `general` profile. Tests: wiremock for fetch and all three search backends; live: grok-4.7 fetched example.com. `web_search` not run against a real service (no key).
 - [x] **P6.8 Observability.** *(OpenTelemetry deferred)* `tracing` spans per turn/round/tool with a file sink under `~/.arbe/logs/`, optional OpenTelemetry export behind a feature flag, and per-session usage/cost summaries.

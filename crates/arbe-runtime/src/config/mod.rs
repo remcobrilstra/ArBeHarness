@@ -102,6 +102,9 @@ pub struct RuntimeConfig {
     pub mcp_servers: Vec<arbe_mcp::McpServerConfig>,
     /// Which system prompt template to render each turn.
     pub prompt: PromptTemplate,
+    /// The mode new sessions start in (`plan`, ...); `None` = `default`.
+    /// Resumed sessions keep their own.
+    pub mode: Option<String>,
     /// The directory the agent works *in* (distinct from `ARBE_HOME`, the
     /// harness's own storage root).
     pub project_dir: PathBuf,
@@ -181,6 +184,7 @@ impl RuntimeConfig {
             web_search: None,
             pricing: None,
             prompt: PromptTemplate::Coding,
+            mode: None,
             project_dir,
             home: arbe_storage::paths::arbe_home(),
             project_trusted: false,
@@ -499,6 +503,9 @@ impl RuntimeConfig {
         if let Some(prompt) = &layer.prompt {
             self.prompt = PromptTemplate::parse(prompt, config_dir);
         }
+        if let Some(mode) = &layer.mode {
+            self.mode = Some(validate_mode(mode).map_err(|e| invalid(path, &e))?);
+        }
         Ok(())
     }
 
@@ -609,6 +616,12 @@ impl RuntimeConfig {
             &mut self.thinking_budget_tokens,
             env_num(env, "ARBE_THINKING_BUDGET")?,
         );
+        if let Some(mode) = env("ARBE_MODE") {
+            self.mode = Some(
+                validate_mode(&mode)
+                    .map_err(|e| ConfigError::InvalidSchema(format!("ARBE_MODE: {e}")))?,
+            );
+        }
         Ok(())
     }
 
@@ -664,6 +677,19 @@ impl RuntimeConfig {
                 remaining
             }
         })
+    }
+}
+
+/// A mode name every session knows (see `agent::modes`).
+fn validate_mode(mode: &str) -> Result<String, String> {
+    if crate::agent::modes::is_known_mode(mode) {
+        Ok(mode.to_string())
+    } else {
+        let known: Vec<String> = crate::agent::modes::builtin_modes()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        Err(format!("mode {mode:?} is not one of: {}", known.join(", ")))
     }
 }
 

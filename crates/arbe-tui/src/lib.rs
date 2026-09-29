@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
+use arbe_runtime::agent::modes::{DEFAULT_MODE, EXIT_PLAN_MODE_TOOL, PLAN_MODE};
 use arbe_runtime::arbe_core::{
     ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, StopReason, ToolCallId,
     ToolResult,
@@ -31,8 +32,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::runtime::Handle;
 
 use app::{
-    APPROVAL_TIMEOUT_TICKS, App, PendingApproval, PendingQuestion, ProfilePicker, ProposedToolCall,
-    SessionPicker,
+    APPROVAL_TIMEOUT_TICKS, App, PLAN_APPROVAL_TIMEOUT_TICKS, PendingApproval, PendingQuestion,
+    ProfilePicker, ProposedToolCall, SessionPicker,
 };
 
 /// Result of a spawned agent call, delivered back to the render loop so it
@@ -69,6 +70,7 @@ pub fn run(
         agent.model().to_string(),
         agent.project_dir().display().to_string(),
     );
+    app.mode = agent.mode();
     show_startup_warnings(&mut app, &agent);
     show_history(&mut app, &harness, agent.session_id());
     let mut agent = Arc::new(agent);
@@ -190,6 +192,10 @@ fn drain_runtime_events(
                     "calling model (~{estimated_tokens} tokens context)…"
                 ));
             }
+            Ok(RuntimeEvent::ModeChanged { mode, .. }) => {
+                app.notice = Some(mode_notice(&mode));
+                app.mode = mode;
+            }
             Ok(RuntimeEvent::ContextUpdated { usage, .. }) => {
                 app.last_estimated_tokens = usage.total_tokens;
                 app.context = Some(usage);
@@ -293,10 +299,16 @@ fn drain_runtime_events(
                 let arguments_pretty = serde_json::to_string(&arguments).unwrap_or_default();
                 app.streaming_tool_args.clear();
                 app.activity = Some(format!("running tool: {tool_name}…"));
-                app.push_line(
-                    Role::Tool,
-                    format!("→ {tool_name} {arguments_pretty} (risk: {risk:?})"),
-                );
+                match plan_text(&tool_name, &arguments) {
+                    // A plan is for reading: shown as Markdown, not JSON.
+                    Some(plan) => {
+                        app.push_line(Role::Assistant, format!("**Proposed plan**\n\n{plan}"))
+                    }
+                    None => app.push_line(
+                        Role::Tool,
+                        format!("→ {tool_name} {arguments_pretty} (risk: {risk:?})"),
+                    ),
+                }
                 app.proposed_tool_calls.insert(
                     tool_call_id,
                     ProposedToolCall {
@@ -373,15 +385,58 @@ fn show_question(app: &mut App, event: &RuntimeEvent, from: &str) {
 /// subagent's: answering goes through the top-level agent either way).
 fn request_approval(app: &mut App, tool_call_id: ToolCallId) {
     if let Some(meta) = app.proposed_tool_calls.remove(&tool_call_id) {
+        let is_plan = meta.tool_name == EXIT_PLAN_MODE_TOOL;
         app.pending_approval = Some(PendingApproval {
             id: tool_call_id,
             tool_name: meta.tool_name,
             arguments_pretty: meta.arguments_pretty,
             risk: meta.risk,
             source_turn: meta.source_turn,
-            ticks_remaining: APPROVAL_TIMEOUT_TICKS,
+            ticks_remaining: if is_plan {
+                PLAN_APPROVAL_TIMEOUT_TICKS
+            } else {
+                APPROVAL_TIMEOUT_TICKS
+            },
+            is_plan,
         });
+        if is_plan {
+            // Show the plan's start: it was just added above the modal.
+            app.follow_tail = true;
+        }
     }
+}
+
+/// The plan in an `exit_plan_mode` call, for showing it as text.
+fn plan_text(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    (tool_name == EXIT_PLAN_MODE_TOOL)
+        .then(|| arguments.get("plan")?.as_str().map(str::to_string))
+        .flatten()
+}
+
+/// Switches the session's mode and says what it means.
+fn switch_mode(app: &mut App, agent: &Agent, name: &str) {
+    if let Err(err) = agent.set_mode(name) {
+        app.status_message = Some(err.to_string());
+    }
+}
+
+/// Shift+Tab: the next mode in the list, wrapping around.
+fn cycle_mode(app: &mut App, agent: &Agent) {
+    let modes = agent.modes();
+    let current = modes.iter().position(|m| m.name == app.mode).unwrap_or(0);
+    if let Some(next) = modes.get((current + 1) % modes.len().max(1)) {
+        switch_mode(app, agent, &next.name.clone());
+    }
+}
+
+/// What the header's notice says on entering a mode.
+fn mode_notice(mode: &str) -> String {
+    let description = arbe_runtime::agent::modes::builtin_modes()
+        .into_iter()
+        .find(|m| m.name == mode)
+        .map(|m| m.description)
+        .unwrap_or_default();
+    format!("{mode} mode: {description} (Shift+Tab to switch)")
 }
 
 /// Shows what a subagent (started by the `task` tool) is doing: its tool
@@ -557,8 +612,28 @@ fn handle_key(
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::ApprovedOnce),
             KeyCode::Char('n') => Some(ApprovalDecision::DeniedOnce),
-            KeyCode::Char('a') => Some(ApprovalDecision::ApprovedForSession),
-            KeyCode::Char('d') => Some(ApprovalDecision::AlwaysDeniedForSession),
+            // A plan is approved or not, each time.
+            KeyCode::Char('a') if !approval.is_plan => Some(ApprovalDecision::ApprovedForSession),
+            KeyCode::Char('d') if !approval.is_plan => {
+                Some(ApprovalDecision::AlwaysDeniedForSession)
+            }
+            // The plan is in the transcript: let it be scrolled.
+            KeyCode::Up if approval.is_plan => {
+                app.scroll_up(1);
+                None
+            }
+            KeyCode::Down if approval.is_plan => {
+                app.scroll_down(1);
+                None
+            }
+            KeyCode::PageUp if approval.is_plan => {
+                app.scroll_up(app.last_viewport_height.max(1));
+                None
+            }
+            KeyCode::PageDown if approval.is_plan => {
+                app.scroll_down(app.last_viewport_height.max(1));
+                None
+            }
             KeyCode::Esc => {
                 // Esc on the prompt cancels the whole turn, not just the call.
                 app.pending_approval = None;
@@ -683,6 +758,7 @@ fn handle_key(
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, harness, events),
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app, harness),
         (KeyModifiers::CONTROL, KeyCode::Char('p')) => open_profile_picker(app, agent, harness),
+        (_, KeyCode::BackTab) => cycle_mode(app, agent),
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.scroll_up((app.last_viewport_height / 2).max(1))
         }
@@ -730,6 +806,7 @@ fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
     app.session_tokens = new_agent.usage().total_tokens();
     app.session_cost_usd = new_agent.cost_usd();
     app.context = new_agent.context_usage();
+    app.mode = new_agent.mode();
     app.last_estimated_tokens = new_agent.last_estimated_tokens();
     app.clear_transcript();
     app.pending_approval = None;
@@ -895,6 +972,39 @@ fn submit_input(
     app.status_message = None;
     app.notice = None;
 
+    if let Some(rest) = content.trim().strip_prefix("/mode") {
+        match rest.trim() {
+            "" => {
+                let list: Vec<String> = agent
+                    .modes()
+                    .into_iter()
+                    .map(|m| {
+                        let marker = if m.name == app.mode { "*" } else { " " };
+                        format!("{marker} {:<8} {}", m.name, m.description)
+                    })
+                    .collect();
+                app.push_line(
+                    Role::System,
+                    format!(
+                        "Modes (Shift+Tab cycles, /mode <name> switches):\n{}",
+                        list.join("\n")
+                    ),
+                );
+            }
+            name => switch_mode(app, agent, name),
+        }
+        return;
+    }
+    if content.trim() == "/plan" {
+        let target = if app.mode == PLAN_MODE {
+            DEFAULT_MODE
+        } else {
+            PLAN_MODE
+        };
+        switch_mode(app, agent, target);
+        return;
+    }
+
     if content.trim() == "/context" {
         match agent.context_usage() {
             Some(usage) => app.push_line(Role::System, context_view::report(&usage)),
@@ -973,6 +1083,41 @@ mod tests {
     }
 
     #[test]
+    fn a_proposed_plan_is_shown_as_text_and_approved_on_its_own_terms() {
+        let mut app = test_app();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let id = ToolCallId::new();
+        for event in [
+            RuntimeEvent::ToolCallProposed {
+                turn_id: TurnId::new(),
+                tool_call_id: id,
+                tool_name: EXIT_PLAN_MODE_TOOL.into(),
+                arguments: serde_json::json!({"plan": "1. do the thing"}),
+                risk: arbe_runtime::arbe_core::RiskLevel::High,
+            },
+            RuntimeEvent::ToolApprovalRequested {
+                turn_id: TurnId::new(),
+                tool_call_id: id,
+            },
+            RuntimeEvent::ModeChanged {
+                session_id: SessionId::new(),
+                mode: "default".into(),
+            },
+        ] {
+            tx.send(EventEnvelope { seq: 0, event }).unwrap();
+        }
+        drain_runtime_events(&mut app, &mut rx);
+        let last = app.transcript.last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(last.content.ends_with("1. do the thing"));
+        let approval = app.pending_approval.as_ref().unwrap();
+        assert!(approval.is_plan);
+        assert_eq!(approval.ticks_remaining, PLAN_APPROVAL_TIMEOUT_TICKS);
+        assert_eq!(app.mode, "default");
+        assert!(app.notice.as_deref().unwrap().starts_with("default mode"));
+    }
+
+    #[test]
     fn stop_notices_explain_guarded_stops_but_not_normal_ends() {
         assert_eq!(stop_notice(&StopReason::EndTurn), None);
         assert!(
@@ -998,6 +1143,7 @@ mod tests {
             risk: arbe_runtime::arbe_core::RiskLevel::High,
             source_turn: TurnId::new(),
             ticks_remaining: 10,
+            is_plan: false,
         });
         tx.send(EventEnvelope {
             seq: 0,

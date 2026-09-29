@@ -54,6 +54,10 @@ impl GrepTool {
 
 #[async_trait]
 impl ToolExecutor for GrepTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Rule subject: the path (see `ToolExecutor::subject`).
     fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
         crate::path_subject(arguments, Some("."))

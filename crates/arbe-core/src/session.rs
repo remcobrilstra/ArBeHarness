@@ -72,6 +72,9 @@ pub struct SessionMeta {
     /// For a subagent's session: the session whose `task` call started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<SessionId>,
+    /// The session's mode (e.g. `plan`), when it isn't the default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl SessionMeta {
@@ -97,6 +100,7 @@ impl SessionMeta {
             pid: None,
             parent: None,
             cost_usd: None,
+            mode: None,
         }
     }
 

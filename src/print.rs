@@ -39,6 +39,13 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
     {
         eprintln!("warning: failed to name the session: {err}");
     }
+    // A resumed session keeps its own mode unless --mode says otherwise.
+    if let (Some(mode), Some(_)) = (&cli.session_mode, cli.resume)
+        && let Err(err) = session.set_mode(mode)
+    {
+        eprintln!("error: {err}");
+        return EXIT_FAILED;
+    }
     let json = cli.output == OutputFormat::Json;
 
     let mut turn = session.send(prompt);

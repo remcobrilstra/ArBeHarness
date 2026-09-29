@@ -397,6 +397,21 @@ impl Session {
         self.agent.answer_question(id, answer)
     }
 
+    /// The session's mode (`default`, `plan`, ...).
+    pub fn mode(&self) -> String {
+        self.agent.mode()
+    }
+
+    /// Every mode the session can switch to.
+    pub fn modes(&self) -> Vec<crate::agent::modes::ModeInfo> {
+        self.agent.modes()
+    }
+
+    /// Switches the session's mode; see `Agent::set_mode`.
+    pub fn set_mode(&self, mode: &str) -> Result<(), HarnessError> {
+        self.agent.set_mode(mode)
+    }
+
     /// What the latest model request's context was made of, against the
     /// budget (`None` before the first model call). See
     /// `RuntimeEvent::ContextUpdated`.

@@ -32,7 +32,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, chunks[1], app);
     draw_input(frame, chunks[2], app);
 
-    if let Some(approval) = &app.pending_approval {
+    if let Some(approval) = app.pending_approval.as_ref().filter(|a| a.is_plan) {
+        draw_plan_approval(frame, area, approval);
+    } else if let Some(approval) = &app.pending_approval {
         draw_approval_modal(frame, area, approval);
     } else if let Some(question) = &app.pending_question {
         draw_question_modal(frame, area, question);
@@ -57,8 +59,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .session_cost_usd
         .map(|c| format!(" (${c:.4})"))
         .unwrap_or_default();
+    // Only a non-default mode is worth the room (and it matters: plan mode
+    // blocks changes).
+    let mode = if app.mode == "default" {
+        String::new()
+    } else {
+        format!("  |  MODE: {}", app.mode.to_uppercase())
+    };
     let lines = vec![
-        Line::from(format!(" workdir: {} ", app.project_dir)),
+        Line::from(format!(" workdir: {}{mode} ", app.project_dir)),
         Line::from(format!(
             " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  context: ~{}  |  used: {}{cost} ",
             app.profile,
@@ -241,7 +250,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.working {
         "Esc: cancel turn | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+C: quit"
     } else {
-        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+T: thinking | Ctrl+P: model | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
+        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Shift+Tab: mode | Ctrl+T: thinking | Ctrl+P: model | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
     };
     let text = app.input.as_str();
     let paragraph = Paragraph::new(text)
@@ -330,6 +339,40 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
                 .title("Tool Approval Required")
                 .style(Style::default().fg(Color::Yellow)),
         );
+    frame.render_widget(paragraph, popup);
+}
+
+/// Approving a plan: the plan itself is in the transcript, so this sits at
+/// the bottom (over the input bar) and leaves it readable.
+fn draw_plan_approval(frame: &mut Frame, area: Rect, approval: &crate::app::PendingApproval) {
+    let height = 5u16.min(area.height);
+    let popup = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height),
+        width: area.width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let minutes_left = (approval.ticks_remaining * 80 / 1000).div_ceil(60);
+    let text = vec![
+        Line::from(Span::styled(
+            "Approve this plan? It's shown above (\u{2191}/\u{2193}/PgUp/PgDn to scroll).",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(
+            "[y] approve: leave plan mode and carry it out   [n] keep planning   Esc: cancel the turn",
+        ),
+        Line::from(Span::styled(
+            format!("not approved if no answer within {minutes_left} min"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Plan approval")
+            .style(Style::default().fg(Color::Yellow)),
+    );
     frame.render_widget(paragraph, popup);
 }
 

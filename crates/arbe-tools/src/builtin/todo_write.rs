@@ -71,6 +71,10 @@ impl Default for TodoWriteTool {
 
 #[async_trait]
 impl ToolExecutor for TodoWriteTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
             "Replace the current task's todo list, for tracking progress on multi-step work. Each call resends the full list.",

@@ -3,7 +3,7 @@
 //!
 //! Requests (client → harness): `initialize`, `session/new`,
 //! `session/resume`, `session/list`, `session/set_title`, `session/close`,
-//! `session/context`, `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
+//! `session/context`, `session/set_mode`, `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
 //! `shutdown`. Every event
 //! of an open session arrives as an `event` notification
 //! (`{"session_id", "seq", "event"}`). Requests run concurrently: while
@@ -243,6 +243,12 @@ struct ResumeParams {
 }
 
 #[derive(Deserialize)]
+struct ModeParams {
+    session_id: SessionId,
+    mode: String,
+}
+
+#[derive(Deserialize)]
 struct SessionParams {
     session_id: SessionId,
 }
@@ -301,6 +307,13 @@ impl Server {
                 Ok(json!({}))
             }),
             "session/close" => params::<SessionParams>(raw).and_then(|p| self.close(p.session_id)),
+            "session/set_mode" => params::<ModeParams>(raw).and_then(|p| {
+                self.with_session(p.session_id, |s| {
+                    s.set_mode(&p.mode)
+                        .map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))
+                })?;
+                Ok(json!({"mode": p.mode}))
+            }),
             "session/context" => params::<SessionParams>(raw).and_then(|p| {
                 let usage = self.with_session(p.session_id, |s| Ok(s.context_usage()))?;
                 Ok(json!({"usage": usage}))
@@ -727,6 +740,37 @@ mod tests {
             .await
             .expect("server did not stop")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_switches_modes() {
+        let (mut client, _server, _home, _project) = start();
+        let opened = client.call(1, "session/new", Value::Null).await;
+        let session_id = opened["result"]["session_id"].clone();
+        let set = client
+            .call(
+                2,
+                "session/set_mode",
+                json!({"session_id": session_id, "mode": "plan"}),
+            )
+            .await;
+        assert_eq!(set["result"]["mode"], "plan");
+        // Events travel through the session's forwarder: it may come
+        // before or after the response.
+        let is_change = |m: &Value| {
+            m["params"]["event"]["type"] == "mode_changed" && m["params"]["event"]["mode"] == "plan"
+        };
+        if !client.seen.iter().any(is_change) {
+            client.until(is_change).await;
+        }
+        let unknown = client
+            .call(
+                3,
+                "session/set_mode",
+                json!({"session_id": session_id, "mode": "yolo"}),
+            )
+            .await;
+        assert_eq!(unknown["error"]["code"], INVALID_PARAMS);
     }
 
     #[tokio::test]

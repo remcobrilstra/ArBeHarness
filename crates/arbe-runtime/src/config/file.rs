@@ -33,6 +33,8 @@ pub struct Layer {
     /// System prompt template: `"coding"`, `"general"`, or a path to a
     /// Markdown file (relative to the config file's directory).
     pub prompt: Option<String>,
+    /// The mode new sessions start in (`"default"`, `"plan"`).
+    pub mode: Option<String>,
     /// Named profiles (top level only).
     #[serde(default)]
     pub profiles: HashMap<String, Layer>,

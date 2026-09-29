@@ -31,6 +31,13 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - **`ask_user`**: the model can ask you a question (with options) mid-turn and continue with your answer; in the TUI, via `--headless` (`question/answer`), or auto-answered in `--print`.
 - Nested instruction files: an `AGENTS.md`/`agent.md`/`CLAUDE.md` in a subfolder applies once the agent works there.
 
+### Modes
+
+- **Plan mode**: the model researches with read-only tools and proposes a plan; approving it (`y`) ends plan mode and the model carries it out in the same turn, declining keeps it planning. Its subagents are read-only too.
+  - **Turning it on:** `Shift+Tab`, `/plan` or `/mode plan` in the chat screen; `--mode plan`; `mode = "plan"` in config or a profile; `session/set_mode` in headless mode.
+  - **Resume:** the session keeps its mode across a resume.
+- Modes are a general mechanism (tools allowed, prompt instructions, an exit the user approves), so more can follow.
+
 ### Long sessions
 
 - Old tool output is pruned first; then, with `memory_strategy = "compact_summary"`, the model summarizes older turns (also on demand with `/compact`); whole turns are dropped only as a last resort. Tool calls and their results are never split.

@@ -26,6 +26,9 @@ pub struct PendingApproval {
     /// TUI spec §9 ("if approval prompt times out: default action from
     /// policy, recommended deny").
     pub ticks_remaining: u32,
+    /// The call asks to approve a plan and leave plan mode
+    /// (`exit_plan_mode`): the plan itself is in the transcript.
+    pub is_plan: bool,
 }
 
 /// Metadata captured from `ToolCallProposed`, held until the matching
@@ -144,6 +147,9 @@ impl ProfilePicker {
 /// `lib.rs::event_loop`) a pending approval waits before auto-denying.
 pub const APPROVAL_TIMEOUT_TICKS: u32 = (30_000 / 80) as u32;
 
+/// A plan takes longer to read than a tool call: 10 minutes.
+pub const PLAN_APPROVAL_TIMEOUT_TICKS: u32 = (600_000 / 80) as u32;
+
 /// All UI-local state. This is presentation state only (current input
 /// text, scroll position, whether a request is in flight) — it holds no
 /// agent decision logic, per TUI spec §2.
@@ -204,6 +210,8 @@ pub struct App {
     pub profile_picker: Option<ProfilePicker>,
     pub should_quit: bool,
     pub last_estimated_tokens: u64,
+    /// The session's mode (`default`, `plan`, ...).
+    pub mode: String,
     /// What the latest model call's context was made of (`/context`).
     pub context: Option<arbe_runtime::arbe_core::ContextUsage>,
     /// Provider-reported tokens used by the whole session so far.
@@ -260,6 +268,7 @@ impl App {
             profile_picker: None,
             should_quit: false,
             last_estimated_tokens: 0,
+            mode: "default".to_string(),
             context: None,
             session_tokens: 0,
             session_cost_usd: None,

@@ -32,6 +32,8 @@ Headless:
 
 Configuration:
       --profile <NAME>     Settings profile: coding, general, or one from a config file
+      --mode <MODE>        Start in MODE: `default`, or `plan` (read-only until you
+                           approve the model's plan); also applies to --resume
       --provider <ID>      Model provider: ollama, openai, anthropic, openai_compatible
       --model <ID>         Model to use
       --config <FILE>      Extra config file, applied after ~/.arbe/config/config.toml
@@ -75,6 +77,9 @@ pub struct Cli {
     pub workdir: Option<PathBuf>,
     pub dev_home: Option<PathBuf>,
     pub profile: Option<String>,
+    /// `--mode`: the session mode (`plan`, ...), not to be confused with
+    /// [`Mode`], how the program runs.
+    pub session_mode: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub config_files: Vec<PathBuf>,
@@ -92,6 +97,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         workdir: None,
         dev_home: None,
         profile: None,
+        session_mode: None,
         provider: None,
         model: None,
         config_files: Vec::new(),
@@ -144,6 +150,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "--workdir" => cli.workdir = Some(value()?.into()),
             "--dev-home" => cli.dev_home = Some(value()?.into()),
             "--profile" => cli.profile = Some(value()?),
+            "--mode" => cli.session_mode = Some(value()?),
             "--provider" => cli.provider = Some(value()?),
             "--model" => cli.model = Some(value()?),
             "--config" => cli.config_files.push(value()?.into()),
@@ -256,9 +263,11 @@ mod tests {
             "--config=b.toml",
             "--prompt",
             "hello",
+            "--mode=plan",
         ])
         .unwrap();
         assert_eq!(cli.workdir, Some(PathBuf::from("/repo")));
+        assert_eq!(cli.session_mode.as_deref(), Some("plan"));
         assert_eq!(cli.resume, Some(id));
         assert_eq!(cli.name.as_deref(), Some("fix: a=b"));
         assert_eq!(

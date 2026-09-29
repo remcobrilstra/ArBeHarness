@@ -4,8 +4,8 @@
 
 use arbe_core::{
     ContentBlock, ContextBreakdown, ContextUsage, HarnessError, LoopMachine, LoopPhase,
-    MemoryError, Message, ProviderError, RequestedToolCall, Role, RuntimeEvent, StopReason,
-    ToolSpec, Turn, TurnId, Usage,
+    MemoryError, Message, ProviderError, RequestedToolCall, Role, RuntimeEvent, StopReason, Turn,
+    TurnId, Usage,
 };
 use arbe_hooks::HookPhase;
 use arbe_memory::HistoryEntry;
@@ -261,6 +261,8 @@ impl TurnRunner<'_> {
     /// Persists the turn and folds it into session state.
     fn commit(&mut self, stop_reason: StopReason) -> Result<(), HarnessError> {
         let agent = self.agent;
+        // The model may have left its mode during the turn.
+        agent.sync_mode();
         close_dangling_tool_uses(&mut self.trace);
         let mut turn = self.turn.clone();
         turn.messages = self.trace.clone();
@@ -355,20 +357,15 @@ impl TurnRunner<'_> {
         // Tool definitions are part of every request: measured, and taken
         // out of the budget before history gets what's left.
         agent.refresh_mcp_tools().await;
-        let tool_specs = if agent
-            .provider
-            .capabilities(&agent.settings.model)
-            .tool_calls
-        {
-            agent.registry_snapshot().specs()
-        } else {
-            Vec::new()
-        };
-        let tool_tokens = arbe_memory::estimate_tool_specs(&tool_specs);
+        let tool_tokens = arbe_memory::estimate_tool_specs(&agent.offered_tool_specs());
 
         let (context, estimated_display) = {
             let mut state = agent.state();
-            state.pipeline.system_instructions = vec![system_prompt.text];
+            // The mode's instructions follow the system prompt: stable for
+            // as long as the mode lasts, so the prefix stays cacheable.
+            state.pipeline.system_instructions = std::iter::once(system_prompt.text)
+                .chain(agent.mode.current().instructions)
+                .collect();
             state.pipeline.instruction_file_tokens = system_prompt.instruction_file_tokens;
             state.pipeline.memory_notes = memory_notes;
             state.pipeline.conversation_summary = state.summary.as_ref().map(|c| c.summary.clone());
@@ -409,8 +406,7 @@ impl TurnRunner<'_> {
                 ..context.breakdown
             },
         };
-        self.model_loop(context.messages, measured, tool_specs)
-            .await
+        self.model_loop(context.messages, measured).await
     }
 
     /// A long tool loop grows the turn's own messages without bound: stubs
@@ -452,6 +448,7 @@ impl TurnRunner<'_> {
         messages: &[Message],
         history: std::ops::Range<usize>,
         first: &ContextBreakdown,
+        tool_tokens: u64,
     ) -> u64 {
         let agent = self.agent;
         let earlier = &messages[history.clone()];
@@ -463,6 +460,7 @@ impl TurnRunner<'_> {
             // Turns dropped since the first round were omitted too.
             omitted_turns: first.omitted_turns + first.history_turns.saturating_sub(history_turns),
             stubbed_tool_results: arbe_memory::count_stubbed_results(&messages[history.start..]),
+            tools: tool_tokens,
             ..first.clone()
         };
         let estimated = breakdown.total();
@@ -492,7 +490,6 @@ impl TurnRunner<'_> {
         &mut self,
         mut messages: Vec<Message>,
         measured: MeasuredContext,
-        tool_specs: Vec<ToolSpec>,
     ) -> Result<LoopEnd, HarnessError> {
         let agent = self.agent;
         let turn_id = self.turn_id();
@@ -528,13 +525,12 @@ impl TurnRunner<'_> {
             )
             .await;
 
+            // Per round: the mode can change mid-turn (e.g. a plan is
+            // approved), and with it the tools on offer.
+            let tool_specs = agent.offered_tool_specs();
+            let tool_tokens = arbe_memory::estimate_tool_specs(&tool_specs);
             if round > 0 {
-                turn_start -= self.make_room(
-                    &mut messages,
-                    history_start,
-                    turn_start,
-                    measured.breakdown.tools,
-                );
+                turn_start -= self.make_room(&mut messages, history_start, turn_start, tool_tokens);
             }
 
             let estimated_prompt_tokens = self.publish_context(
@@ -542,13 +538,14 @@ impl TurnRunner<'_> {
                 &messages,
                 history_start..turn_start,
                 &measured.breakdown,
+                tool_tokens,
             );
             let request = ModelRequest {
                 model: agent.settings.model.clone(),
                 messages: messages.clone(),
                 temperature: agent.settings.temperature,
                 max_tokens: agent.settings.max_tokens,
-                tools: tool_specs.clone(),
+                tools: tool_specs,
                 thinking_budget_tokens: agent.settings.thinking_budget_tokens,
             };
             let (response, cancelled) = self.stream_inference(request).await?;

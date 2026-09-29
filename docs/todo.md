@@ -8,7 +8,7 @@ to build all of these — a punch list to pick from.
 |---|---|---|
 | Nested project instruction files | Scans the whole repo tree for `AGENTS.md`/`AGENT.md`/`Claude.md` (not just root `agent.md`/`CLAUDE.md`), with deeper files taking precedence over shallower ones for the code they cover | `arbe-storage::instructions` — currently we only check `project_dir` root and don't walk subdirectories at all (child-directory discovery, the inverse of the parent-walk we explicitly deferred; needs per-file-touched scope resolution, not just prompt assembly) |
 | ~~Todo/task tracking tool exposed to the model~~ | A `todo_write`-equivalent tool so the *model itself* can track and surface multi-step progress | **Done** — `arbe-tools::builtin::todo_write::TodoWriteTool`, see `CLAUDE.md` |
-| Plan mode | A read-only exploration phase before ambiguous/high-impact work, with explicit enter/exit and user approval of the plan | Would need a new `LoopPhase` variant plus `enter_plan_mode`/`exit_plan_mode` tools — nothing like this exists in `arbe-core`'s phase graph today |
+| ~~Plan mode~~ | Done (v2 P6.6) as a session mode rather than a `LoopPhase`: `plan` mode offers read-only tools and `exit_plan_mode`; see the user guide's *Modes and plan mode* | — |
 | `ask_user_question`-style tool | A structured way for the model to ask a narrow clarifying question mid-task | No such tool in `arbe-tools::builtin` |
 | Background/async tool execution | Start a long-running command, poll it, kill it, while continuing other work | Our `execute` tool is synchronous-only (with a timeout) — no background task registry |
 | Subagents | Spawning parallel sub-conversations to isolate context or parallelize independent work | Nothing like this — `Agent` is single-threaded per session |

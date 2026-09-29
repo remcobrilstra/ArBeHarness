@@ -14,7 +14,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 | P3 Agent loop | Met | — |
 | P4 Config, profiles, extensions | Met | — |
 | P5 Context management | Met | — |
-| P6.1–P6.3 Embedding, headless, subagents | Met | — (of P6.4–P6.8, outside the release bar, only P6.6 plan mode is open) |
+| P6.1–P6.3 Embedding, headless, subagents | Met | — (P6.4–P6.8, outside the release bar, are done too) |
 | P7 Verification & release | **Open** | Live runs above; `v0.2.0` tag and binaries |
 
 **Tests:** 495 passing on Windows (497 on Linux, which runs two Unix-only tests), 24 `#[ignore]`d live tests; `cargo fmt`, `cargo clippy --workspace --all-targets -D warnings` and `cargo deny check` clean. Last full GitHub Actions run on Linux, macOS and Windows: run 36579578868, commit `2823e18`, all green; later commits verified locally on Windows and in a Linux container.
@@ -65,7 +65,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 - *A subagent test shows context isolation and approval routing:* met — `a_subagent_works_in_its_own_context_and_its_approvals_reach_the_parent`, `cancelling_the_parent_cancels_a_waiting_subagent`; live, `delegates_research_to_a_subagent`.
 - *The minimal embedder example compiles in CI:* met — `crates/arbe-runtime/examples/embed.rs` builds under `clippy --all-targets` in CI on all three OSes, and ran against a local model.
 
-Outside the release bar: P6.4 background processes, P6.5 `ask_user`, P6.7 web tools and P6.8 observability are done and were verified live on grok-4.7 (`web_search` only against a mock server; OpenTelemetry deferred). P6.6 plan mode is postponed — see [Pending work](#pending-work).
+Outside the release bar: P6.4 background processes, P6.5 `ask_user`, P6.7 web tools and P6.8 observability are done and were verified live on grok-4.7 (`web_search` only against a mock server; OpenTelemetry deferred). P6.6 plan mode is done as the first of general session modes: agent-level tests for refusal, approval (mode ends mid-turn) and decline, persistence across resume; verified live on grok-4.7 both ways.
 
 ## P7 — Verification, hardening & release — Open
 
@@ -97,7 +97,7 @@ Everything not done yet, in one place. Nothing here blocks using the harness tod
 
 | Item | State |
 |---|---|
-| P6.6 Plan mode | Postponed by the maintainer. A read-only overlay (write/execute tools denied) with an `exit_plan_mode` tool the user approves. |
+| Custom modes | Modes are data (`agent/modes.rs`), but only the built-in `default` and `plan` exist; `[modes.<name>]` in config isn't read yet. |
 | Desktop control | Designed only (see above). |
 | OpenTelemetry export (P6.8) | Deferred; the daily log file covers local debugging. |
 | `events.jsonl` | Not written; events are available live (TUI, `--print --output json`, `--headless`). |

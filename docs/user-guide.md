@@ -72,6 +72,7 @@ The agent works on the directory you start it in. To point it somewhere else, us
 | `--approve <policy>` | | With `--print` only: `none`, `reads` or `all`. See [Headless mode](#headless-mode). |
 | `--output <format>` | | With `--print` only: `text` or `json`. See [Headless mode](#headless-mode). |
 | `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, or one defined in a config file. |
+| `--mode <mode>` | `ARBE_MODE` | Start in this [mode](#modes-and-plan-mode): `default` or `plan`. New sessions start in it; with `--resume` it also switches the resumed session (otherwise a resumed session keeps its own mode). |
 | `--provider <id>` | `ARBE_PROVIDER` | The model provider. See [Providers and models](#providers-and-models). |
 | `--model <id>` | `ARBE_MODEL` | The model. |
 | `--config <file>` | | An extra [configuration file](#configuration-file), applied right after the global one and trusted like it. Can be given more than once. Meant for a program that launches ArBeHarness and keeps its own settings (for example [hooks](#hooks)) without editing yours. The file must exist. |
@@ -146,6 +147,7 @@ Requests are handled concurrently: while a `turn/send` is waiting for its turn t
 | `session/list` | none | `{"sessions": [<meta.json contents>, …]}`, newest first |
 | `session/set_title` | `session_id`, `title` | `{}` |
 | `session/close` | `session_id` | `{}` (stops a running turn first) |
+| `session/set_mode` | `session_id`, `mode` | `{"mode"}` — switches the session's [mode](#modes-and-plan-mode) (`-32602` for an unknown mode); a `mode_changed` event follows. The model leaving plan mode sends `mode_changed` too |
 | `session/context` | `session_id` | `{"usage": {"breakdown", "total_tokens", "budget_tokens", "context_window", "compaction_threshold_tokens"}}` — the latest model call's context by source (`null` before the first call); also sent before every call as a `context_updated` event |
 | `turn/send` | `session_id`, `message` | `{"answer", "stop_reason"}` once the turn ends |
 | `turn/cancel` | `session_id` | `{"cancelled": true/false}` (whether a turn was running) |
@@ -283,6 +285,7 @@ context_window = 32768
 | `trusted_projects` | `[]` | Folders whose project config may change security-sensitive settings. Global config only. See [Trusted projects](#trusted-projects). |
 | `tools` | all tools | Tools the model may use, by name. An entry ending in `*` matches by prefix, e.g. `"github__*"` for every tool of the `github` [MCP server](#mcp-servers). Tools not listed are not available at all (not even through `/tool`). |
 | `prompt` | per profile | System prompt template: `coding`, `general`, or a path to your own Markdown file (relative paths are relative to the config file). See [Profiles](#profiles). |
+| `mode` | `"default"` | The [mode](#modes-and-plan-mode) new sessions start in: `"default"` or `"plan"`. Top level or in a profile (e.g. a `planner` profile that always starts in plan mode). |
 | `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
 | `provider.model` | per provider | Same as `ARBE_MODEL`. |
 | `provider.base_url` | provider's endpoint | Same as `ARBE_BASE_URL`. |
@@ -373,6 +376,7 @@ Environment variables override the [configuration file](#configuration-file). Th
 | Variable | Default | Description |
 |---|---|---|
 | `ARBE_PROFILE` | `coding` | Same as `--profile`. See [Profiles](#profiles). |
+| `ARBE_MODE` | `default` | The [mode](#modes-and-plan-mode) new sessions start in (same as `--mode`, except it doesn't switch resumed sessions). |
 | `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`. See [Providers and models](#providers-and-models). |
 | `ARBE_MODEL` | ollama: `qwen2.5-coder:3b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5` | The model ID sent to the provider. |
 | `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. |
@@ -467,7 +471,7 @@ The sources are: the harness's own **system prompt**; your **instruction files**
 
 The screen has three parts:
 
-1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent, against the context budget: `~12.3k/124k (10%)` (type `/context` for what it's made of). `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
+1. **Header**: `workdir` (followed by `MODE: PLAN` in [plan mode](#modes-and-plan-mode)), then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent, against the context budget: `~12.3k/124k (10%)` (type `/context` for what it's made of). `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
 
 **Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, reasoning models on OpenAI-compatible servers such as xAI), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
 2. **Transcript**: your messages, the assistant's replies (basic Markdown formatting), tool activity, and `[error]` / `[info]` status lines. Replies stream in as they are generated, including any text the model writes between tool calls. If you scroll up, new output doesn't pull you back down. Scroll to the bottom to follow it again.
@@ -497,6 +501,7 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 | `Ctrl+N` | Start a new session |
 | `Ctrl+R` | Open the session picker to resume an earlier session |
 | `Ctrl+P` | Open the profile picker to [switch this session to another profile](#switching-models-with-profiles) (and so, usually, another model) |
+| `Shift+Tab` | Switch to the next [mode](#modes-and-plan-mode) (`default` → `plan` → `default`). Works during a turn too |
 | `Esc` | While a reply is in progress: cancel the turn |
 | `Ctrl+C` | Quit. A turn in progress is cancelled and saved first (if saving takes more than about 2 seconds, it's recovered the next time you resume the session) |
 
@@ -511,6 +516,16 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 | `Esc` | Cancel the whole turn (not just this call) |
 
 If you don't answer within **30 seconds**, the call is denied automatically. The dialog shows a countdown.
+
+**Approving a plan** ([plan mode](#modes-and-plan-mode)) is different. The plan appears in the transcript as **Proposed plan**, and a small dialog at the bottom asks whether to approve it. You can scroll the plan with `↑`/`↓`/`PgUp`/`PgDn` while the dialog is open, and you have 10 minutes to answer:
+
+| Key | Decision |
+|---|---|
+| `y` | Approve: plan mode ends and the model carries out the plan |
+| `n` | Keep planning: the model stays in plan mode and asks what to change |
+| `Esc` | Cancel the whole turn |
+
+There's no approve or deny for the session (`a`/`d`): each plan is decided on its own.
 
 ### Questions from the agent
 
@@ -546,6 +561,9 @@ Anything you type is sent to the model, except lines starting with a recognized 
 |---|---|
 | `/profile` | Open the profile picker (same as `Ctrl+P`). |
 | `/profile <name>` | Switch this session to profile `<name>` — see [Switching models with profiles](#switching-models-with-profiles). |
+| `/mode` | List the [modes](#modes-and-plan-mode), marking the current one. |
+| `/mode <name>` | Switch to mode `<name>` (`default`, `plan`). |
+| `/plan` | Switch plan mode on, or off if it's on. |
 | `/context` | Show what the latest model call's context was made of: system prompt, instruction files, skills, memory, summary, tool definitions, history and this turn, in tokens and percent (see [Token counts](#providers-and-models)). |
 | `/compact` | Have the model summarize everything but your latest exchange now, to free up context. Works with either memory strategy. |
 | `/tool <name> <json-args>` | Run one of the [builtin tools](#builtin-tools) yourself. It goes through exactly the same path as a call from the model: the same approval dialog, the same output limit, the same transcript lines. Handy for checking that a tool works. Invalid JSON is treated as `{}`. Not available while a turn is running. |
@@ -579,6 +597,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `load_skill` | `name` | low | Reads a skill's full instructions (only present when [skills](#skills) load on demand). |
 | `task` | `description` (short label), `prompt`, optional `tools` (list) | low | Hands a self-contained job to a [subagent](#subagents) and returns its final answer. Not in the `general` profile. |
 | `ask_user` | `question`, optional `options` (up to 8), optional `allow_free_text` (default true) | low | Asks you a question and waits for the answer — for decisions only you can make. Never needs approval (it acts on nothing). See [Questions from the agent](#questions-from-the-agent). |
+| `exit_plan_mode` | `plan` (Markdown) | high | Only offered in [plan mode](#modes-and-plan-mode): presents the plan and asks you to approve it. Approving ends plan mode. Always asks, whatever your approval settings, except with `--print --approve all`. |
 | `web_fetch` | `url` (http/https), optional `max_chars` (default 20,000, max 100,000) | medium | Fetches a page and returns its text: HTML converted to readable text (with the page title), JSON and plain text as they are. Binary files are refused. Reads at most 3 MB. |
 | `web_search` | `query`, optional `count` (default 5, max 10) | medium | Searches the web and returns titles, URLs and snippets. Only present when [a search service is configured](#web-tools). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
@@ -667,6 +686,26 @@ headers = { "X-Team" = "platform" }
 - Each stdio server's error output is written to `~/.arbe/logs/mcp/<name>.log` — the first place to look when a server won't start.
 - A tool's result is shown to the model as text. Images a tool returns appear as `[image: <type>]`.
 - **HTTP limitation:** the harness only hears from an HTTP server while one of its own requests is open, so an HTTP server's "tool list changed" announcements made at other times are missed until the next session.
+
+### Modes and plan mode
+
+A session is always in one **mode**, which decides which tools the model may use:
+
+| Mode | Tools | Use it for |
+|---|---|---|
+| `default` | All of them, with your usual [approvals](#approvals) | Normal work |
+| `plan` | Read-only ones only, plus `exit_plan_mode` | Having the model research and propose a plan you approve before anything changes |
+
+**Plan mode.** The model can read and search files, fetch web pages, ask you questions (`ask_user`), keep its to-do list, and start [subagents](#subagents), which are read-only too. It can't write or edit files, run commands (`execute`), save memory notes or stop background processes. Those tools aren't offered to it, and if it calls one anyway the call is refused before any approval prompt. MCP tools are allowed only if their server marks them read-only. When its plan is ready, the model calls `exit_plan_mode` with it, and you approve it or not ([dialog](#tool-approval-dialog)):
+
+- **Approve (`y`):** plan mode ends and the model carries out the plan in the same turn, with all tools and your usual approvals.
+- **Keep planning (`n`):** the model stays in plan mode, asks what should change, and presents a revised plan.
+
+**Switching.** Use `Shift+Tab`, `/mode <name>` or `/plan` in the chat screen, `session/set_mode` in [headless mode](#json-rpc---headless), or `--mode plan` / `mode = "plan"` to start in it. The header shows `MODE: PLAN` next to the workdir while plan mode is on. Switching during a turn changes which tools may run straight away; the model is told about the new mode from the next turn. The session remembers its mode (`meta.json`), so a resumed session continues in it.
+
+**With `--print`:** `--approve all` approves the plan, so the model plans and then does the work. With `--approve none` or `reads` the plan is declined. There's nobody to ask what to change, so the model ends with the plan as its answer and nothing is changed.
+
+A tool you run yourself with `/tool` follows the mode too.
 
 ### Approvals
 
@@ -919,6 +958,7 @@ Rewritten atomically (temp file + rename) whenever the session changes.
 | `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress), `awaiting_approval` (a tool call is waiting for your decision) or `awaiting_answer` (the model asked you a question). Absent once closed. |
 | `pid` | The process that has the session open. Absent once closed; if it's present but that process no longer exists, the process ended without closing the session (for example it crashed or was killed). |
 | `parent` | Only for a [subagent](#subagents)'s session: the id of the session that started it. |
+| `mode` | The session's [mode](#modes-and-plan-mode) (`"plan"`), absent in the default mode. A resumed session continues in it. |
 
 Other programs can watch this file to show a session's state; every change is written atomically. Sessions saved before a field existed simply don't have it.
 

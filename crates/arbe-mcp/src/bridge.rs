@@ -51,6 +51,11 @@ impl McpToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for McpToolExecutor {
+    /// The server's `readOnlyHint` annotation — its word, not verified.
+    fn read_only(&self) -> bool {
+        self.tool.read_only
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

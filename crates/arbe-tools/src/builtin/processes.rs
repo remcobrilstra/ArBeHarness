@@ -281,6 +281,10 @@ impl ProcessOutputTool {
 
 #[async_trait]
 impl ToolExecutor for ProcessOutputTool {
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,

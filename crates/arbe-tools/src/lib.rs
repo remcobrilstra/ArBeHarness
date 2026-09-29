@@ -266,6 +266,15 @@ pub trait ToolExecutor: Send + Sync {
         true
     }
 
+    /// Whether the tool leaves everything as it was: it reads files or the
+    /// web, or talks to the user, but writes nothing, runs nothing and
+    /// changes no shared state outside the session. Read-only session modes
+    /// (plan mode) offer only these. Defaults to `false`, so a tool that
+    /// doesn't say is treated as having side effects.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     /// The session this tool belongs to is ending: release anything that
     /// must not outlive it (e.g. `execute` stops its background
     /// processes). Called by [`ToolRegistry::close_all`].
