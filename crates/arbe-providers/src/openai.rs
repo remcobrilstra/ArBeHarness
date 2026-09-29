@@ -361,6 +361,29 @@ struct PromptTokensDetails {
 struct StreamState {
     ids_by_index: HashMap<u32, String>,
     open_in_order: Vec<String>,
+    /// A `finish_reason` arrived (and with it a `Stop` event).
+    finished: bool,
+}
+
+/// `[DONE]` is itself a completion marker. Servers that send it without a
+/// `finish_reason` still get a `Stop`, inferred from whether the model
+/// called tools; otherwise the stream would look cut short.
+fn stop_on_done(state: &mut StreamState) -> Vec<ProviderEvent> {
+    if state.finished {
+        return Vec::new();
+    }
+    state.finished = true;
+    let mut events: Vec<ProviderEvent> = state
+        .open_in_order
+        .drain(..)
+        .map(|id| ProviderEvent::ToolUseEnd { id })
+        .collect();
+    events.push(ProviderEvent::Stop(if state.ids_by_index.is_empty() {
+        StopReason::EndTurn
+    } else {
+        StopReason::ToolUse
+    }));
+    events
 }
 
 fn map_finish_reason(reason: &str) -> StopReason {
@@ -433,6 +456,7 @@ fn translate_chunk(
             }
         }
         if let Some(reason) = choice.finish_reason {
+            state.finished = true;
             for id in state.open_in_order.drain(..) {
                 events.push(ProviderEvent::ToolUseEnd { id });
             }
@@ -486,7 +510,12 @@ impl ModelProvider for OpenAiProvider {
                 };
                 for item in decoder.push(&text) {
                     let payload = match item {
-                        SseItem::Done => return,
+                        SseItem::Done => {
+                            for event in stop_on_done(&mut state) {
+                                yield Ok(event);
+                            }
+                            return;
+                        }
                         SseItem::Data(payload) => payload,
                     };
                     match translate_chunk(&mut state, &payload) {

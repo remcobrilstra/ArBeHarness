@@ -373,7 +373,7 @@ This is a safety net, not a guarantee: a secret the harness doesn't know about, 
 | `ARBE_MAX_TOOL_ROUNDS` | `50` | Maximum model↔tool round trips in one turn before the turn stops. This is a runaway guard, not a cost limit. |
 | `ARBE_MAX_TURN_TOKENS` | off | Stops a turn once it has used this many tokens in total (input + output, across all its rounds). Unset means no limit. |
 | `ARBE_MAX_TOOL_OUTPUT_CHARS` | `50000` | Longest tool result sent back to the model. Longer output keeps its beginning and end, with a `[... N characters omitted ...]` marker in between. |
-| `ARBE_MAX_RETRIES` | `4` | How many times a failed provider request is retried (rate limits, overloads, transient network errors). `0` disables retrying. Backoff starts at 1s and caps at 60s, and honors the provider's `Retry-After`. |
+| `ARBE_MAX_RETRIES` | `4` | How many times a failed provider request is retried (rate limits, server errors 500/502/503/529, timeouts, transient network errors). `0` disables retrying. Backoff starts at 1s and caps at 60s, and honors the provider's `Retry-After`. A request is only retried before its reply starts; if a reply breaks off partway (the connection drops, or the stream stops without the provider's end-of-reply marker), the turn ends with an error instead of treating the partial reply as complete. |
 
 The maximum response length is fixed at 4096 output tokens.
 

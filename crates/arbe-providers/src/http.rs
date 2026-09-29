@@ -105,6 +105,11 @@ where
 {
     Box::pin(async_stream::stream! {
         let mut inner = Box::pin(inner);
+        // Every adapter emits `Stop` when the server signals completion. A
+        // stream that ends without one was cut short (a proxy or server
+        // giving up mid-answer); passing it on would turn a truncated
+        // answer — or half a tool call — into what looks like a finished one.
+        let mut stopped = false;
         loop {
             tokio::select! {
                 biased;
@@ -115,12 +120,20 @@ where
                 item = inner.next() => match item {
                     Some(item) => {
                         let is_err = item.is_err();
+                        stopped |= matches!(item, Ok(ProviderEvent::Stop(_)));
                         yield item;
                         if is_err {
                             return;
                         }
                     }
-                    None => return,
+                    None => {
+                        if !stopped {
+                            yield Err(ProviderError::Network(
+                                "the response ended before it was complete".into(),
+                            ));
+                        }
+                        return;
+                    }
                 },
             }
         }
@@ -135,11 +148,19 @@ mod tests {
     async fn cancellable_passes_events_through_until_the_end() {
         let inner = futures_util::stream::iter(vec![
             Ok(ProviderEvent::TextDelta("a".into())),
-            Ok(ProviderEvent::TextDelta("b".into())),
+            Ok(ProviderEvent::Stop(arbe_core::StopReason::EndTurn)),
         ]);
         let out: Vec<_> = cancellable(inner, CancellationToken::new()).collect().await;
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|e| e.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_stopping_ends_with_an_error() {
+        let inner = futures_util::stream::iter(vec![Ok(ProviderEvent::TextDelta("a".into()))]);
+        let out: Vec<_> = cancellable(inner, CancellationToken::new()).collect().await;
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[1], Err(ProviderError::Network(_))));
     }
 
     #[tokio::test]

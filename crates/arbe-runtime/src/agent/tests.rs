@@ -484,6 +484,7 @@ async fn reported_input_tokens_calibrate_the_estimator() {
             output_tokens: 1,
             ..Default::default()
         }),
+        ProviderEvent::Stop(StopReason::EndTurn),
     ]);
     let t = test_agent(ScriptedProvider::new(vec![], big_input));
     t.agent.submit_message("hi".into()).await.unwrap();

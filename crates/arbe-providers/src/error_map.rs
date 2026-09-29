@@ -12,8 +12,11 @@ pub fn map_http_error(status: StatusCode, body: &str) -> ProviderError {
         401 | 403 => ProviderError::Auth(body.to_string()),
         429 => ProviderError::rate_limit(body),
         408 | 504 => ProviderError::Timeout(body.to_string()),
-        // 503 Service Unavailable, and Anthropic's non-standard 529 Overloaded.
-        503 | 529 => ProviderError::Overloaded(body.to_string()),
+        // Transient server-side failures, which every provider documents
+        // as "retry after a short wait": 500 Internal Server Error, 502 Bad
+        // Gateway, 503 Service Unavailable, and Anthropic's 529 Overloaded.
+        // Other 5xx (501 Not Implemented, 505, ...) won't change on retry.
+        500 | 502 | 503 | 529 => ProviderError::Overloaded(format!("HTTP {status}: {body}")),
         400 | 413 if is_context_length_error(body) => {
             ProviderError::ContextLengthExceeded(body.to_string())
         }
@@ -107,7 +110,7 @@ mod tests {
             ProviderError::InvalidRequest(_)
         ));
         assert!(matches!(
-            map_http_error(StatusCode::INTERNAL_SERVER_ERROR, "oops"),
+            map_http_error(StatusCode::NOT_IMPLEMENTED, "oops"),
             ProviderError::Internal(_)
         ));
     }
@@ -167,5 +170,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn transient_server_errors_are_retryable_and_permanent_ones_are_not() {
+        for status in [500, 502, 503, 529] {
+            let err = map_http_error(StatusCode::from_u16(status).unwrap(), "x");
+            assert!(err.is_retryable(), "{status}: {err:?}");
+        }
+        for status in [501, 505] {
+            let err = map_http_error(StatusCode::from_u16(status).unwrap(), "x");
+            assert!(!err.is_retryable(), "{status}: {err:?}");
+        }
     }
 }
