@@ -12,4 +12,10 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
 chrono = { workspace = true }
+
+[[bench]]
+name = "resume"
+harness = false

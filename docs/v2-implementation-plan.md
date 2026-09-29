@@ -21,7 +21,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | In progress | 3 / 8 | P6.1–P6.3 done; all three exit criteria met (binary-spawning headless test, subagent isolation + approval-routing test, embedder example compiles). Remaining P6.4–P6.8 are optional per the risk register's release bar |
-| P7 | Verification, hardening & release | In progress | 1 / 8 | P7.3 reference MCP server done; P7.2 partial: Ollama live provider + end-to-end agent tests pass, OpenAI/Anthropic not run |
+| P7 | Verification, hardening & release | In progress | 5 / 8 | P7.1, P7.3–P7.6 done. P7.2 partial (live runs on Ollama + xAI pass; api.openai.com / Anthropic not run — no keys; no CI job). P7.7 (push + CI) and P7.8 (release) need the maintainer |
 
 **Current focus:** P7 (verification & release) — P6.4+ are optional
 **Last updated:** 2026-09-29 · test count: 466 (+20 ignored live tests)
@@ -30,6 +30,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-29 — P7.5/P7.6 benchmarks.** Criterion benches for context assembly, resume and streaming; all fast (see P7.6), so P7.5 is closed without a code change.
 - **2026-09-29 — P7.4 gate enforcement.** Running a tool without approval no longer compiles outside `arbe-tools`. 464 → 466 tests.
 - **2026-09-29 — P7.1 HTTP mock tests; two provider bugs fixed.** Silent truncation of cleanly-ended incomplete streams, and 500/502 not being retried (see P7.1). 452 → 464 tests.
 - **2026-09-29 — P6.3 subagents.** `task` tool with shared approvals/limits across the tree, `SubagentEvent` wrapping, TUI/`--print`/JSON-RPC support; P6 exit criteria all met. Live on grok-4.7: 13/13 agent tests (the model only delegated when asked). 449 → 452 tests.
@@ -309,8 +310,19 @@ Start P7.1 to P7.3 alongside P2; they are infrastructure the other phases need.
   - *Done:* `crates/arbe-mcp/tests/fixture/mcp_fixture_server.rs` (built as the `mcp-fixture-server` bin): out-of-order replies, stdout noise, stderr logging, crash, list-changed. 8 integration tests incl. an in-test HTTP server. Plus `#[ignore]`d live tests against the official `server-everything` (client-level and through the agent), both passing.
 - [x] **P7.4 Gate enforcement.** Make `ToolExecutor::execute` unreachable except via the gate: e.g. executors receive a `GateToken` that only `execute_gated` can construct. Closes the open item from the 2026-08-04 review.
   - *Done:* the token is `ToolContext` itself — every `ToolExecutor::execute` already requires one, and now only `Authorized::execute(ToolRun)` can issue it (private field, no `Default`/`Clone`; `compile_fail` doctests pin that). Callers pass a `ToolRun { cancel, progress }` instead. Executor unit tests use `ToolContext::for_testing()` behind a `testing` feature enabled only in dev-dependencies (verified absent from the binary's feature tree). Residual, by design: an executor handed a context could pass it to another executor it holds — that's code inside a tool, not a harness path.
-- [ ] **P7.5 JSONL read performance.** Fix the deferred `list_turns`/`list_events` full re-read (append-aware index or in-memory tail cache in `SessionStore`).
-- [ ] **P7.6 Benchmarks.** `criterion` benches for context assembly over large histories and stream-decode throughput, plus a first-token-latency measurement against the mock server. Only now, when there's a representative load profile.
+- [x] **P7.5 JSONL read performance.** Fix the deferred `list_turns`/`list_events` full re-read (append-aware index or in-memory tail cache in `SessionStore`).
+  - *Closed by measurement, no code change:* the only production readers run once per resume (history rebuild; the TUI transcript; in-flight recovery only after a crash) — nothing re-reads per turn, and `list_events` has no caller. Measured (P7.6): 5,000 turns / 46 MB reads in 66 ms. An index would add complexity to save that.
+- [x] **P7.6 Benchmarks.** `criterion` benches for context assembly over large histories and stream-decode throughput, plus a first-token-latency measurement against the mock server. Only now, when there's a representative load profile.
+  - *Done:* `cargo bench -p arbe-memory --bench context`, `-p arbe-storage --bench resume`, `-p arbe-providers --bench stream` (criterion, dev-only). Results on the dev machine (Windows, release build), 2026-09-29:
+
+    | Benchmark | Result |
+    |---|---|
+    | Context assembly per model call, 50 / 500 / 2,000 turns with 8 KB tool output each (worst case: nothing pruned yet) | 0.16 ms / 2.7 ms / 23 ms |
+    | Resume read (`list_turns`), 100 / 1,000 / 5,000 turns (0.9 / 9 / 46 MB) | 1.0 ms / 12 ms / 66 ms |
+    | OpenAI-format stream decode through the adapter over local HTTP, 5,000 deltas | 8.8 ms (~30 MiB/s, ~1.7 µs per delta) |
+    | Harness overhead to first streamed event (local HTTP) | 0.46 ms |
+
+    Conclusion: harness overhead is negligible next to model latency at every size measured; nothing to optimize now. Context assembly grows faster than linearly past ~500 turns (23 ms at 2,000) — the agent's in-place pruning keeps real sessions below the worst case, but it's the number to watch.
 - [ ] **P7.7 CI actually running.** Push to the remote and get the fmt/clippy/test matrix green on GitHub Actions for all three OSes; add `cargo-deny` (licenses/advisories).
 - [ ] **P7.8 Docs & release.** `docs/v2-status.md` (honest acceptance checklist in the style of v1-status), user-facing README (install, config reference, profiles, MCP setup), `CHANGELOG`, tagged `v0.2.0` release with prebuilt binaries for the three platforms.
 

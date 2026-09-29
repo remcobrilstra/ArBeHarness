@@ -17,4 +17,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 wiremock = { workspace = true }
+
+[[bench]]
+name = "stream"
+harness = false
