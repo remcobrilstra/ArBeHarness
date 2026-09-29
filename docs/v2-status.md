@@ -78,7 +78,7 @@ Outside the release bar and not started: P6.4 background execution, P6.5 `ask_us
 | P7.5 JSONL read performance | Met (by measurement) | Resume of 5,000 turns / 46 MB reads in 66 ms; no change needed. |
 | P7.6 Benchmarks | Met | `cargo bench` in arbe-memory, arbe-storage, arbe-providers; results in the plan. |
 | P7.7 CI actually running | **Open** | Workflows + `cargo-deny` are in the repo and pass locally; never run on GitHub. Needs a push. |
-| P7.8 Docs & release | **Open** | This file, README and CHANGELOG are written. Open: a `LICENSE` file (Cargo.toml declares MIT, but the copyright holder is the maintainer's call), the `v0.2.0` tag and prebuilt binaries. |
+| P7.8 Docs & release | **Open** | This file, README and CHANGELOG are written. `LICENSE` added: proprietary, all rights reserved, until a license is chosen. Open: the `v0.2.0` tag and prebuilt binaries. |
 
 ## Known limitations (by design or deferred)
 

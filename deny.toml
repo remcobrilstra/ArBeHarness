@@ -16,7 +16,7 @@ ignore = [
 ]
 
 [licenses]
-# Permissive licenses only (the project itself is MIT). A crate offering a
+# Dependencies: permissive licenses only. A crate offering a
 # choice (e.g. "MIT OR Apache-2.0 OR LGPL-2.1-or-later") passes if any
 # option is listed here.
 allow = [
@@ -32,6 +32,11 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+
+# Our own crates aren't published and are under the proprietary LICENSE
+# file, not an SPDX license; the checks above are about dependencies.
+[licenses.private]
+ignore = true
 
 [bans]
 # Duplicate versions are common in a Rust tree (e.g. windows-sys); report

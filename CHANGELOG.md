@@ -2,6 +2,8 @@
 
 ## Unreleased — 0.2.0 (branch `v2`)
 
+**License:** proprietary, all rights reserved (see `LICENSE`) until a license is chosen. The `Cargo.toml` MIT declaration was removed.
+
 A rebuild of the harness core: a streaming agent loop on typed content blocks, three new providers, context management for long sessions, and ways to use the harness beyond the terminal UI. See [`docs/v2-status.md`](docs/v2-status.md) for what's verified and what isn't yet.
 
 ### Models

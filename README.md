@@ -93,4 +93,4 @@ crates/
   arbe-tui/           terminal UI (depends only on arbe-runtime)
 ```
 
-License: MIT.
+License: proprietary, all rights reserved — see [LICENSE](LICENSE). No permission to use, copy, modify or distribute is granted without written permission.
