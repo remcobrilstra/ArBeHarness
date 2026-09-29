@@ -264,6 +264,9 @@ impl RuntimeConfig {
         env: &dyn Fn(&str) -> Option<String>,
         project_dir: PathBuf,
     ) -> Result<Self, ConfigError> {
+        // An empty variable (`ARBE_PROVIDER=`) is a common way to unset
+        // one; treat it as absent rather than as an empty setting.
+        let env = &|key: &str| env(key).filter(|value| !value.trim().is_empty());
         let read_all = |files: &[PathBuf]| {
             files
                 .iter()
@@ -882,6 +885,24 @@ mod tests {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<RuntimeConfig, ConfigError> {
         RuntimeConfig::load_from(files, env, PathBuf::from("/project"))
+    }
+
+    #[test]
+    fn empty_environment_variables_count_as_unset() {
+        let env = env_of(&[
+            ("ARBE_PROVIDER", ""),
+            ("ARBE_MODEL", "  "),
+            ("ARBE_PROFILE", ""),
+        ]);
+        let c = load(&[], &env).unwrap();
+        assert_eq!(
+            (
+                c.provider_name.as_str(),
+                c.model.as_str(),
+                c.profile.as_str()
+            ),
+            ("ollama", "qwen2.5-coder:3b", "coding")
+        );
     }
 
     #[test]

@@ -360,7 +360,7 @@ provider = { name = "ollama", model = "qwen2.5-coder:3b" }
 
 ## Environment variables
 
-Environment variables override the [configuration file](#configuration-file). They're read at startup; changing one requires restarting the app. An invalid number (e.g. `ARBE_MAX_TOOL_ROUNDS=lots`) stops the app with an error naming the variable.
+Environment variables override the [configuration file](#configuration-file). They're read at startup; changing one requires restarting the app. An invalid number (e.g. `ARBE_MAX_TOOL_ROUNDS=lots`) stops the app with an error naming the variable. A variable set to an empty value (`ARBE_PROVIDER=`) counts as not set.
 
 ### Provider and model
 
