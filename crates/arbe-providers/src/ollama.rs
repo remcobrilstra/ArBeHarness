@@ -175,6 +175,10 @@ fn tool_result_text(content: &[ContentBlock], is_error: bool) -> String {
     for block in content {
         match block {
             ContentBlock::Text { text } => out.push_str(text),
+            ContentBlock::Image {
+                source: ImageSource::Base64 { .. },
+                ..
+            } => out.push_str("[image: in the next message]"),
             ContentBlock::Image { .. } => out.push_str("[image omitted]"),
             _ => {}
         }
@@ -191,6 +195,9 @@ fn to_chat_messages(message: &Message, all: &[Message]) -> Vec<ChatMessage> {
     let mut text = String::new();
     let mut images = Vec::new();
     let mut tool_calls = Vec::new();
+    // Images a tool returned (base64 only: Ollama can't fetch URLs) go in
+    // a user message after the tool messages.
+    let mut tool_images = Vec::new();
 
     for block in &message.content {
         match block {
@@ -209,12 +216,21 @@ fn to_chat_messages(message: &Message, all: &[Message]) -> Vec<ChatMessage> {
                 tool_use_id,
                 content,
                 is_error,
-            } => out.push(ChatMessage {
-                role: "tool".to_string(),
-                content: tool_result_text(content, *is_error),
-                tool_name: tool_name_for(all, tool_use_id),
-                ..Default::default()
-            }),
+            } => {
+                out.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: tool_result_text(content, *is_error),
+                    tool_name: tool_name_for(all, tool_use_id),
+                    ..Default::default()
+                });
+                tool_images.extend(content.iter().filter_map(|block| match block {
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 { data },
+                        ..
+                    } => Some(data.clone()),
+                    _ => None,
+                }));
+            }
             ContentBlock::Image { .. }
             | ContentBlock::Thinking { .. }
             | ContentBlock::Opaque { .. } => {}
@@ -228,6 +244,14 @@ fn to_chat_messages(message: &Message, all: &[Message]) -> Vec<ChatMessage> {
             content: text,
             images,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            ..Default::default()
+        });
+    }
+    if !tool_images.is_empty() {
+        out.push(ChatMessage {
+            role: "user".to_string(),
+            content: "Images returned by the tool calls above:".to_string(),
+            images: tool_images,
             ..Default::default()
         });
     }
@@ -490,6 +514,32 @@ mod tests {
             tools,
             thinking_budget_tokens: None,
         }
+    }
+
+    fn image_result() -> Message {
+        Message::tool_result_blocks(
+            "call_1",
+            vec![
+                ContentBlock::text("{\"image\":\"shot.png\"}"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        data: "QUJD".into(),
+                    },
+                    media_type: "image/png".into(),
+                },
+            ],
+            false,
+        )
+    }
+
+    #[test]
+    fn images_from_tool_results_follow_in_a_user_message() {
+        let json = body_json(&request(vec![image_result()], vec![]));
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["images"], json!(["QUJD"]));
     }
 
     fn body_json(req: &ModelRequest) -> serde_json::Value {

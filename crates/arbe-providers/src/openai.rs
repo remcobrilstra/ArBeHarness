@@ -187,7 +187,7 @@ fn tool_result_text(content: &[ContentBlock], is_error: bool) -> String {
     for block in content {
         match block {
             ContentBlock::Text { text } => out.push_str(text),
-            ContentBlock::Image { .. } => out.push_str("[image omitted]"),
+            ContentBlock::Image { .. } => out.push_str("[image: in the next message]"),
             _ => {}
         }
     }
@@ -205,6 +205,9 @@ fn to_chat_messages(message: &Message) -> Vec<ChatMessage> {
     let mut parts = Vec::new();
     let mut has_image = false;
     let mut tool_calls = Vec::new();
+    // Tool messages can only carry text; images a tool returned follow the
+    // tool messages in a user message.
+    let mut tool_images = Vec::new();
 
     for block in &message.content {
         match block {
@@ -232,12 +235,22 @@ fn to_chat_messages(message: &Message) -> Vec<ChatMessage> {
                 tool_use_id,
                 content,
                 is_error,
-            } => out.push(ChatMessage {
-                role: "tool",
-                content: Some(ChatContent::Text(tool_result_text(content, *is_error))),
-                tool_calls: None,
-                tool_call_id: Some(tool_use_id.clone()),
-            }),
+            } => {
+                out.push(ChatMessage {
+                    role: "tool",
+                    content: Some(ChatContent::Text(tool_result_text(content, *is_error))),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                });
+                tool_images.extend(content.iter().filter_map(|block| match block {
+                    ContentBlock::Image { source, media_type } => Some(ChatPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: image_url(source, media_type),
+                        },
+                    }),
+                    _ => None,
+                }));
+            }
             ContentBlock::Thinking { .. } | ContentBlock::Opaque { .. } => {}
         }
     }
@@ -255,6 +268,18 @@ fn to_chat_messages(message: &Message) -> Vec<ChatMessage> {
             role: role_str(message.role),
             content,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            tool_call_id: None,
+        });
+    }
+    if !tool_images.is_empty() {
+        let mut parts = vec![ChatPart::Text {
+            text: "Images returned by the tool calls above:".into(),
+        }];
+        parts.extend(tool_images);
+        out.push(ChatMessage {
+            role: "user",
+            content: Some(ChatContent::Parts(parts)),
+            tool_calls: None,
             tool_call_id: None,
         });
     }
@@ -552,6 +577,41 @@ mod tests {
             tools: Vec::new(),
             thinking_budget_tokens: None,
         }
+    }
+
+    fn image_result() -> Message {
+        Message::tool_result_blocks(
+            "call_1",
+            vec![
+                ContentBlock::text("{\"image\":\"shot.png\"}"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        data: "QUJD".into(),
+                    },
+                    media_type: "image/png".into(),
+                },
+            ],
+            false,
+        )
+    }
+
+    #[test]
+    fn images_from_tool_results_follow_in_a_user_message() {
+        let json = body_json(&base_req(vec![image_result()]));
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[image: in the next message]")
+        );
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
     }
 
     fn body_json(req: &ModelRequest) -> serde_json::Value {

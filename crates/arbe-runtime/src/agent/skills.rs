@@ -78,6 +78,7 @@ impl ToolExecutor for LoadSkillTool {
             id: invocation.id,
             output: Value::String(output),
             is_error,
+            attachments: Vec::new(),
         })
     }
 

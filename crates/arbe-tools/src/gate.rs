@@ -145,6 +145,7 @@ mod tests {
                 id: invocation.id,
                 output: invocation.arguments,
                 is_error: false,
+                attachments: Vec::new(),
             })
         }
     }

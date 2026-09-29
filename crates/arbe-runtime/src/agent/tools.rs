@@ -47,6 +47,15 @@ pub(super) fn truncate_middle(text: String, max_chars: usize) -> String {
 
 /// A tool's JSON output as the text the model sees: strings as-is,
 /// anything else as compact JSON.
+/// What one executed call produced, before it's turned into a result block.
+#[derive(Clone)]
+struct Outcome {
+    text: String,
+    is_error: bool,
+    /// Non-text content (images) the tool returned.
+    attachments: Vec<ContentBlock>,
+}
+
 fn output_text(output: &Value) -> String {
     match output {
         Value::String(s) => s.clone(),
@@ -92,11 +101,17 @@ pub(super) async fn run_round(
     // Phase 2: run what was approved — unless the turn was cancelled while
     // approving. Consecutive parallel-safe calls run together; anything
     // else runs alone, in order.
-    let mut results: Vec<Option<(String, bool)>> = vec![None; calls.len()];
+    let mut results: Vec<Option<Outcome>> = vec![None; calls.len()];
     let mut pending = Vec::new();
     for (i, slot) in slots.into_iter().enumerate() {
         match slot {
-            Slot::Done { text, is_error } => results[i] = Some((text, is_error)),
+            Slot::Done { text, is_error } => {
+                results[i] = Some(Outcome {
+                    text,
+                    is_error,
+                    attachments: Vec::new(),
+                })
+            }
             Slot::Approved { authorized, id } => pending.push((i, authorized, id)),
         }
     }
@@ -134,16 +149,20 @@ pub(super) async fn run_round(
         }
     }
 
+    let vision = agent.provider.capabilities(&agent.settings.model).vision;
     let blocks = calls
         .iter()
         .zip(results)
         .map(|(call, result)| {
-            let succeeded = matches!(result, Some((_, false)));
-            let (text, is_error) = result.unwrap_or_else(|| {
-                (
-                    "not executed: the turn was cancelled before this tool call ran".to_string(),
-                    true,
-                )
+            let succeeded = matches!(result, Some(Outcome { is_error: false, .. }));
+            let Outcome {
+                text,
+                is_error,
+                attachments,
+            } = result.unwrap_or_else(|| Outcome {
+                text: "not executed: the turn was cancelled before this tool call ran".to_string(),
+                is_error: true,
+                attachments: Vec::new(),
             });
             // Redacted before anything else sees it: the model, the
             // persisted trace, and the transcript.
@@ -151,6 +170,15 @@ pub(super) async fn run_round(
                 agent.redactor.redact(&text),
                 agent.settings.max_tool_output_chars,
             ))];
+            if !attachments.is_empty() {
+                if vision {
+                    content.extend(attachments);
+                } else {
+                    content.push(ContentBlock::text(
+                        "(the tool also returned an image, which isn't shown: this model doesn't accept images)",
+                    ));
+                }
+            }
             if succeeded {
                 content.extend(
                     nested_instructions(agent, &registry, call)
@@ -353,6 +381,7 @@ fn publish_executed(
             id,
             output: agent.redactor.redact_value(output),
             is_error,
+            attachments: Vec::new(),
         },
     });
 }
@@ -366,7 +395,7 @@ async fn run_batch(
     turn_id: TurnId,
     batch: Vec<(usize, Authorized, ToolCallId)>,
     cancel: &CancellationToken,
-    results: &mut [Option<(String, bool)>],
+    results: &mut [Option<Outcome>],
 ) -> bool {
     if batch.is_empty() {
         return cancel.is_cancelled();
@@ -390,7 +419,7 @@ async fn run_batch(
 
     let mut cancelled = false;
     for (index, id, tool_name, outcome) in join_all(runs).await {
-        let (text, is_error) = match outcome {
+        let (text, is_error, attachments) = match outcome {
             Ok(result) => {
                 let text = output_text(&result.output);
                 publish_executed(
@@ -401,11 +430,11 @@ async fn run_batch(
                     result.output,
                     result.is_error,
                 );
-                (text, result.is_error)
+                (text, result.is_error, result.attachments)
             }
             Err(ToolError::Cancelled) => {
                 cancelled = true;
-                ("cancelled".to_string(), true)
+                ("cancelled".to_string(), true, Vec::new())
             }
             Err(err) => {
                 let message = err.to_string();
@@ -417,7 +446,7 @@ async fn run_batch(
                     json!({ "error": message }),
                     true,
                 );
-                (message, true)
+                (message, true, Vec::new())
             }
         };
         hooks::run(
@@ -431,7 +460,11 @@ async fn run_batch(
             },
         )
         .await;
-        results[index] = Some((text, is_error));
+        results[index] = Some(Outcome {
+            text,
+            is_error,
+            attachments,
+        });
     }
     cancelled || cancel.is_cancelled()
 }

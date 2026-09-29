@@ -132,6 +132,7 @@ impl ToolExecutor for ExecuteTool {
                 "exit_code": exit_code,
             }),
             is_error,
+            attachments: Vec::new(),
         })
     }
 }

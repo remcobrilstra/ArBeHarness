@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
-use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
+use arbe_core::{ContentBlock, ImageSource, RiskLevel, ToolError, ToolInvocation, ToolResult};
 use async_trait::async_trait;
+use base64::Engine;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -13,6 +14,22 @@ use crate::{ToolContext, ToolDescription, ToolExecutor};
 /// single tool call from pulling an entire large binary/log into the
 /// model's context by accident.
 const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Largest image returned as an image. Base64 adds a third, which keeps it
+/// under the 5 MB-per-image limit the strictest provider (Anthropic) sets.
+const MAX_IMAGE_BYTES: u64 = 3_750_000;
+
+/// The image formats every vision-capable provider accepts, by extension.
+fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    })
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
@@ -43,7 +60,7 @@ impl ToolExecutor for ReadFileTool {
 
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
-            "Read a UTF-8 text file (optionally a 1-indexed inclusive line range) from within the project directory.",
+            "Read a UTF-8 text file (optionally a 1-indexed inclusive line range) from within the project directory. PNG, JPEG, GIF and WebP files are returned as an image you can look at, if you can see images.",
         )
     }
 
@@ -72,6 +89,34 @@ impl ToolExecutor for ReadFileTool {
             )));
         }
 
+        if let Some(media_type) = image_media_type(&path) {
+            if metadata.len() > MAX_IMAGE_BYTES {
+                return Err(ToolError::Validation(format!(
+                    "{} is {} bytes, over the {MAX_IMAGE_BYTES}-byte image limit",
+                    path.display(),
+                    metadata.len()
+                )));
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
+            return Ok(ToolResult {
+                id: invocation.id,
+                output: json!({
+                    "image": args.path,
+                    "media_type": media_type,
+                    "bytes": bytes.len(),
+                }),
+                is_error: false,
+                attachments: vec![ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    },
+                    media_type: media_type.to_string(),
+                }],
+            });
+        }
+
         let contents = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
@@ -82,6 +127,7 @@ impl ToolExecutor for ReadFileTool {
             id: invocation.id,
             output: json!({ "content": content, "total_lines": total_lines }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }
@@ -234,5 +280,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn image_files_come_back_as_images() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 1x1 PNG.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        ];
+        std::fs::write(dir.path().join("shot.PNG"), png).unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute_default(invocation(json!({"path": "shot.PNG"})))
+            .await
+            .unwrap();
+        assert_eq!(result.output["media_type"], "image/png");
+        assert_eq!(result.output["bytes"], png.len());
+        match &result.attachments[..] {
+            [
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { data },
+                    media_type,
+                },
+            ] => {
+                assert_eq!(media_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap();
+                assert_eq!(decoded, png);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

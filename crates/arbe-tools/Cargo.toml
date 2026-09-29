@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 arbe-core = { workspace = true }
 arbe-storage = { workspace = true }
 async-trait = { workspace = true }

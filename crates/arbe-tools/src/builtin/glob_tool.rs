@@ -80,6 +80,7 @@ impl ToolExecutor for GlobTool {
             id: invocation.id,
             output: json!({ "matches": matches, "truncated": truncated }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }

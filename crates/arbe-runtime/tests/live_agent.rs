@@ -35,6 +35,9 @@ fn env(key: &str) -> Option<String> {
 /// Which model service the tests run against.
 struct Target {
     settings: Vec<(&'static str, String)>,
+    /// Whether the model can look at images (the default Ollama models
+    /// can't).
+    vision: bool,
     coding_model: String,
     general_model: String,
 }
@@ -51,6 +54,7 @@ fn target() -> Option<Target> {
         }
         return Some(Target {
             settings,
+            vision: true,
             coding_model: model.clone(),
             general_model: model,
         });
@@ -62,6 +66,7 @@ fn target() -> Option<Target> {
     }
     Some(Target {
         settings,
+        vision: false,
         coding_model: env("ARBE_LIVE_CODING_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into()),
         general_model: env("ARBE_LIVE_GENERAL_MODEL").unwrap_or_else(|| "llama3.2:3b".into()),
     })
@@ -624,6 +629,32 @@ async fn delegates_research_to_a_subagent() {
     );
     assert!(
         answer.contains("billing.py") && (answer.contains("0.21") || answer.contains("21%")),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live model that can see images"]
+async fn reads_an_image_file_and_sees_it() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    if !bench.target.vision {
+        eprintln!("skipped: this target's model has no vision");
+        return;
+    }
+    // A 32x32 solid crimson PNG.
+    const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGO4I2JDU8QwasGoBaMWjFowasGoBaMWjFowasGoBaMWDBULADahsD1ndvqVAAAAAElFTkSuQmCC";
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(RED_PNG)
+        .unwrap();
+    std::fs::write(bench.project().join("logo.png"), png).unwrap();
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("What is the main colour of logo.png? Open it with read_file and look. Answer with one colour word.")
+        .await;
+    assert!(trace.used("read_file"), "{trace:?}");
+    assert!(
+        contains_ci(&answer, "red") || contains_ci(&answer, "crimson"),
         "{answer}"
     );
 }

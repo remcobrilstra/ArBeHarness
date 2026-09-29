@@ -17,19 +17,20 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P0 | Housekeeping & quick correctness fixes | Done | 6 / 6 | 223 tests, fmt/clippy clean. P0.3 not verified against a live Ollama server (none available) |
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested. Ollama verified live (qwen2.5-coder:3b, llama3.2:3b). **Not Done yet:** the exit criterion also needs live OpenAI and Anthropic runs (no API keys here) |
-| P3 | Agent loop v2 | In progress | 8 / 10 | 322 tests, fmt/clippy clean. Open: P3.7 image/block tool results, P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
+| P3 | Agent loop v2 | In progress | 9 / 10 | Open: P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | In progress | 3 / 8 | P6.1–P6.3 done; all three exit criteria met (binary-spawning headless test, subagent isolation + approval-routing test, embedder example compiles). Remaining P6.4–P6.8 are optional per the risk register's release bar |
 | P7 | Verification, hardening & release | In progress | 5 / 8 | P7.1, P7.3–P7.6 done. P7.2 partial (live runs on Ollama + xAI pass; api.openai.com / Anthropic not run — no keys; no CI job). P7.7 (push + CI) and P7.8 (release) need the maintainer |
 
 **Current focus:** P7 (verification & release) — P6.4+ are optional
-**Last updated:** 2026-09-29 · test count: 466 (+20 ignored live tests)
+**Last updated:** 2026-09-29 · test count: 469 (+21 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-29 — P3.7 image tool results.** `read_file` returns images to vision models (all three adapters); verified live on grok-4.7.
 - **2026-09-29 — P7.5/P7.6 benchmarks.** Criterion benches for context assembly, resume and streaming; all fast (see P7.6), so P7.5 is closed without a code change.
 - **2026-09-29 — P7.4 gate enforcement.** Running a tool without approval no longer compiles outside `arbe-tools`. 464 → 466 tests.
 - **2026-09-29 — P7.1 HTTP mock tests; two provider bugs fixed.** Silent truncation of cleanly-ended incomplete streams, and 500/502 not being retried (see P7.1). 452 → 464 tests.
@@ -214,8 +215,8 @@ Replace the 1 358-line `Agent` with a small, cancellable loop that persists ever
   - *Done:* `Agent::cancel_turn()`; covered for mid-stream, pending approval (the prompt is withdrawn) and running tools. Tools that already ran keep their real results. `TurnCancelled` event; `submit_message` returns `HarnessError::Cancelled`. `RuntimeCommand::CancelTurn` has no dispatcher yet (commands arrive with headless mode, P6.2).
 - [x] **P3.6 Loop guards.** Configurable max rounds, per-turn token/cost ceiling, repeated-identical-tool-call detection. Hitting a guard ends the turn with an explicit stop reason and event, not a canned apology string.
   - *Done:* `StopReason::{ToolRoundLimit, TurnTokenLimit, RepeatedToolCall}` (+ `Interrupted`), carried on `TurnCompleted`; `max_turn_tokens` (`ARBE_MAX_TURN_TOKENS`); 3 identical rounds = stuck. The TUI shows a notice. Also changed: an all-denied round no longer ends the turn with "I don't have permission" — the model sees the denial and decides what to say.
-- [ ] **P3.7 Tool result handling.** Structured results (`Vec<ContentBlock>`, so tools can return images); per-tool output size caps with truncation markers; `is_error` results flow back to the model rather than aborting the turn (only harness-level failures abort).
-  - *Mostly done:* errors go back as `is_error` results; output is capped head+tail (`max_tool_output_chars`, `ARBE_MAX_TOOL_OUTPUT_CHARS`). **Remaining:** `ToolResult` still carries JSON only, so a tool can't return an image — needs a blocks field on `arbe_core::ToolResult`.
+- [x] **P3.7 Tool result handling.** Structured results (`Vec<ContentBlock>`, so tools can return images); per-tool output size caps with truncation markers; `is_error` results flow back to the model rather than aborting the turn (only harness-level failures abort).
+  - *Mostly done:* errors go back as `is_error` results; output is capped head+tail (`max_tool_output_chars`, `ARBE_MAX_TOOL_OUTPUT_CHARS`). *Done (2026-09-29):* `arbe_core::ToolResult.attachments: Vec<ContentBlock>` (serde-default, so old records load); `read_file` returns PNG/JPEG/GIF/WebP (≤ 3.75 MB) as a base64 image attachment; the agent puts attachments into the tool-result block when `capabilities(model).vision`, else a one-line note. Anthropic takes images inside `tool_result` natively; OpenAI/compatible and Ollama tool messages are text-only, so their adapters send the images in a user message right after the tool messages. Images count as a fixed token estimate and are pruned with their result. Verified live: grok-4.7 read a PNG via `read_file` and named its colour.
 - [x] **P3.8 Hook phases fully wired.** Call all seven `HookPhase`s at their points (`BeforeContextAssembly`, `BeforeToolExecute` — which may veto or rewrite arguments, still inside the gate — `AfterToolExecute`, `OnError`) with typed payloads rather than ad-hoc `json!`.
   - *Done:* all seven phases fire; payload structs in `agent/hooks.rs`. `BeforeToolExecute` runs before the gate (so the human approves the final arguments) and can rewrite `arguments` or set `veto`. `Hook::run` does not get the cancellation token — hooks already have a hard timeout, so it wasn't worth another trait change.
 - [x] **P3.9 Remove the manual `/tool` bypass path's duplication.** `propose_tool_call`/`resolve_tool_call` become a thin "inject a synthetic tool-use" entry point into the same `TurnRunner` path, so there is exactly one execution path to test.

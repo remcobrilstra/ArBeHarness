@@ -140,6 +140,7 @@ impl ToolExecutor for RememberTool {
                 }
             )),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 

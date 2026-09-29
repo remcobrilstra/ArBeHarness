@@ -28,6 +28,11 @@ pub struct ToolResult {
     pub id: ToolCallId,
     pub output: Value,
     pub is_error: bool,
+    /// Content beyond the text `output` — images, for now (e.g.
+    /// `read_file` on a PNG) — passed to the model as-is when it can take
+    /// it (see the agent's tool round).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::ContentBlock>,
 }
 
 /// A tool's name/description/JSON-schema, sent to a provider that supports

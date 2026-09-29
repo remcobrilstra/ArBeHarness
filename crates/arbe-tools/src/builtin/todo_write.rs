@@ -143,6 +143,7 @@ impl ToolExecutor for TodoWriteTool {
                 "completed": completed,
             }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }

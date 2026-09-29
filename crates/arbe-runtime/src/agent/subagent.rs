@@ -209,11 +209,13 @@ impl ToolExecutor for TaskTool {
                     "(the subagent finished without writing a final answer)".into(),
                 ),
                 is_error: false,
+                attachments: Vec::new(),
             }),
             Ok(answer) => Ok(ToolResult {
                 id: invocation.id,
                 output: Value::String(answer),
                 is_error: false,
+                attachments: Vec::new(),
             }),
             Err(HarnessError::Cancelled) => Err(ToolError::RuntimeFailure(
                 "the subagent was cancelled".into(),

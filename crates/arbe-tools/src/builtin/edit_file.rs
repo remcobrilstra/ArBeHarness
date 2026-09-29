@@ -102,6 +102,7 @@ impl ToolExecutor for EditFileTool {
             id: invocation.id,
             output: json!({ "replacements": replacements }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }

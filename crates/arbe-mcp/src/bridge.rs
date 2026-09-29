@@ -74,6 +74,7 @@ impl ToolExecutor for McpToolExecutor {
             id: invocation.id,
             output: Value::String(outcome.text),
             is_error: outcome.is_error,
+            attachments: Vec::new(),
         })
     }
 

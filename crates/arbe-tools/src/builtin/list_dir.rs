@@ -94,6 +94,7 @@ impl ToolExecutor for ListDirTool {
             id: invocation.id,
             output: json!({ "entries": entries, "truncated": truncated }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }

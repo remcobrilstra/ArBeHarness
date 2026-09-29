@@ -508,7 +508,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 
 | Tool | Arguments | Risk | What it does |
 |---|---|---|---|
-| `read_file` | `path`, optional `start_line`, `end_line` (1-indexed, inclusive) | low | Reads a UTF-8 text file. |
+| `read_file` | `path`, optional `start_line`, `end_line` (1-indexed, inclusive) | low | Reads a UTF-8 text file. A PNG, JPEG, GIF or WebP file (up to 3.75 MB) comes back as an image the model can look at — if the model supports images; otherwise it's told the image can't be shown. |
 | `list_dir` | optional `path` (defaults to workdir root) | low | Lists a directory (max 1,000 entries). |
 | `glob` | `pattern` (e.g. `**/*.rs`), optional `path` | low | Finds files by pattern (max 2,000 matches). |
 | `grep` | `pattern` (regex), optional `path`, `case_insensitive` | low | Searches file contents (max 500 matches). |
@@ -852,7 +852,7 @@ One line per completed turn (schema version 2):
 
 - `messages` holds the whole turn in order: your message, then each assistant message (text and/or `tool_use` blocks) followed by a `tool` message with the matching `tool_result` blocks, ending with the final answer.
 - `role`: `user`, `assistant`, `system`, or `tool`.
-- `content`: a list of blocks, each tagged by `type`: `text`, `image`, `tool_use`, `tool_result`, `thinking`, or `opaque` (provider-specific data passed back unchanged).
+- `content`: a list of blocks, each tagged by `type`: `text`, `image`, `tool_use`, `tool_result`, `thinking`, or `opaque` (provider-specific data passed back unchanged). A `tool_result` block's own `content` is a list of blocks too: normally one `text` block, plus an `image` block (base64) when `read_file` returned an image to a model that can see it — so a session that read images can make `turns.jsonl` large.
 - `stop_reason.kind`: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `refusal`, `cancelled`, `interrupted`, `tool_round_limit`, `turn_token_limit`, `repeated_tool_call`, or `other` (with a `detail` string).
 - Older (v1) records have no `schema_version`, and store `user_message` / `assistant_message` fields with plain-string `content`. They still load and are converted when read.
 - If the app is killed mid-write, a half-written last line is ignored on load. A damaged line anywhere else makes the session fail to load.
@@ -919,4 +919,3 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
 | Showing the model's reasoning | Extended thinking is saved in `turns.jsonl`, but the chat screen only shows `thinking…` while it happens, not the text. |
-| Tools returning images | Tool results are text only. |

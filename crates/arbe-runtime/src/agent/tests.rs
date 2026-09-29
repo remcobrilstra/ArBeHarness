@@ -178,6 +178,7 @@ impl ToolExecutor for EchoExecutor {
             id: invocation.id,
             output: invocation.arguments,
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }
@@ -205,6 +206,7 @@ impl ToolExecutor for SlowTool {
             id: invocation.id,
             output: json!("slept"),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }
@@ -1566,6 +1568,7 @@ async fn a_200_turn_session_with_large_tool_output_stays_within_budget() {
                 id: invocation.id,
                 output: json!("q".repeat(12_000)),
                 is_error: false,
+                attachments: Vec::new(),
             })
         }
     }

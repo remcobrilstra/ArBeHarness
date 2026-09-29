@@ -73,6 +73,7 @@ impl ToolExecutor for WriteFileTool {
             id: invocation.id,
             output: json!({ "bytes_written": bytes_written }),
             is_error: false,
+            attachments: Vec::new(),
         })
     }
 }
