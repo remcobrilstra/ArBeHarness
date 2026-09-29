@@ -30,6 +30,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-29 — cargo-deny; rustls security update.** Supply-chain checks added; they caught RUSTSEC-2026-0285 in rustls (fixed). Manual live-test workflow added.
 - **2026-09-29 — P3.10 TUI thinking view + live tool arguments.** P3's tasks are complete; only the human terminal check remains.
 - **2026-09-29 — P3.7 image tool results.** `read_file` returns images to vision models (all three adapters); verified live on grok-4.7.
 - **2026-09-29 — P7.5/P7.6 benchmarks.** Criterion benches for context assembly, resume and streaming; all fast (see P7.6), so P7.5 is closed without a code change.
@@ -326,6 +327,7 @@ Start P7.1 to P7.3 alongside P2; they are infrastructure the other phases need.
 
     Conclusion: harness overhead is negligible next to model latency at every size measured; nothing to optimize now. Context assembly grows faster than linearly past ~500 turns (23 ms at 2,000) — the agent's in-place pruning keeps real sessions below the worst case, but it's the number to watch.
 - [ ] **P7.7 CI actually running.** Push to the remote and get the fmt/clippy/test matrix green on GitHub Actions for all three OSes; add `cargo-deny` (licenses/advisories).
+  - *Local part done (2026-09-29):* `deny.toml` + a `cargo-deny` CI job; `cargo deny check` passes locally (advisories, bans, licenses, sources). It found **a real vulnerability** — rustls 0.23.43, RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption levels) — fixed by updating to 0.23.45 (re-verified over HTTPS against xAI). `paste` (unmaintained, compile-time only via ratatui) is an explicit, reasoned exception. All crates marked `publish = false` (they're not published; this also makes cargo-deny accept the path dependencies). Added `.github/workflows/live.yml` (manual, secrets-gated live tests) for P7.2. **Remaining:** pushing to GitHub and seeing both workflows green on all three OSes — needs the maintainer.
 - [ ] **P7.8 Docs & release.** `docs/v2-status.md` (honest acceptance checklist in the style of v1-status), user-facing README (install, config reference, profiles, MCP setup), `CHANGELOG`, tagged `v0.2.0` release with prebuilt binaries for the three platforms.
 
 **Exit criteria:** all of the above green; `v2-status.md` has no item marked done that isn't verified.

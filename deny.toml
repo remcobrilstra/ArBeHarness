@@ -1,0 +1,46 @@
+# cargo-deny: `cargo deny check` (run in CI, see .github/workflows/ci.yml).
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on known vulnerabilities and on crates marked unmaintained or
+# yanked, across the whole dependency tree.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # `paste` (unmaintained) comes in through ratatui 0.29 as a
+    # compile-time macro only; nothing of it runs in the binary. Revisit
+    # when ratatui drops it.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time only, via ratatui" },
+]
+
+[licenses]
+# Permissive licenses only (the project itself is MIT). A crate offering a
+# choice (e.g. "MIT OR Apache-2.0 OR LGPL-2.1-or-later") passes if any
+# option is listed here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are common in a Rust tree (e.g. windows-sys); report
+# them without failing the build.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

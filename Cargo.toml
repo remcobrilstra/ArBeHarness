@@ -6,6 +6,8 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+# Not published to crates.io; distributed as a binary.
+publish = false
 repository = "https://github.com/remcobrilstra/ArBeHarness"
 
 [workspace.dependencies]
@@ -51,6 +53,7 @@ name = "arbeharness"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 arbe-runtime = { workspace = true }

@@ -1,0 +1,48 @@
+name: Live model tests
+
+# Runs the #[ignore]d tests that call real model APIs. Manual only: they
+# cost money and depend on outside services. Each target runs only if its
+# secrets are set (the tests skip otherwise):
+#   OPENAI_API_KEY, ANTHROPIC_API_KEY                 -> provider round trips
+#   COMPAT_BASE_URL, COMPAT_MODEL, COMPAT_API_KEY     -> any OpenAI-compatible
+#     server (e.g. https://api.x.ai/v1 + grok-4.7): provider round trips,
+#     the 13 agent-level feature tests, and the headless CLI test.
+# Local Ollama isn't covered here (runners have no GPU and the models are
+# gigabytes); run those locally with ARBE_LIVE_OLLAMA=1.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ARBE_LIVE_COMPAT_BASE_URL: ${{ secrets.COMPAT_BASE_URL }}
+      ARBE_LIVE_COMPAT_MODEL: ${{ secrets.COMPAT_MODEL }}
+      ARBE_LIVE_COMPAT_API_KEY: ${{ secrets.COMPAT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The MCP test starts the reference server with npx; the hook test
+      # uses python. Both are preinstalled on ubuntu-latest.
+
+      - name: Provider round trips
+        run: cargo test -p arbe-providers --test live -- --ignored --nocapture
+
+      - name: Agent feature tests
+        if: env.ARBE_LIVE_COMPAT_BASE_URL != ''
+        run: cargo test -p arbe-runtime --test live_agent -- --ignored --nocapture --test-threads=4
+
+      - name: Headless CLI
+        if: env.ARBE_LIVE_COMPAT_BASE_URL != ''
+        run: cargo test --test cli -- --ignored --nocapture
