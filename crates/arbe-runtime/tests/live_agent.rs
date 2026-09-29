@@ -198,15 +198,20 @@ impl Run {
         tokio::spawn(async move {
             let mut names = HashMap::new();
             while let Ok(envelope) = rx.recv().await {
-                match envelope.event {
+                // A subagent's events arrive wrapped; its calls are recorded
+                // as `↳tool`, and only the top-level turn's ending counts.
+                let (event, depth) = envelope.event.innermost();
+                let (event, prefix) = (event.clone(), "↳".repeat(depth));
+                match event {
                     RuntimeEvent::ToolCallProposed {
                         tool_call_id,
                         tool_name,
                         arguments,
                         ..
                     } => {
-                        eprintln!("    tool: {tool_name} {arguments}");
+                        eprintln!("    tool: {prefix}{tool_name} {arguments}");
                         names.insert(tool_call_id, tool_name.clone());
+                        let tool_name = format!("{prefix}{tool_name}");
                         t.lock()
                             .unwrap()
                             .calls
@@ -250,7 +255,7 @@ impl Run {
                     RuntimeEvent::CompactionPerformed { .. } => {
                         t.lock().unwrap().compactions += 1;
                     }
-                    RuntimeEvent::TurnCompleted { stop_reason, .. } => {
+                    RuntimeEvent::TurnCompleted { stop_reason, .. } if depth == 0 => {
                         t.lock().unwrap().stop = Some(stop_reason);
                     }
                     _ => {}
@@ -595,4 +600,30 @@ if call["tool_name"] == "execute":
         "the command ran"
     );
     eprintln!("  (answer after veto: {answer:?})");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn delegates_research_to_a_subagent() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    bench.write("src/app/main.py", "from app.billing import compute_tax\n");
+    bench.write(
+        "src/app/billing.py",
+        "RATE = 0.21\n\ndef compute_tax(amount):\n    return amount * RATE\n",
+    );
+    bench.write("src/app/users.py", "def load_users():\n    return []\n");
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("Use the task tool to have a subagent find out which file defines `compute_tax` and what tax rate it uses. Then tell me both.")
+        .await;
+    assert!(trace.used("task"), "{trace:?}");
+    // The subagent did the looking, not the parent.
+    assert!(
+        trace.calls.iter().any(|(t, _)| t.starts_with('↳')),
+        "{trace:?}"
+    );
+    assert!(
+        answer.contains("billing.py") && (answer.contains("0.21") || answer.contains("21%")),
+        "{answer}"
+    );
 }

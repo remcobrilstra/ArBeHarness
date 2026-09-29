@@ -273,16 +273,7 @@ fn drain_runtime_events(
                 );
             }
             Ok(RuntimeEvent::ToolApprovalRequested { tool_call_id, .. }) => {
-                if let Some(meta) = app.proposed_tool_calls.remove(&tool_call_id) {
-                    app.pending_approval = Some(PendingApproval {
-                        id: tool_call_id,
-                        tool_name: meta.tool_name,
-                        arguments_pretty: meta.arguments_pretty,
-                        risk: meta.risk,
-                        source_turn: meta.source_turn,
-                        ticks_remaining: APPROVAL_TIMEOUT_TICKS,
-                    });
-                }
+                request_approval(app, tool_call_id);
             }
             Ok(RuntimeEvent::ToolExecuted {
                 tool_name, result, ..
@@ -296,6 +287,7 @@ fn drain_runtime_events(
                 app.activity = Some("continuing…".to_string());
                 app.push_line(Role::Tool, format!("✗ {tool_name} denied: {reason}"));
             }
+            Ok(event @ RuntimeEvent::SubagentEvent { .. }) => apply_subagent_event(app, &event),
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -314,6 +306,80 @@ fn drain_runtime_events(
                 continue;
             }
         }
+    }
+}
+
+/// Opens the approval dialog for a proposed call (the agent's own or a
+/// subagent's: answering goes through the top-level agent either way).
+fn request_approval(app: &mut App, tool_call_id: ToolCallId) {
+    if let Some(meta) = app.proposed_tool_calls.remove(&tool_call_id) {
+        app.pending_approval = Some(PendingApproval {
+            id: tool_call_id,
+            tool_name: meta.tool_name,
+            arguments_pretty: meta.arguments_pretty,
+            risk: meta.risk,
+            source_turn: meta.source_turn,
+            ticks_remaining: APPROVAL_TIMEOUT_TICKS,
+        });
+    }
+}
+
+/// Shows what a subagent (started by the `task` tool) is doing: its tool
+/// calls and results, indented under the `task` call, and its approval
+/// requests. Its own text isn't shown; its final answer comes back as the
+/// `task` result.
+fn apply_subagent_event(app: &mut App, event: &RuntimeEvent) {
+    let (inner, depth) = event.innermost();
+    let indent = format!("{}↳ ", "  ".repeat(depth));
+    match inner {
+        RuntimeEvent::ToolCallProposed {
+            turn_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+            risk,
+        } => {
+            let arguments_pretty = serde_json::to_string(arguments).unwrap_or_default();
+            app.activity = Some(format!("subagent running {tool_name}…"));
+            app.push_line(
+                Role::Tool,
+                format!("{indent}{tool_name} {arguments_pretty} (risk: {risk:?})"),
+            );
+            app.proposed_tool_calls.insert(
+                *tool_call_id,
+                ProposedToolCall {
+                    tool_name: format!("{tool_name} (subagent)"),
+                    arguments_pretty,
+                    risk: *risk,
+                    source_turn: *turn_id,
+                },
+            );
+        }
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
+            request_approval(app, *tool_call_id);
+        }
+        RuntimeEvent::ToolExecuted {
+            tool_name, result, ..
+        } => {
+            app.push_line(
+                Role::Tool,
+                format!("{indent}{}", format_tool_result(tool_name, result)),
+            );
+        }
+        RuntimeEvent::ToolCallDenied {
+            tool_name, reason, ..
+        } => {
+            app.push_line(
+                Role::Tool,
+                format!("{indent}✗ {tool_name} denied: {reason}"),
+            );
+        }
+        RuntimeEvent::ModelStreamChunk { .. }
+        | RuntimeEvent::ThinkingDelta { .. }
+        | RuntimeEvent::ToolUseStarted { .. } => {
+            app.activity = Some("subagent working…".to_string());
+        }
+        _ => {}
     }
 }
 

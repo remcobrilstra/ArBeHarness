@@ -112,6 +112,15 @@ pub enum RuntimeEvent {
         server: String,
         reason: String,
     },
+    /// An event from a subagent started by the `task` tool call
+    /// `parent_tool_call_id`, running as session `session_id`. Nested
+    /// subagents nest these. Approval requests inside are answered like
+    /// any other (`supply_tool_decision` on the top-level agent).
+    SubagentEvent {
+        parent_tool_call_id: ToolCallId,
+        session_id: SessionId,
+        event: Box<RuntimeEvent>,
+    },
     /// A hook failed (error, bad output, timeout) and was skipped.
     HookFailed {
         hook: String,
@@ -139,6 +148,20 @@ pub enum RuntimeEvent {
         turn_id: Option<TurnId>,
         reason: String,
     },
+}
+
+impl RuntimeEvent {
+    /// The event itself, unwrapped from any [`RuntimeEvent::SubagentEvent`]
+    /// layers, and how many there were (0 for the top-level agent's own).
+    pub fn innermost(&self) -> (&RuntimeEvent, usize) {
+        let mut event = self;
+        let mut depth = 0;
+        while let RuntimeEvent::SubagentEvent { event: inner, .. } = event {
+            event = inner;
+            depth += 1;
+        }
+        (event, depth)
+    }
 }
 
 /// Commands the TUI (or any other client) sends to the runtime (TUI spec §5).

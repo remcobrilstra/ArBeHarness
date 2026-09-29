@@ -62,6 +62,9 @@ pub struct SessionMeta {
     /// the session (e.g. it crashed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// For a subagent's session: the session whose `task` call started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
 }
 
 impl SessionMeta {
@@ -85,6 +88,7 @@ impl SessionMeta {
             branch: None,
             activity: None,
             pid: None,
+            parent: None,
         }
     }
 

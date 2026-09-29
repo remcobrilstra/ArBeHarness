@@ -90,6 +90,10 @@ pub struct RuntimeConfig {
     pub tools: Option<Vec<String>>,
     /// How skills reach the model — see [`SkillsMode`].
     pub skills_mode: SkillsMode,
+    /// How deep `task` subagents may nest (0 = no `task` tool).
+    pub subagent_max_depth: u32,
+    /// Subagents running at once across a session's whole tree.
+    pub subagent_max_concurrent: usize,
     /// MCP servers to connect for each session (enabled ones only).
     pub mcp_servers: Vec<arbe_mcp::McpServerConfig>,
     /// Which system prompt template to render each turn.
@@ -158,6 +162,8 @@ impl RuntimeConfig {
             tools: None,
             mcp_servers: Vec::new(),
             skills_mode: SkillsMode::OnDemand,
+            subagent_max_depth: 1,
+            subagent_max_concurrent: 4,
             prompt: PromptTemplate::Coding,
             project_dir,
             home: arbe_storage::paths::arbe_home(),
@@ -392,6 +398,20 @@ impl RuntimeConfig {
                         .map(std::time::Duration::from_millis)
                         .unwrap_or(arbe_hooks::command::DEFAULT_COMMAND_TIMEOUT),
                 });
+            }
+        }
+        if let Some(subagents) = &layer.subagents {
+            if let Some(depth) = subagents.max_depth {
+                self.subagent_max_depth = depth;
+            }
+            if let Some(concurrent) = subagents.max_concurrent {
+                if concurrent == 0 {
+                    return Err(invalid(
+                        path,
+                        "subagents.max_concurrent must be at least 1 (use max_depth = 0 to turn subagents off)",
+                    ));
+                }
+                self.subagent_max_concurrent = concurrent;
             }
         }
         if let Some(skills) = &layer.skills
@@ -969,6 +989,37 @@ mod tests {
         assert!(tool_allowed(&allowed, "github__search"));
         assert!(!tool_allowed(&allowed, "read_files"));
         assert!(!tool_allowed(&allowed, "gitlab__search"));
+    }
+
+    #[test]
+    fn subagent_limits_are_configurable_and_validated() {
+        let dir = temp_dir();
+        let defaults = load(&[], &no_env).unwrap();
+        assert_eq!(
+            (
+                defaults.subagent_max_depth,
+                defaults.subagent_max_concurrent
+            ),
+            (1, 4)
+        );
+        let set = write(
+            &dir,
+            "a.toml",
+            "[subagents]
+max_depth = 2
+max_concurrent = 1
+",
+        );
+        let c = load(&[set], &no_env).unwrap();
+        assert_eq!((c.subagent_max_depth, c.subagent_max_concurrent), (2, 1));
+        let zero = write(
+            &dir,
+            "b.toml",
+            "[subagents]
+max_concurrent = 0
+",
+        );
+        assert!(load(&[zero], &no_env).is_err());
     }
 
     #[test]

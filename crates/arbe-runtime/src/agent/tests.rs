@@ -272,6 +272,7 @@ fn test_parts(
         allowed_tools: None,
         startup_warnings: Vec::new(),
         redactor: crate::redact::Redactor::default(),
+        decisions: Default::default(),
     }
 }
 
@@ -1759,4 +1760,229 @@ fn titles_come_from_the_first_non_empty_line_shortened() {
     assert_eq!(title_from("   \n"), None);
     let long = title_from(&"word ".repeat(40)).unwrap();
     assert!(long.ends_with('…') && long.chars().count() <= 60);
+}
+
+// ---------------------------------------------------------------------------
+// Subagents (the `task` tool)
+// ---------------------------------------------------------------------------
+
+/// Plays both sides: the parent (asked `PARENT-Q`) delegates with `task`;
+/// the child (asked `CHILD-TASK ...`) reads `notes.txt` and reports.
+/// Every request is recorded, so tests can see what each side was sent.
+#[derive(Clone, Default)]
+struct DelegatingModel {
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl DelegatingModel {
+    fn requests(&self) -> Vec<ModelRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn mentions(message: &Message, needle: &str) -> bool {
+    serde_json::to_string(&message.content)
+        .unwrap()
+        .contains(needle)
+}
+
+#[async_trait]
+impl ModelProvider for DelegatingModel {
+    fn id(&self) -> &str {
+        "delegating"
+    }
+    fn capabilities(&self, _model: &str) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calls: true,
+            vision: false,
+            thinking: false,
+            prompt_caching: false,
+            max_context_tokens: 32_000,
+        }
+    }
+    async fn stream(
+        &self,
+        req: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.requests.lock().unwrap().push(req.clone());
+        let is_parent = req
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && mentions(m, "PARENT-Q"));
+        let last = req.messages.last().unwrap();
+        let round = match (is_parent, last.role == Role::Tool) {
+            (true, false) => tool_calls(&[(
+                "t1",
+                "task",
+                json!({"description": "look up the code", "prompt": "CHILD-TASK: read notes.txt and report the code"}),
+            )]),
+            (false, false) => tool_calls(&[("r1", "read_file", json!({"path": "notes.txt"}))]),
+            (false, true) => answer(if mentions(last, "secret-42") {
+                "the code is secret-42"
+            } else {
+                "could not read it"
+            }),
+            (true, true) => answer(if mentions(last, "the code is secret-42") {
+                "my subagent says: secret-42"
+            } else {
+                "the subagent failed"
+            }),
+        };
+        let Round::Events(events) = round else {
+            unreachable!()
+        };
+        Ok(Box::pin(futures_util::stream::iter(
+            events.into_iter().map(Ok),
+        )))
+    }
+}
+
+struct Tree {
+    agent: Arc<Agent>,
+    rx: tokio::sync::broadcast::Receiver<arbe_core::EventEnvelope>,
+    model: DelegatingModel,
+    store: SessionStore,
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+}
+
+fn delegating_agent() -> Tree {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("notes.txt"), "code: secret-42").unwrap();
+    let model = DelegatingModel::default();
+    let mut providers = ProviderRegistry::new();
+    let shared = model.clone();
+    providers.register("delegating", move |_| {
+        Ok(Box::new(shared.clone()) as Box<dyn ModelProvider>)
+    });
+    let config = crate::RuntimeConfig {
+        provider_name: "delegating".into(),
+        home: home.path().to_path_buf(),
+        // Default approval mode: every call asks, the child's included.
+        ..crate::RuntimeConfig::defaults(project.path().to_path_buf())
+    };
+    let store = SessionStore::with_root(home.path().join("sessions"));
+    let events = Arc::new(EventBus::new(4_096));
+    let rx = events.subscribe();
+    let agent = Arc::new(Agent::create_with(&config, store.clone(), events, &providers).unwrap());
+    Tree {
+        agent,
+        rx,
+        model,
+        store,
+        _dirs: (home, project),
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_works_in_its_own_context_and_its_approvals_reach_the_parent() {
+    let mut tree = delegating_agent();
+    let agent = tree.agent.clone();
+    let turn = tokio::spawn(async move { agent.submit_message("PARENT-Q".into()).await });
+
+    // First the parent's own `task` call asks for approval...
+    let task_id = wait_for(&mut tree.rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    })
+    .await;
+    assert!(
+        tree.agent
+            .supply_tool_decision(task_id, ApprovalDecision::ApprovedOnce)
+    );
+
+    // ...then the child's `read_file`, wrapped as a subagent event and
+    // answered through the parent.
+    let (child_call, child_session) = wait_for(&mut tree.rx, |e| match e {
+        RuntimeEvent::SubagentEvent {
+            parent_tool_call_id,
+            session_id,
+            event,
+        } => match *event {
+            RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
+                assert_eq!(parent_tool_call_id, task_id);
+                Some((tool_call_id, session_id))
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    assert!(
+        tree.agent
+            .supply_tool_decision(child_call, ApprovalDecision::ApprovedOnce)
+    );
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("turn never finished")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, "my subagent says: secret-42");
+
+    // Context isolation: the child never saw the parent's conversation,
+    // and at the depth cap it wasn't offered `task` itself.
+    let requests = tree.model.requests();
+    let child_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| !r.messages.iter().any(|m| mentions(m, "PARENT-Q")))
+        .collect();
+    assert_eq!(child_requests.len(), 2);
+    for request in &child_requests {
+        assert!(!request.tools.iter().any(|t| t.name == "task"));
+        assert!(request.tools.iter().any(|t| t.name == "read_file"));
+    }
+    assert!(requests[0].tools.iter().any(|t| t.name == "task"));
+    // The parent saw the child's answer, not its tool traffic.
+    let parent_last = requests.last().unwrap();
+    assert!(
+        !parent_last
+            .messages
+            .iter()
+            .any(|m| mentions(m, "code: secret-42"))
+    );
+
+    // The child's session is saved, named, closed, and linked to its parent.
+    let child = tree.store.load_meta(child_session).unwrap();
+    assert_eq!(child.parent, Some(tree.agent.session_id()));
+    assert_eq!(child.title.as_deref(), Some("look up the code"));
+    assert_eq!(child.status, SessionStatus::Closed);
+    assert_eq!(tree.store.list_turns(child_session).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_cancels_a_waiting_subagent() {
+    let mut tree = delegating_agent();
+    let agent = tree.agent.clone();
+    let turn = tokio::spawn(async move { agent.submit_message("PARENT-Q".into()).await });
+    let task_id = wait_for(&mut tree.rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    })
+    .await;
+    tree.agent
+        .supply_tool_decision(task_id, ApprovalDecision::ApprovedOnce);
+    // Wait until the child is paused on its own approval, then cancel.
+    let child_session = wait_for(&mut tree.rx, |e| match e {
+        RuntimeEvent::SubagentEvent {
+            session_id, event, ..
+        } if matches!(*event, RuntimeEvent::ToolApprovalRequested { .. }) => Some(session_id),
+        _ => None,
+    })
+    .await;
+    assert!(tree.agent.cancel_turn());
+
+    let result = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("turn never finished")
+        .unwrap();
+    assert!(matches!(result, Err(HarnessError::Cancelled)), "{result:?}");
+    let child_turns = tree.store.list_turns(child_session).unwrap();
+    assert_eq!(child_turns[0].stop_reason, Some(StopReason::Cancelled));
+    assert_eq!(
+        tree.store.load_meta(child_session).unwrap().status,
+        SessionStatus::Closed
+    );
 }

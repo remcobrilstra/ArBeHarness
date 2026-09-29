@@ -25,6 +25,7 @@ pub struct Layer {
     pub hooks: Option<HooksSection>,
     pub mcp: Option<McpSection>,
     pub skills: Option<SkillsSection>,
+    pub subagents: Option<SubagentsSection>,
     /// Tools the model may use, by name (a trailing `*` matches a prefix,
     /// e.g. `"github__*"`). Absent = every registered tool.
     pub tools: Option<Vec<String>>,
@@ -141,6 +142,17 @@ pub struct ApprovalSection {
 pub struct SkillsSection {
     /// `"on_demand"` (default) or `"always"`.
     pub mode: Option<String>,
+}
+
+/// `[subagents]`: the `task` tool.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentsSection {
+    /// How deep subagents may nest: 1 (default) lets the agent start
+    /// subagents that can't start their own; 0 turns the `task` tool off.
+    pub max_depth: Option<u32>,
+    /// Subagents running at once, across the whole session (default 4).
+    pub max_concurrent: Option<usize>,
 }
 
 /// `[mcp.servers.<name>]` tables.

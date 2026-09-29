@@ -62,7 +62,11 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
                 let _ = writeln!(stdout, "{line}");
             }
         }
-        match event {
+        // A subagent's events arrive wrapped; unwrap them, and indent
+        // their lines by how deeply they're nested.
+        let (inner, depth) = event.innermost();
+        let indent = "  ".repeat(depth);
+        match inner {
             RuntimeEvent::ToolCallProposed {
                 tool_call_id,
                 tool_name,
@@ -71,14 +75,14 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
                 ..
             } => {
                 if !json {
-                    eprintln!("[tool] {tool_name} {arguments}");
+                    eprintln!("{indent}[tool] {tool_name} {arguments}");
                 }
-                risks.insert(tool_call_id, risk);
+                risks.insert(*tool_call_id, *risk);
             }
             RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
                 let approve = match cli.approve {
                     ApprovePolicy::All => true,
-                    ApprovePolicy::Reads => risks.get(&tool_call_id) == Some(&RiskLevel::Low),
+                    ApprovePolicy::Reads => risks.get(tool_call_id) == Some(&RiskLevel::Low),
                     ApprovePolicy::None => false,
                 };
                 let decision = if approve {
@@ -86,18 +90,19 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
                 } else {
                     ApprovalDecision::DeniedOnce
                 };
-                session.decide(tool_call_id, decision);
+                session.decide(*tool_call_id, decision);
             }
             RuntimeEvent::ToolCallDenied {
                 tool_name, reason, ..
-            } if !json => eprintln!("[denied] {tool_name}: {reason}"),
+            } if !json => eprintln!("{indent}[denied] {tool_name}: {reason}"),
             RuntimeEvent::ProviderRetrying {
                 attempt, reason, ..
-            } if !json => eprintln!("[retry {attempt}] {reason}"),
+            } if !json => eprintln!("{indent}[retry {attempt}] {reason}"),
+            // Only the top-level turn's ending decides the exit status.
             RuntimeEvent::TurnCompleted {
                 stop_reason: reason,
                 ..
-            } => stop_reason = Some(reason),
+            } if depth == 0 => stop_reason = Some(reason.clone()),
             _ => {}
         }
     }

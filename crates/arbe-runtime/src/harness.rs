@@ -240,12 +240,14 @@ impl Harness {
         Ok(self.with_tools(agent))
     }
 
-    /// Every saved session, newest first.
+    /// Every saved top-level session, newest first. Subagents' sessions
+    /// (those with a `parent`) are left out; they're in the store.
     pub fn sessions(&self) -> Result<Vec<SessionMeta>, HarnessError> {
         let mut sessions = self
             .store
             .list_sessions()
             .map_err(|e| HarnessError::Internal(e.to_string()))?;
+        sessions.retain(|s| s.parent.is_none());
         sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(sessions)
     }

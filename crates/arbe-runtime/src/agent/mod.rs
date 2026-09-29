@@ -18,6 +18,7 @@ mod hooks;
 mod memory;
 mod nested;
 mod skills;
+mod subagent;
 mod tools;
 mod turn;
 
@@ -113,7 +114,9 @@ pub struct Agent {
     allowed_tools: Option<Vec<String>>,
     /// This session's MCP servers, if any are configured.
     mcp: Option<Arc<McpManager>>,
-    decisions: ToolDecisions,
+    /// Shared by a whole tree of subagents: answering here answers any of
+    /// them.
+    decisions: Arc<ToolDecisions>,
     /// Held for the duration of a turn (or a manual tool call); `try_lock`
     /// failing is what makes a concurrent submission `Busy`.
     turn_lock: tokio::sync::Mutex<()>,
@@ -146,6 +149,7 @@ struct Parts {
     allowed_tools: Option<Vec<String>>,
     startup_warnings: Vec<String>,
     redactor: Redactor,
+    decisions: Arc<ToolDecisions>,
 }
 
 /// Records in `meta.json` where the session works and that this process
@@ -319,7 +323,7 @@ impl Agent {
             mcp: None,
             startup_warnings: parts.startup_warnings,
             redactor: parts.redactor,
-            decisions: ToolDecisions::default(),
+            decisions: parts.decisions,
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
             state: Mutex::new(SessionState {
@@ -349,6 +353,7 @@ impl Agent {
         history: Vec<HistoryEntry>,
         next_turn_index: u64,
         summary: Option<Compaction>,
+        lineage: subagent::Lineage,
     ) -> Result<Self, ProviderError> {
         let provider = providers.build(
             &config.provider_name,
@@ -368,6 +373,21 @@ impl Agent {
                 config.project_dir.clone(),
             )),
         );
+        // Registered before the allow-set is applied, so a profile decides
+        // whether its agent may start subagents.
+        if lineage.depth < config.subagent_max_depth {
+            registry.register(
+                subagent::TASK_TOOL,
+                Arc::new(subagent::TaskTool::new(
+                    config,
+                    providers,
+                    store.clone(),
+                    events.clone(),
+                    &lineage,
+                    meta.id,
+                )),
+            );
+        }
         if let Some(allowed) = &config.tools {
             registry.retain(|name| tool_allowed(allowed, name));
         }
@@ -426,6 +446,7 @@ impl Agent {
             strategy: build_strategy(&config.memory_strategy),
             approval_ctx: ApprovalContext {
                 session_approval_covers_high_risk: config.session_approval_covers_high_risk,
+                session: lineage.session_approvals.clone(),
                 ..ApprovalContext::new(
                     config.policy_mode,
                     config.allowlist.clone(),
@@ -452,6 +473,7 @@ impl Agent {
             allowed_tools: config.tools.clone(),
             startup_warnings,
             redactor: redactor_for(config),
+            decisions: lineage.decisions,
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }
@@ -537,7 +559,51 @@ impl Agent {
         events.publish(RuntimeEvent::SessionStarted {
             session_id: meta.id,
         });
-        Self::assemble(config, providers, store, meta, events, Vec::new(), 0, None)
+        Self::assemble(
+            config,
+            providers,
+            store,
+            meta,
+            events,
+            Vec::new(),
+            0,
+            None,
+            subagent::Lineage::root(config),
+        )
+    }
+
+    /// A subagent's agent: a new session recording its parent, sharing the
+    /// parent tree's approvals and limits (see `subagent`).
+    fn create_child(
+        config: &RuntimeConfig,
+        store: SessionStore,
+        events: Arc<EventBus>,
+        providers: &ProviderRegistry,
+        lineage: subagent::Lineage,
+    ) -> Result<Self, ProviderError> {
+        let mut meta = store
+            .create_session(
+                config.profile.clone(),
+                config.provider_name.clone(),
+                config.model.clone(),
+            )
+            .map_err(|e| ProviderError::Internal(format!("failed to create session: {e}")))?;
+        meta.parent = lineage.parent;
+        mark_open(&mut meta, config, &store);
+        events.publish(RuntimeEvent::SessionStarted {
+            session_id: meta.id,
+        });
+        Self::assemble(
+            config,
+            providers,
+            store,
+            meta,
+            events,
+            Vec::new(),
+            0,
+            None,
+            lineage,
+        )
     }
 
     /// Resumes a session from disk (harness spec FR-1): recovers a turn the
@@ -598,6 +664,7 @@ impl Agent {
             history,
             next_turn_index,
             summary,
+            subagent::Lineage::root(config),
         )
     }
 

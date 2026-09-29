@@ -157,6 +157,8 @@ Requests are handled concurrently: while a `turn/send` is waiting for its turn t
 
 `seq` counts up per session; a jump means events were dropped because the client read too slowly. A turn's `turn/send` response is always sent **after** every event that turn produced.
 
+A [subagent](#subagents)'s events arrive wrapped: `{"type":"subagent_event","parent_tool_call_id","session_id","event":{…}}`, where `parent_tool_call_id` is the `task` call that started it and `event` is the subagent's own event (possibly wrapped again for a nested one). Answer its `tool_approval_requested` with `approval/decide` on the **parent** session's id. The same wrapping appears in `--print --output json`; in text mode, its tool lines are indented.
+
 **Approvals.** Nothing is approved on your behalf beyond your [approval settings](#approvals). When a `tool_approval_requested` event arrives, the turn waits until you call `approval/decide` with one of `approved_once`, `denied_once`, `approved_for_session` or `always_denied_for_session` (the chat dialog's `y`, `n`, `a`, `d`). The preceding `tool_call_proposed` event carries the tool name, arguments and risk.
 
 **Errors** use the standard JSON-RPC codes (`-32700` invalid JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal error) plus:
@@ -296,6 +298,8 @@ context_window = 32768
 | `approval.deny` | `[]` | [Rules](#permission-rules) for calls that are always refused, in every mode. |
 | `approval.session_approval_covers_high_risk` | `false` | Whether pressing `a` on a high-risk call approves the whole tool rather than just that exact call. |
 | `skills.mode` | `on_demand` | `on_demand` or `always`. See [Skills](#skills). |
+| `subagents.max_depth` | `1` | How deeply [subagents](#subagents) may nest: `1` lets the agent start subagents that can't start their own, `2` lets those start one more level, `0` removes the `task` tool. |
+| `subagents.max_concurrent` | `4` | Subagents running at once, across the whole session (at least 1). |
 | `hooks.timeout_ms` | `500` | Default time limit for hooks that don't set their own. |
 | `[[hooks.commands]]` | none | Shell commands run at points in a turn. See [Hooks](#hooks). |
 | `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
@@ -510,6 +514,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `grep` | `pattern` (regex), optional `path`, `case_insensitive` | low | Searches file contents (max 500 matches). |
 | `remember` | `note`, optional `scope` (`project` default, or `global`) | medium | Saves a one-line note to [memory](#memory), shown at the start of future sessions. |
 | `load_skill` | `name` | low | Reads a skill's full instructions (only present when [skills](#skills) load on demand). |
+| `task` | `description` (short label), `prompt`, optional `tools` (list) | low | Hands a self-contained job to a [subagent](#subagents) and returns its final answer. Not in the `general` profile. |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
 | `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
@@ -518,6 +523,17 @@ Every session gets these tools. When the model supports tool calling, it decides
 **Sandboxing.** Every file tool resolves its path inside the workdir and refuses anything outside it, including through `..`. `glob` and `grep` skip `.git`, `target`, `node_modules`, and `.venv`. `execute` is **not** sandboxed: a shell command can do anything your user account can. That is why it is marked high-risk and always asks you first.
 
 If a tool fails (bad arguments, file not found, unknown tool) or you deny it, that result goes back to the model so it can adjust or explain. The turn itself does not fail.
+
+### Subagents
+
+With the `task` tool, the agent can hand a self-contained job — "find where X is defined", "survey how Y is used across the code" — to a **subagent**: a separate agent that starts with a fresh context (it doesn't see your conversation, only the instructions the agent writes for it), works through the job with its own tool calls, and returns just its final answer. The details it read along the way don't fill up the main conversation.
+
+- **Same settings, maybe fewer tools.** A subagent uses the same provider, model, workdir and approval settings. The agent can limit it to some tools (for example only `read_file`, `grep`, `glob`, `list_dir` for read-only research). It never gets a tool the agent itself doesn't have. It doesn't connect your [MCP servers](#mcp-servers).
+- **You approve its tool calls**, in the same dialog, marked `(subagent)`. Its calls and results show in the transcript indented under the `task` call (`↳`). "Approve for session" answers apply to subagents too, in both directions.
+- **Several at once.** Several `task` calls in one reply run in parallel, at most 4 at a time.
+- **No subagents of subagents** by default; see `subagents.max_depth`.
+- **Esc** (cancel) stops subagents too.
+- **Saved** like any session, with a `parent` field in its `meta.json`. Subagent sessions don't appear in the session picker. Their token use is counted in their own `meta.json`, not the parent's.
 
 **Several calls at once.** The model can ask for several tools in one step. You're asked about them one at a time, in the order the model listed them. Once all are decided, the approved read-only tools (`read_file`, `list_dir`, `glob`, `grep`) run at the same time; `write_file`, `edit_file`, `execute`, and `todo_write` always run on their own, in order. Results go back to the model in its original order.
 
@@ -808,6 +824,7 @@ Rewritten atomically (temp file + rename) whenever the session changes.
 | `branch` | The git branch checked out in `workdir` when the session was last opened. Absent outside a repository or on a detached HEAD. |
 | `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress) or `awaiting_approval` (a tool call is waiting for your decision). Absent once closed. |
 | `pid` | The process that has the session open. Absent once closed; if it's present but that process no longer exists, the process ended without closing the session (for example it crashed or was killed). |
+| `parent` | Only for a [subagent](#subagents)'s session: the id of the session that started it. |
 
 Other programs can watch this file to show a session's state; every change is written atomically. Sessions saved before a field existed simply don't have it.
 
