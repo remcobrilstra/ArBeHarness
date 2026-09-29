@@ -257,6 +257,15 @@ pub trait ToolExecutor: Send + Sync {
         RiskLevel::Medium
     }
 
+    /// Whether a call needs a human's approval when the policy would ask
+    /// for one. `false` only for tools that act on nothing — that just talk
+    /// to the user or read the harness's own state (e.g. `ask_user`):
+    /// asking permission to ask a question helps no one. Such calls still
+    /// go through the gate, so deny rules and dry-run mode still apply.
+    fn requires_approval(&self) -> bool {
+        true
+    }
+
     /// What a call acts on, for permission rules like `tool(pattern)`: a
     /// path for file tools, the command line for `execute`. `None` (the
     /// default) means rules can only match this tool by name.

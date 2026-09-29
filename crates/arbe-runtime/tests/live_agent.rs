@@ -169,6 +169,9 @@ struct Trace {
     calls: Vec<(String, String)>,
     denied: Vec<String>,
     thinking_chars: usize,
+    /// Questions the model asked (`ask_user`), each answered with its first
+    /// option (or "yes").
+    questions: Vec<String>,
     stop: Option<StopReason>,
     compactions: usize,
     /// `(tool, output)` for every executed call.
@@ -236,6 +239,17 @@ impl Run {
                                 ApprovalDecision::DeniedOnce
                             },
                         );
+                    }
+                    RuntimeEvent::UserQuestionAsked {
+                        question_id,
+                        question,
+                        options,
+                        ..
+                    } => {
+                        let reply = options.first().cloned().unwrap_or_else(|| "yes".into());
+                        eprintln!("    {prefix}question: {question} -> {reply}");
+                        t.lock().unwrap().questions.push(question);
+                        a.answer_question(question_id, reply);
                     }
                     RuntimeEvent::ToolCallDenied { tool_name, .. } => {
                         t.lock().unwrap().denied.push(tool_name);
@@ -657,4 +671,18 @@ async fn reads_an_image_file_and_sees_it() {
         contains_ci(&answer, "red") || contains_ci(&answer, "crimson"),
         "{answer}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn asks_the_user_and_follows_the_answer() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    let run = bench.start(Approve::All);
+    let (_, trace) = run
+        .ask("I want a hello-world program in this folder, but I haven't decided on the language. Ask me which one (offer exactly two options: Python first, then Go), then write it as hello.py or hello.go accordingly.")
+        .await;
+    assert_eq!(trace.questions.len(), 1, "{trace:?}");
+    // The watcher answers with the first option.
+    assert!(bench.project().join("hello.py").exists(), "{trace:?}");
+    assert!(!bench.project().join("hello.go").exists());
 }

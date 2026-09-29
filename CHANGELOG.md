@@ -25,6 +25,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - **Subagents**: a `task` tool that hands a job to a child agent with a fresh context; its approvals come to you as usual.
 - **Images**: `read_file` returns PNG/JPEG/GIF/WebP files as images to models that can see them.
 - Persistent **memory** (`remember` tool, global and per-project notes).
+- **`ask_user`**: the model can ask you a question (with options) mid-turn and continue with your answer; in the TUI, via `--headless` (`question/answer`), or auto-answered in `--print`.
 - Nested instruction files: an `AGENTS.md`/`agent.md`/`CLAUDE.md` in a subfolder applies once the agent works there.
 
 ### Long sessions

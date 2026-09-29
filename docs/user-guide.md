@@ -122,6 +122,8 @@ The answer goes to stdout. Tool activity goes to stderr, as `[tool] name {argume
 
 Calls your [approval settings](#approvals) already allow or deny are unaffected: `--approve` only answers what would otherwise be asked.
 
+**Questions.** If the model asks you something (the `ask_user` tool), it's told no one is available and to continue on its best judgment, stating its assumption; the question is shown on stderr as `[question] …`.
+
 **Output.** With `--output json`, stdout gets one JSON object per line: every event of the turn as it happens (the same events the chat screen shows, each with a `type`), then a final result:
 
 ```json
@@ -147,6 +149,7 @@ Requests are handled concurrently: while a `turn/send` is waiting for its turn t
 | `turn/send` | `session_id`, `message` | `{"answer", "stop_reason"}` once the turn ends |
 | `turn/cancel` | `session_id` | `{"cancelled": true/false}` (whether a turn was running) |
 | `approval/decide` | `session_id`, `tool_call_id`, `decision` | `{"accepted": true/false}` (false if nothing was waiting on that call) |
+| `question/answer` | `session_id`, `question_id`, `answer` | `{"accepted": true/false}` — answers a `user_question_asked` event (the turn waits until you do) |
 | `shutdown` | none | `{}`, then the process exits |
 
 **Events.** Every event of an open session is sent as a notification — the same events the chat screen and `--print --output json` show:
@@ -316,7 +319,7 @@ Two profiles are built in:
 | Profile | Tools | System prompt |
 |---|---|---|
 | `coding` (default) | all builtin tools | A software-engineering agent working in the workdir. |
-| `general` | only `todo_write` and `remember` (no file access, no shell) | A general-purpose assistant. |
+| `general` | only `todo_write`, `remember` and `ask_user` (no file access, no shell) | A general-purpose assistant. |
 
 Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine `coding` or `general` this way.
 
@@ -490,6 +493,18 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 
 If you don't answer within **30 seconds**, the call is denied automatically. The dialog shows a countdown.
 
+### Questions from the agent
+
+When the model asks you something (the `ask_user` tool), the question appears in the transcript (`❓ …`) and in a dialog, and the turn waits for you — there's no timeout.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Highlight an option |
+| `Enter` | Send the text you typed in the input bar — or, if you typed nothing, the highlighted option |
+| `Esc` | Cancel the whole turn |
+
+Questions from a [subagent](#subagents) are marked `(subagent)` and answered the same way.
+
 ### Session picker
 
 | Key | Action |
@@ -543,6 +558,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `remember` | `note`, optional `scope` (`project` default, or `global`) | medium | Saves a one-line note to [memory](#memory), shown at the start of future sessions. |
 | `load_skill` | `name` | low | Reads a skill's full instructions (only present when [skills](#skills) load on demand). |
 | `task` | `description` (short label), `prompt`, optional `tools` (list) | low | Hands a self-contained job to a [subagent](#subagents) and returns its final answer. Not in the `general` profile. |
+| `ask_user` | `question`, optional `options` (up to 8), optional `allow_free_text` (default true) | low | Asks you a question and waits for the answer — for decisions only you can make. Never needs approval (it acts on nothing). See [Questions from the agent](#questions-from-the-agent). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
 | `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
@@ -850,7 +866,7 @@ Rewritten atomically (temp file + rename) whenever the session changes.
 | `usage` | Token totals for the session. |
 | `workdir` | Absolute path of the project directory the session works in (updated when it's resumed). |
 | `branch` | The git branch checked out in `workdir` when the session was last opened. Absent outside a repository or on a detached HEAD. |
-| `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress) or `awaiting_approval` (a tool call is waiting for your decision). Absent once closed. |
+| `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress), `awaiting_approval` (a tool call is waiting for your decision) or `awaiting_answer` (the model asked you a question). Absent once closed. |
 | `pid` | The process that has the session open. Absent once closed; if it's present but that process no longer exists, the process ended without closing the session (for example it crashed or was killed). |
 | `parent` | Only for a [subagent](#subagents)'s session: the id of the session that started it. |
 

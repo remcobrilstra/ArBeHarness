@@ -82,6 +82,7 @@ pub fn authorize(
     ) {
         (PolicyOutcome::AutoApprove, _) => true,
         (PolicyOutcome::AutoDeny, _) => false,
+        (PolicyOutcome::RequiresPrompt, _) if !executor.requires_approval() => true,
         (PolicyOutcome::RequiresPrompt, None) => {
             return Ok(Authorization::NeedsHuman(invocation));
         }
@@ -167,6 +168,44 @@ mod tests {
         let mut r = ToolRegistry::new();
         r.register("echo", Arc::new(EchoExecutor));
         r
+    }
+
+    /// Like `EchoExecutor`, but acts on nothing, so never asks.
+    struct QuietExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for QuietExecutor {
+        async fn execute(
+            &self,
+            invocation: ToolInvocation,
+            ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            EchoExecutor.execute(invocation, ctx).await
+        }
+        fn requires_approval(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn tools_that_act_on_nothing_skip_the_prompt_but_not_deny_rules_or_dry_run() {
+        let policy = crate::StandardApprovalPolicy;
+        let mut r = ToolRegistry::new();
+        r.register("echo", Arc::new(QuietExecutor));
+        let approved = |c: &ApprovalContext| {
+            matches!(
+                authorize(&r, &policy, c, invocation(), None).unwrap(),
+                Authorization::Approved(_)
+            )
+        };
+        assert!(approved(&ctx(ApprovalPolicyMode::AlwaysPrompt)));
+        assert!(!approved(&ctx(ApprovalPolicyMode::DryRunOnly)));
+        let denied = ApprovalContext::new(
+            ApprovalPolicyMode::AlwaysPrompt,
+            vec![],
+            vec!["echo".into()],
+        );
+        assert!(!approved(&denied));
     }
 
     #[tokio::test]

@@ -400,6 +400,14 @@ async fn run_batch(
     if batch.is_empty() {
         return cancel.is_cancelled();
     }
+    // `ask_user` never shares a batch (it isn't parallel-safe), so this
+    // marks exactly the time spent waiting for the user's answer.
+    let asking = batch
+        .iter()
+        .any(|(_, a, _)| a.invocation().tool_name == super::ask::ASK_USER_TOOL);
+    if asking {
+        agent.set_activity(SessionActivity::AwaitingAnswer);
+    }
     let runs = batch.into_iter().map(|(index, authorized, id)| async move {
         let tool_name = authorized.invocation().tool_name.clone();
         let events = agent.events.clone();
@@ -465,6 +473,9 @@ async fn run_batch(
             is_error,
             attachments,
         });
+    }
+    if asking {
+        agent.set_activity(SessionActivity::Running);
     }
     cancelled || cancel.is_cancelled()
 }

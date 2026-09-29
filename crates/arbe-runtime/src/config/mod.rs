@@ -118,7 +118,7 @@ const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
 
 /// Tools the built-in `general` profile allows: nothing that touches the
 /// file system or runs commands.
-const GENERAL_PROFILE_TOOLS: &[&str] = &["todo_write", "remember"];
+const GENERAL_PROFILE_TOOLS: &[&str] = &["todo_write", "remember", "ask_user"];
 
 /// Settings that are only decided once every layer has been applied,
 /// because their defaults depend on other settings (e.g. the provider).

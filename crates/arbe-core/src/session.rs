@@ -27,6 +27,8 @@ pub enum SessionActivity {
     Running,
     /// A turn is paused on a tool-approval decision.
     AwaitingApproval,
+    /// A turn is paused on a question the model asked the user.
+    AwaitingAnswer,
 }
 
 /// Session-level metadata persisted as `~/.arbe/sessions/<session-id>/meta.json`.

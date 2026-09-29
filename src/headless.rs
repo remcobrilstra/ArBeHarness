@@ -3,7 +3,8 @@
 //!
 //! Requests (client → harness): `initialize`, `session/new`,
 //! `session/resume`, `session/list`, `session/set_title`, `session/close`,
-//! `turn/send`, `turn/cancel`, `approval/decide`, `shutdown`. Every event
+//! `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
+//! `shutdown`. Every event
 //! of an open session arrives as an `event` notification
 //! (`{"session_id", "seq", "event"}`). Requests run concurrently: while
 //! `turn/send` waits for its turn, the client can answer approvals or
@@ -259,6 +260,13 @@ struct SendParams {
 }
 
 #[derive(Deserialize)]
+struct AnswerParams {
+    session_id: SessionId,
+    question_id: ToolCallId,
+    answer: String,
+}
+
+#[derive(Deserialize)]
 struct DecideParams {
     session_id: SessionId,
     tool_call_id: ToolCallId,
@@ -308,6 +316,11 @@ impl Server {
             "approval/decide" => params::<DecideParams>(raw).and_then(|p| {
                 let accepted =
                     self.with_session(p.session_id, |s| Ok(s.decide(p.tool_call_id, p.decision)))?;
+                Ok(json!({"accepted": accepted}))
+            }),
+            "question/answer" => params::<AnswerParams>(raw).and_then(|p| {
+                let accepted =
+                    self.with_session(p.session_id, |s| Ok(s.answer(p.question_id, p.answer)))?;
                 Ok(json!({"accepted": accepted}))
             }),
             other => Err(RpcError::new(

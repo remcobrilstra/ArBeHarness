@@ -30,7 +30,8 @@ use ratatui::backend::CrosstermBackend;
 use tokio::runtime::Handle;
 
 use app::{
-    APPROVAL_TIMEOUT_TICKS, App, PendingApproval, ProfilePicker, ProposedToolCall, SessionPicker,
+    APPROVAL_TIMEOUT_TICKS, App, PendingApproval, PendingQuestion, ProfilePicker, ProposedToolCall,
+    SessionPicker,
 };
 
 /// Result of a spawned agent call, delivered back to the render loop so it
@@ -264,6 +265,7 @@ fn drain_runtime_events(
                 app.working = false;
                 app.activity = None;
                 app.pending_approval = None;
+                app.pending_question = None;
                 app.notice = Some("turn cancelled".to_string());
             }
             Ok(RuntimeEvent::RuntimeError { reason, .. }) => {
@@ -298,6 +300,7 @@ fn drain_runtime_events(
             Ok(RuntimeEvent::ToolApprovalRequested { tool_call_id, .. }) => {
                 request_approval(app, tool_call_id);
             }
+            Ok(event @ RuntimeEvent::UserQuestionAsked { .. }) => show_question(app, &event, ""),
             Ok(RuntimeEvent::ToolExecuted {
                 tool_name, result, ..
             }) => {
@@ -330,6 +333,30 @@ fn drain_runtime_events(
             }
         }
     }
+}
+
+/// Shows a question the model asked (`ask_user`) in the transcript and
+/// opens the question dialog.
+fn show_question(app: &mut App, event: &RuntimeEvent, from: &str) {
+    let RuntimeEvent::UserQuestionAsked {
+        question_id,
+        question,
+        options,
+        allow_free_text,
+        ..
+    } = event
+    else {
+        return;
+    };
+    app.activity = Some("waiting for your answer…".to_string());
+    app.push_line(Role::Assistant, format!("{from}❓ {question}"));
+    app.pending_question = Some(PendingQuestion {
+        id: *question_id,
+        question: question.clone(),
+        options: options.clone(),
+        allow_free_text: *allow_free_text,
+        selected: 0,
+    });
 }
 
 /// Opens the approval dialog for a proposed call (the agent's own or a
@@ -381,6 +408,7 @@ fn apply_subagent_event(app: &mut App, event: &RuntimeEvent) {
         RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
             request_approval(app, *tool_call_id);
         }
+        RuntimeEvent::UserQuestionAsked { .. } => show_question(app, inner, "(subagent) "),
         RuntimeEvent::ToolExecuted {
             tool_name, result, ..
         } => {
@@ -534,6 +562,43 @@ fn handle_key(
             resolve_approval(app, agent, approval.id, decision);
         }
         return;
+    }
+
+    if let Some(question) = app.pending_question.as_mut() {
+        match key.code {
+            KeyCode::Up if !question.options.is_empty() => {
+                question.move_up();
+                return;
+            }
+            KeyCode::Down if !question.options.is_empty() => {
+                question.move_down();
+                return;
+            }
+            KeyCode::Esc => {
+                app.pending_question = None;
+                if agent.cancel_turn() {
+                    app.activity = Some("cancelling…".to_string());
+                }
+                return;
+            }
+            KeyCode::Enter
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                if let Some(answer) = question.answer(&app.input) {
+                    let id = question.id;
+                    app.pending_question = None;
+                    app.take_input();
+                    app.push_line(Role::User, answer.clone());
+                    app.activity = Some("continuing…".to_string());
+                    agent.answer_question(id, answer);
+                }
+                return;
+            }
+            // Anything else edits the input bar (a free-text answer).
+            _ => {}
+        }
     }
 
     if app.profile_picker.is_some() {

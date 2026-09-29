@@ -112,6 +112,18 @@ pub enum RuntimeEvent {
         server: String,
         reason: String,
     },
+    /// The model asked the user a question (the `ask_user` tool); the turn
+    /// waits until it's answered (`answer_question`) or cancelled.
+    /// `question_id` is the tool call's id. With `options`, the answer is
+    /// usually one of them; `allow_free_text` says whether it may be
+    /// anything else.
+    UserQuestionAsked {
+        turn_id: TurnId,
+        question_id: ToolCallId,
+        question: String,
+        options: Vec<String>,
+        allow_free_text: bool,
+    },
     /// An event from a subagent started by the `task` tool call
     /// `parent_tool_call_id`, running as session `session_id`. Nested
     /// subagents nest these. Approval requests inside are answered like

@@ -34,6 +34,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(approval) = &app.pending_approval {
         draw_approval_modal(frame, area, approval);
+    } else if let Some(question) = &app.pending_question {
+        draw_question_modal(frame, area, question);
     } else if let Some(picker) = &app.session_picker {
         draw_session_picker(frame, area, picker);
     } else if let Some(picker) = &app.profile_picker {
@@ -219,6 +221,14 @@ fn cursor_row_col(app: &App) -> (u16, u16) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.pending_approval.is_some() {
         "approval pending — see modal"
+    } else if app
+        .pending_question
+        .as_ref()
+        .is_some_and(|q| q.options.is_empty())
+    {
+        "question — type your answer, Enter to send, Esc to cancel the turn"
+    } else if app.pending_question.is_some() {
+        "question — \u{2191}/\u{2193} pick, Enter to send (or type your own answer), Esc to cancel the turn"
     } else if app.profile_picker.is_some() {
         "profile picker — \u{2191}/\u{2193} choose, Enter switch, Esc cancel"
     } else if app.session_picker.is_some() {
@@ -315,6 +325,60 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
                 .title("Tool Approval Required")
                 .style(Style::default().fg(Color::Yellow)),
         );
+    frame.render_widget(paragraph, popup);
+}
+
+/// The model's question, with its options (the highlighted one is sent
+/// on Enter unless an answer was typed). Drawn in the upper part of the
+/// screen so the input bar stays visible for typed answers.
+fn draw_question_modal(frame: &mut Frame, area: Rect, question: &crate::app::PendingQuestion) {
+    let width = area.width.saturating_sub(10).clamp(40, 100);
+    let mut lines: Vec<Line> = question
+        .question
+        .lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect();
+    if !question.options.is_empty() {
+        lines.push(Line::default());
+        for (i, option) in question.options.iter().enumerate() {
+            let style = if i == question.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" {}. {option} ", i + 1),
+                style,
+            )));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        if question.options.is_empty() {
+            "Type your answer below and press Enter."
+        } else if question.allow_free_text {
+            "↑/↓ + Enter to pick — or type your own answer below."
+        } else {
+            "↑/↓ + Enter to pick."
+        },
+        Style::default().fg(Color::DarkGray),
+    )));
+    let height = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(6))
+        .max(5);
+    let popup = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: 3.min(area.height.saturating_sub(height)),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("The agent asks")
+            .style(Style::default().fg(Color::Cyan)),
+    );
     frame.render_widget(paragraph, popup);
 }
 

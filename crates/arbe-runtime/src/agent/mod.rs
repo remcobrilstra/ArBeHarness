@@ -13,6 +13,7 @@
 //! hook payloads; `approvals` is the decision mailbox.
 
 mod approvals;
+mod ask;
 mod compaction;
 mod hooks;
 mod memory;
@@ -117,6 +118,8 @@ pub struct Agent {
     /// Shared by a whole tree of subagents: answering here answers any of
     /// them.
     decisions: Arc<ToolDecisions>,
+    /// Answers to `ask_user` questions; shared like `decisions`.
+    questions: Arc<ask::QuestionMailbox>,
     /// Held for the duration of a turn (or a manual tool call); `try_lock`
     /// failing is what makes a concurrent submission `Busy`.
     turn_lock: tokio::sync::Mutex<()>,
@@ -150,6 +153,7 @@ struct Parts {
     startup_warnings: Vec<String>,
     redactor: Redactor,
     decisions: Arc<ToolDecisions>,
+    questions: Arc<ask::QuestionMailbox>,
 }
 
 /// Records in `meta.json` where the session works, which profile, provider
@@ -330,6 +334,7 @@ impl Agent {
             startup_warnings: parts.startup_warnings,
             redactor: parts.redactor,
             decisions: parts.decisions,
+            questions: parts.questions,
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
             state: Mutex::new(SessionState {
@@ -377,6 +382,13 @@ impl Agent {
             Arc::new(memory::RememberTool::new(
                 config.home.clone(),
                 config.project_dir.clone(),
+            )),
+        );
+        registry.register(
+            ask::ASK_USER_TOOL,
+            Arc::new(ask::AskUserTool::new(
+                lineage.questions.clone(),
+                events.clone(),
             )),
         );
         // Registered before the allow-set is applied, so a profile decides
@@ -480,6 +492,7 @@ impl Agent {
             startup_warnings,
             redactor: redactor_for(config),
             decisions: lineage.decisions,
+            questions: lineage.questions,
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }
@@ -787,6 +800,13 @@ impl Agent {
             }
             None => false,
         }
+    }
+
+    /// Answers a `UserQuestionAsked` question (the `ask_user` tool) — the
+    /// agent's own or a subagent's. Returns `false` if nothing is waiting
+    /// on `id` (already answered, or the turn was cancelled).
+    pub fn answer_question(&self, id: ToolCallId, answer: impl Into<String>) -> bool {
+        self.questions.answer(id, answer.into())
     }
 
     /// Answers a `ToolApprovalRequested` prompt. Returns `false` if nothing

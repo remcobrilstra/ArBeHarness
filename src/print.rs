@@ -14,6 +14,9 @@ use serde_json::json;
 
 use crate::cli::{ApprovePolicy, Cli, OutputFormat};
 
+/// What `ask_user` gets back in `--print` mode, where nobody can answer.
+const NO_USER_ANSWER: &str = "No user is available to answer: this is a non-interactive run. Continue with your best judgment and state the assumption you made.";
+
 const EXIT_OK: i32 = 0;
 const EXIT_FAILED: i32 = 1;
 const EXIT_INCOMPLETE: i32 = 3;
@@ -91,6 +94,18 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
                     ApprovalDecision::DeniedOnce
                 };
                 session.decide(*tool_call_id, decision);
+            }
+            RuntimeEvent::UserQuestionAsked {
+                question_id,
+                question,
+                ..
+            } => {
+                if !json {
+                    eprintln!(
+                        "{indent}[question] {question} (no user to answer; the model is told to assume)"
+                    );
+                }
+                session.answer(*question_id, NO_USER_ANSWER);
             }
             RuntimeEvent::ToolCallDenied {
                 tool_name, reason, ..

@@ -391,6 +391,12 @@ impl Session {
         self.agent.supply_tool_decision(id, decision)
     }
 
+    /// Answers a `UserQuestionAsked` event. Returns `false` if nothing is
+    /// waiting on `id`.
+    pub fn answer(&self, id: ToolCallId, answer: impl Into<String>) -> bool {
+        self.agent.answer_question(id, answer)
+    }
+
     /// Cancels the running turn, keeping what it produced so far. Returns
     /// whether a turn was running.
     pub fn cancel(&self) -> bool {

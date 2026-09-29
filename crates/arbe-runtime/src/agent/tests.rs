@@ -275,6 +275,7 @@ fn test_parts(
         startup_warnings: Vec::new(),
         redactor: crate::redact::Redactor::default(),
         decisions: Default::default(),
+        questions: Default::default(),
     }
 }
 
@@ -1988,5 +1989,68 @@ async fn cancelling_the_parent_cancels_a_waiting_subagent() {
     assert_eq!(
         tree.store.load_meta(child_session).unwrap().status,
         SessionStatus::Closed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ask_user
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ask_user_waits_for_the_answer_without_asking_for_approval() {
+    let provider = ScriptedProvider::new(
+        vec![tool_calls(&[(
+            "q1",
+            "ask_user",
+            json!({"question": "Which database?", "options": ["sqlite", "postgres"]}),
+        )])],
+        answer("going with the user's choice"),
+    );
+    let requests = provider.requests.clone();
+    // Default policy: AlwaysPrompt — yet no approval is asked for.
+    let (t, mut rx) = test_agent_with(provider, |_| {});
+    t.agent.register_tool(
+        "ask_user",
+        Arc::new(ask::AskUserTool::new(
+            t.agent.questions.clone(),
+            t.agent.events.clone(),
+        )),
+    );
+
+    let agent = t.agent.clone();
+    let turn = tokio::spawn(async move { agent.submit_message("set it up".into()).await });
+    let (id, options) = wait_for(&mut rx, |e| match e {
+        RuntimeEvent::ToolApprovalRequested { .. } => panic!("ask_user must not need approval"),
+        RuntimeEvent::UserQuestionAsked {
+            question_id,
+            options,
+            ..
+        } => Some((question_id, options)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(options, ["sqlite", "postgres"]);
+    assert_eq!(
+        t.store.load_meta(t.session_id).unwrap().activity,
+        Some(arbe_core::SessionActivity::AwaitingAnswer)
+    );
+    assert!(t.agent.answer_question(id, "postgres"));
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("turn never finished")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, "going with the user's choice");
+    // The model got the answer as the tool result.
+    let last = requests.lock().unwrap().last().unwrap().messages.clone();
+    assert!(
+        serde_json::to_string(&last.last().unwrap().content)
+            .unwrap()
+            .contains("postgres")
+    );
+    assert_eq!(
+        t.store.load_meta(t.session_id).unwrap().activity,
+        Some(arbe_core::SessionActivity::Idle)
     );
 }

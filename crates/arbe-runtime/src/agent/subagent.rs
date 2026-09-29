@@ -42,6 +42,7 @@ pub(super) struct Lineage {
     /// 0 for a top-level agent.
     pub depth: u32,
     pub decisions: Arc<ToolDecisions>,
+    pub questions: Arc<super::ask::QuestionMailbox>,
     pub session_approvals: SessionApprovals,
     /// Permits for subagents running at once.
     pub slots: Arc<Semaphore>,
@@ -55,6 +56,7 @@ impl Lineage {
         Self {
             depth: 0,
             decisions: Arc::default(),
+            questions: Arc::default(),
             session_approvals: SessionApprovals::new(),
             slots: Arc::new(Semaphore::new(config.subagent_max_concurrent)),
             parent: None,

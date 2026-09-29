@@ -70,6 +70,40 @@ impl SessionPicker {
     }
 }
 
+/// A question the model asked (`ask_user`), waiting for the user's answer.
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub id: ToolCallId,
+    pub question: String,
+    pub options: Vec<String>,
+    pub allow_free_text: bool,
+    /// The highlighted option.
+    pub selected: usize,
+}
+
+impl PendingQuestion {
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.options.len() {
+            self.selected += 1;
+        }
+    }
+
+    /// The answer to send for what the user did: text typed in the input
+    /// bar (if free text is allowed), else the highlighted option. `None`
+    /// when there's nothing to send yet.
+    pub fn answer(&self, typed: &str) -> Option<String> {
+        let typed = typed.trim();
+        if !typed.is_empty() && self.allow_free_text {
+            return Some(typed.to_string());
+        }
+        self.options.get(self.selected).cloned()
+    }
+}
+
 /// Profile-picker overlay state: switch the session to another configured
 /// profile (and with it, usually, another provider/model).
 #[derive(Debug, Clone)]
@@ -164,6 +198,7 @@ pub struct App {
     /// never needs to be reset.
     pub spinner_frame: usize,
     pub pending_approval: Option<PendingApproval>,
+    pub pending_question: Option<PendingQuestion>,
     pub proposed_tool_calls: std::collections::HashMap<ToolCallId, ProposedToolCall>,
     pub session_picker: Option<SessionPicker>,
     pub profile_picker: Option<ProfilePicker>,
@@ -215,6 +250,7 @@ impl App {
             activity: None,
             spinner_frame: 0,
             pending_approval: None,
+            pending_question: None,
             proposed_tool_calls: std::collections::HashMap::new(),
             session_picker: None,
             profile_picker: None,
@@ -550,6 +586,31 @@ mod tests {
         assert_eq!(taken, "élo\n!");
         assert_eq!(a.input, "");
         assert_eq!(a.input_cursor, 0);
+    }
+
+    #[test]
+    fn a_question_is_answered_by_typed_text_or_the_highlighted_option() {
+        let mut q = PendingQuestion {
+            id: ToolCallId::new(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+            allow_free_text: true,
+            selected: 0,
+        };
+        assert_eq!(q.answer("  "), Some("a".into()));
+        q.move_down();
+        q.move_down();
+        assert_eq!(q.answer(""), Some("b".into()));
+        assert_eq!(q.answer(" my own "), Some("my own".into()));
+        q.allow_free_text = false;
+        assert_eq!(q.answer("my own"), Some("b".into()));
+        let open = PendingQuestion {
+            options: vec![],
+            allow_free_text: true,
+            ..q
+        };
+        assert_eq!(open.answer(""), None);
+        assert_eq!(open.answer("x"), Some("x".into()));
     }
 
     #[test]
