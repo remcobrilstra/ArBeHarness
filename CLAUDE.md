@@ -9,6 +9,7 @@ Full specs live in `/docs` — read them before making architectural decisions, 
 - `docs/v1-tui-spec.md` — TUI requirements, event contract, keybindings
 - `docs/user-guide.md` — the end-user guide (keep in sync with behavior, see Working conventions)
 - `docs/v2-implementation-plan.md` — **the active plan.** Phased v2 roadmap (P0–P7) with a status table and per-task checkboxes; read this first to know what's in progress and what's next, and keep it updated as work lands
+- `docs/v2-status.md` — **honest v2 acceptance checklist**: every exit criterion with its evidence, and what's still open. Update it when a criterion's status changes; never mark something met that wasn't verified
 - `docs/v1-status.md` — frozen v1 acceptance-criteria checklist (historical; superseded by the v2 plan's status table)
 - `docs/user-guide.md` — **end-user documentation** (CLI args, env vars, providers, keybindings, chat commands, tools/approvals, instruction & skill files, sessions, `~/.arbe/` layout, file formats, logs). See the doc-maintenance rule under "Working conventions".
 
