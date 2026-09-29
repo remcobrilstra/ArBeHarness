@@ -310,7 +310,7 @@ mod tests {
         } else {
             "sleep 30"
         };
-        let ctx = ToolContext::default();
+        let ctx = ToolContext::for_testing();
         let cancel = ctx.cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;

@@ -191,12 +191,15 @@ mod tests {
         let tool = RememberTool::new(home.path().into(), project.path().into());
         assert!(load_notes(home.path(), project.path()).is_empty());
 
-        tool.execute(call(json!({"note": "uses tabs"})), &ToolContext::default())
-            .await
-            .unwrap();
+        tool.execute(
+            call(json!({"note": "uses tabs"})),
+            &ToolContext::for_testing(),
+        )
+        .await
+        .unwrap();
         tool.execute(
             call(json!({"note": "prefers short answers\nreally", "scope": "global"})),
-            &ToolContext::default(),
+            &ToolContext::for_testing(),
         )
         .await
         .unwrap();
@@ -218,7 +221,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let tool = RememberTool::new(home.path().into(), home.path().into());
         assert!(
-            tool.execute(call(json!({"note": "  "})), &ToolContext::default())
+            tool.execute(call(json!({"note": "  "})), &ToolContext::for_testing())
                 .await
                 .is_err()
         );

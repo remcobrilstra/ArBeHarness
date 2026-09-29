@@ -4,6 +4,7 @@ use arbe_core::{ApprovalDecision, ToolError, ToolInvocation, ToolResult};
 
 use crate::{
     ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolContext, ToolExecutor, ToolRegistry,
+    ToolRun,
 };
 
 /// What happened to a gated invocation. Deliberately distinct from
@@ -40,8 +41,11 @@ impl Authorized {
         self.executor.parallel_safe()
     }
 
-    pub async fn execute(self, tool_ctx: &ToolContext) -> Result<ToolResult, ToolError> {
-        self.executor.execute(self.invocation, tool_ctx).await
+    /// Runs the approved call. This is where the [`ToolContext`] every
+    /// executor requires is issued — the only place it can be.
+    pub async fn execute(self, run: ToolRun) -> Result<ToolResult, ToolError> {
+        let tool_ctx = ToolContext::issue(run);
+        self.executor.execute(self.invocation, &tool_ctx).await
     }
 }
 
@@ -109,13 +113,12 @@ pub async fn execute_gated(
     ctx: &ApprovalContext,
     invocation: ToolInvocation,
     human_decision: Option<ApprovalDecision>,
-    tool_ctx: &ToolContext,
+    run: ToolRun,
 ) -> Result<GatedOutcome, ToolError> {
     match authorize(registry, policy, ctx, invocation, human_decision)? {
-        Authorization::Approved(authorized) => authorized
-            .execute(tool_ctx)
-            .await
-            .map(GatedOutcome::Executed),
+        Authorization::Approved(authorized) => {
+            authorized.execute(run).await.map(GatedOutcome::Executed)
+        }
         Authorization::Denied(_) => Ok(GatedOutcome::Denied),
         Authorization::NeedsHuman(_) => Ok(GatedOutcome::PendingApproval),
     }
@@ -185,7 +188,7 @@ mod tests {
             panic!("expected Approved");
         };
         assert!(approved.parallel_safe());
-        let result = approved.execute(&ToolContext::default()).await.unwrap();
+        let result = approved.execute(ToolRun::default()).await.unwrap();
         assert_eq!(result.output, json!({"a": 1}));
     }
 
@@ -217,7 +220,7 @@ mod tests {
             &c,
             invocation(),
             Some(ApprovalDecision::ApprovedForSession),
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -229,7 +232,7 @@ mod tests {
             &c,
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -246,7 +249,7 @@ mod tests {
             &c,
             invocation(),
             Some(ApprovalDecision::AlwaysDeniedForSession),
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -258,7 +261,7 @@ mod tests {
             &c,
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -275,7 +278,7 @@ mod tests {
             &c,
             invocation(),
             Some(ApprovalDecision::ApprovedOnce),
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -285,7 +288,7 @@ mod tests {
             &c,
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -302,7 +305,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap_err();
@@ -318,7 +321,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -334,7 +337,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             Some(ApprovalDecision::ApprovedOnce),
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -350,7 +353,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::AlwaysPrompt),
             invocation(),
             Some(ApprovalDecision::DeniedOnce),
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();
@@ -366,7 +369,7 @@ mod tests {
             &ctx(ApprovalPolicyMode::DryRunOnly),
             invocation(),
             None,
-            &ToolContext::default(),
+            ToolRun::default(),
         )
         .await
         .unwrap();

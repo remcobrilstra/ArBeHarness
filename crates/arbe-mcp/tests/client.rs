@@ -253,21 +253,27 @@ async fn the_manager_registers_tools_reports_failures_and_refreshes_changed_list
     let result = echo
         .execute(
             invocation("fx__echo", json!({"text": "via registry"})),
-            &ToolContext::default(),
+            &ToolContext::for_testing(),
         )
         .await
         .unwrap();
     assert_eq!(result.output, json!("via registry"));
     let failed = sink
         .executor("fx", "fx__fail")
-        .execute(invocation("fx__fail", json!({})), &ToolContext::default())
+        .execute(
+            invocation("fx__fail", json!({})),
+            &ToolContext::for_testing(),
+        )
         .await
         .unwrap();
     assert!(failed.is_error);
 
     // The server announces a changed tool list; a refresh picks it up.
     sink.executor("fx", "fx__toggle")
-        .execute(invocation("fx__toggle", json!({})), &ToolContext::default())
+        .execute(
+            invocation("fx__toggle", json!({})),
+            &ToolContext::for_testing(),
+        )
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -280,7 +286,7 @@ async fn cancelling_a_tool_context_cancels_the_mcp_call() {
     let manager = McpManager::new(vec![fixture("fx", Duration::from_secs(10))], None);
     let sink = RecordingSink::default();
     manager.connect_all(&sink, &|_| {}).await;
-    let ctx = ToolContext::default();
+    let ctx = ToolContext::for_testing();
     let cancel = ctx.cancel.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;

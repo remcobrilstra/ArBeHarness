@@ -155,22 +155,69 @@ fn simplify_schema(value: &mut Value) {
 /// long command's latest output line), for UIs to show while it runs.
 pub type ProgressSink = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Everything a tool execution needs besides its invocation.
+/// What the caller of an approved tool call supplies for running it (see
+/// [`Authorized::execute`]).
 #[derive(Clone, Default)]
+pub struct ToolRun {
+    pub cancel: CancellationToken,
+    pub progress: Option<ProgressSink>,
+}
+
+/// Everything a tool execution needs besides its invocation — and proof
+/// that the call passed the approval gate: only the gate can create one
+/// (a private field; no `Default` or `Clone`), and
+/// [`ToolExecutor::execute`] requires one, so no code path can run a tool
+/// without approval by accident. Unit tests of a single executor use
+/// [`ToolContext::for_testing`] (the `testing` feature).
+///
+/// Outside this crate, a context can't be built by hand...
+///
+/// ```compile_fail
+/// let ctx = arbe_tools::ToolContext {
+///     cancel: arbe_tools::CancellationToken::new(),
+///     progress: None,
+/// };
+/// ```
+///
+/// ...nor defaulted:
+///
+/// ```compile_fail
+/// let ctx = arbe_tools::ToolContext::default();
+/// ```
 pub struct ToolContext {
     /// Fires when the turn is cancelled. Long-running tools should stop
     /// promptly (e.g. `execute` kills its child process) and return
     /// `ToolError::Cancelled`; quick tools may ignore it.
     pub cancel: CancellationToken,
     pub progress: Option<ProgressSink>,
+    _issued_by_gate: IssuedByGate,
 }
 
+/// Only constructible in this crate.
+struct IssuedByGate;
+
 impl ToolContext {
-    pub fn new(cancel: CancellationToken) -> Self {
+    /// Issued by the gate for an approved call.
+    pub(crate) fn issue(run: ToolRun) -> Self {
         Self {
-            cancel,
-            progress: None,
+            cancel: run.cancel,
+            progress: run.progress,
+            _issued_by_gate: IssuedByGate,
         }
+    }
+
+    /// A context for calling one executor directly in its own unit tests,
+    /// bypassing approval. Never use it in harness code.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing() -> Self {
+        Self::issue(ToolRun::default())
+    }
+
+    /// [`for_testing`](Self::for_testing) with a given cancel token and
+    /// progress sink.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_testing_with(run: ToolRun) -> Self {
+        Self::issue(run)
     }
 
     /// Reports progress, if anyone is listening.
@@ -241,7 +288,7 @@ pub(crate) trait ExecuteWithDefaultContext {
 #[cfg(test)]
 impl<T: ToolExecutor + ?Sized> ExecuteWithDefaultContext for T {
     async fn execute_default(&self, invocation: ToolInvocation) -> Result<ToolResult, ToolError> {
-        self.execute(invocation, &ToolContext::default()).await
+        self.execute(invocation, &ToolContext::for_testing()).await
     }
 }
 

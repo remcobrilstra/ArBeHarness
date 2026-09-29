@@ -145,12 +145,12 @@ mod tests {
             rationale: None,
         };
         let found = tool
-            .execute(call("deploy"), &ToolContext::default())
+            .execute(call("deploy"), &ToolContext::for_testing())
             .await
             .unwrap();
         assert_eq!(found.output, json!("run make release"));
         let missing = tool
-            .execute(call("nope"), &ToolContext::default())
+            .execute(call("nope"), &ToolContext::for_testing())
             .await
             .unwrap();
         assert!(missing.is_error);

@@ -10,7 +10,7 @@ use arbe_core::{
 };
 use arbe_hooks::HookPhase;
 use arbe_providers::CancellationToken;
-use arbe_tools::{Authorization, Authorized, ToolContext, authorize};
+use arbe_tools::{Authorization, Authorized, ToolRun, authorize};
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 
@@ -374,7 +374,7 @@ async fn run_batch(
     let runs = batch.into_iter().map(|(index, authorized, id)| async move {
         let tool_name = authorized.invocation().tool_name.clone();
         let events = agent.events.clone();
-        let tool_ctx = ToolContext {
+        let run = ToolRun {
             cancel: cancel.clone(),
             progress: Some(Arc::new(move |update: String| {
                 events.publish(RuntimeEvent::ToolProgress {
@@ -384,7 +384,7 @@ async fn run_batch(
                 })
             })),
         };
-        let outcome = authorized.execute(&tool_ctx).await;
+        let outcome = authorized.execute(run).await;
         (index, id, tool_name, outcome)
     });
 

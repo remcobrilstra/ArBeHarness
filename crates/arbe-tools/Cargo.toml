@@ -19,3 +19,8 @@ regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+# `ToolContext::for_testing`: call one executor directly in unit tests,
+# bypassing the approval gate. Enable only in [dev-dependencies].
+testing = []

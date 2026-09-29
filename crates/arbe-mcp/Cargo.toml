@@ -26,5 +26,6 @@ test = false
 doc = false
 
 [dev-dependencies]
+arbe-tools = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 

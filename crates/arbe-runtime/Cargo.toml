@@ -23,5 +23,6 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+arbe-tools = { workspace = true, features = ["testing"] }
 uuid = { workspace = true }
 tempfile = { workspace = true }
