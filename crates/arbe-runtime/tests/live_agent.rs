@@ -1,22 +1,30 @@
-//! End-to-end runs of the whole harness against a real local model (v2
-//! plan P7.2): the real system prompt, builtin tools, approval flow and
-//! persistence, on small tasks in a scratch project.
+//! End-to-end runs of the whole harness against a real model (v2 plan
+//! P7.2): the real system prompt, builtin tools, approvals, persistence,
+//! memory, skills, compaction, cancellation and resume — each on a small
+//! task in a scratch project, with a scratch harness home.
 //!
-//! `#[ignore]`d; needs a running Ollama with the default models pulled:
+//! `#[ignore]`d. Pick a target:
 //!
 //! ```text
+//! # any OpenAI-compatible server, e.g. xAI:
+//! ARBE_LIVE_COMPAT_BASE_URL=https://api.x.ai/v1 ARBE_LIVE_COMPAT_API_KEY=... \
+//! ARBE_LIVE_COMPAT_MODEL=grok-4.7 \
+//!   cargo test -p arbe-runtime --test live_agent -- --ignored --nocapture
+//!
+//! # local Ollama with the default models (qwen2.5-coder:3b, llama3.2:3b):
 //! ARBE_LIVE_OLLAMA=1 cargo test -p arbe-runtime --test live_agent -- --ignored --nocapture
 //! ```
 //!
-//! Models: `ARBE_LIVE_CODING_MODEL` (default `qwen2.5-coder:3b`) and
-//! `ARBE_LIVE_GENERAL_MODEL` (default `llama3.2:3b`). Every approval request
-//! is approved once, and each run prints the tool calls it saw, so a failure
-//! shows what the model actually did.
+//! Every test prints the tool calls it saw, so a failure shows what the
+//! model actually did. Model behavior varies; the assertions check
+//! outcomes (files changed, facts recalled), not exact wording.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use arbe_core::{ApprovalDecision, RuntimeEvent, StopReason};
+use arbe_core::{ApprovalDecision, HarnessError, RuntimeEvent, StopReason};
 use arbe_runtime::{Agent, EventBus, RuntimeConfig};
 use arbe_storage::SessionStore;
 
@@ -24,162 +32,567 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Which model service the tests run against.
+struct Target {
+    settings: Vec<(&'static str, String)>,
+    coding_model: String,
+    general_model: String,
+}
+
+fn target() -> Option<Target> {
+    if let Some(base_url) = env("ARBE_LIVE_COMPAT_BASE_URL") {
+        let model = env("ARBE_LIVE_COMPAT_MODEL").expect("set ARBE_LIVE_COMPAT_MODEL");
+        let mut settings = vec![
+            ("ARBE_PROVIDER", "openai_compatible".to_string()),
+            ("ARBE_BASE_URL", base_url),
+        ];
+        if let Some(key) = env("ARBE_LIVE_COMPAT_API_KEY") {
+            settings.push(("ARBE_API_KEY", key));
+        }
+        return Some(Target {
+            settings,
+            coding_model: model.clone(),
+            general_model: model,
+        });
+    }
+    env("ARBE_LIVE_OLLAMA")?;
+    let mut settings = vec![("ARBE_PROVIDER", "ollama".to_string())];
+    if let Some(url) = env("ARBE_BASE_URL") {
+        settings.push(("ARBE_BASE_URL", url));
+    }
+    Some(Target {
+        settings,
+        coding_model: env("ARBE_LIVE_CODING_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into()),
+        general_model: env("ARBE_LIVE_GENERAL_MODEL").unwrap_or_else(|| "llama3.2:3b".into()),
+    })
+}
+
+/// Skips the test (returning early) when no target is configured.
+macro_rules! target_or_skip {
+    () => {
+        match target() {
+            Some(target) => target,
+            None => {
+                eprintln!("skipped: set ARBE_LIVE_COMPAT_BASE_URL or ARBE_LIVE_OLLAMA");
+                return;
+            }
+        }
+    };
+}
+
+/// A scratch harness home + project, and how to open agents on them.
+struct Bench {
+    home: tempfile::TempDir,
+    project: tempfile::TempDir,
+    target: Target,
+    profile: &'static str,
+    /// Extra config (TOML) applied as a global config file.
+    config_toml: String,
+}
+
+impl Bench {
+    fn new(target: Target, profile: &'static str) -> Self {
+        Self {
+            home: tempfile::tempdir().unwrap(),
+            project: tempfile::tempdir().unwrap(),
+            target,
+            profile,
+            config_toml: String::new(),
+        }
+    }
+
+    fn project(&self) -> &Path {
+        self.project.path()
+    }
+
+    fn write(&self, relative: &str, text: &str) {
+        let path = self.project().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn read(&self, relative: &str) -> String {
+        std::fs::read_to_string(self.project().join(relative)).unwrap_or_default()
+    }
+
+    fn config(&self) -> RuntimeConfig {
+        let model = if self.profile == "general" {
+            &self.target.general_model
+        } else {
+            &self.target.coding_model
+        };
+        let mut vars: HashMap<&str, String> = self.target.settings.iter().cloned().collect();
+        vars.insert("ARBE_PROFILE", self.profile.to_string());
+        vars.insert("ARBE_MODEL", model.clone());
+        vars.insert("ARBE_HOME", self.home.path().display().to_string());
+        let lookup = move |key: &str| vars.get(key).cloned();
+        let file = self.home.path().join("live.toml");
+        std::fs::write(&file, &self.config_toml).unwrap();
+        RuntimeConfig::load_from(&[file], &lookup, self.project().to_path_buf()).unwrap()
+    }
+
+    fn store(&self) -> SessionStore {
+        SessionStore::with_root(self.home.path().join("sessions"))
+    }
+
+    fn start(&self, approve: Approve) -> Run {
+        let events = Arc::new(EventBus::new(8192));
+        let rx = events.subscribe();
+        let agent = Arc::new(Agent::create(&self.config(), self.store(), events).unwrap());
+        Run::watch(agent, rx, approve)
+    }
+
+    fn resume(&self, id: arbe_core::SessionId, approve: Approve) -> Run {
+        let events = Arc::new(EventBus::new(8192));
+        let rx = events.subscribe();
+        let agent = Arc::new(Agent::resume(&self.config(), self.store(), id, events).unwrap());
+        Run::watch(agent, rx, approve)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Approve {
+    All,
+    /// Approve everything except these tools.
+    AllBut(&'static [&'static str]),
+}
+
 /// What one turn did.
 #[derive(Debug, Default)]
 struct Trace {
-    tools: Vec<String>,
+    /// `(tool, arguments)` for every proposed call.
+    calls: Vec<(String, String)>,
+    denied: Vec<String>,
+    thinking_chars: usize,
     stop: Option<StopReason>,
+    compactions: usize,
+    /// `(tool, output)` for every executed call.
+    results: Vec<(String, String)>,
 }
+
+impl Trace {
+    fn used(&self, tool: &str) -> bool {
+        self.calls.iter().any(|(t, _)| t == tool)
+    }
+}
+
+/// An MCP server that connected `(name, tool count)` or failed `(name, reason)`.
+type McpStatus = Result<(String, usize), (String, String)>;
 
 struct Run {
     agent: Arc<Agent>,
     trace: Arc<Mutex<Trace>>,
-}
-
-fn start(profile: &str, model: &str, project: &Path, sessions: &Path) -> Run {
-    let vars = [("ARBE_PROFILE", profile), ("ARBE_MODEL", model)];
-    let lookup = |key: &str| {
-        vars.iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.to_string())
-            .or_else(|| (key == "ARBE_BASE_URL").then(|| env(key)).flatten())
-    };
-    let config = RuntimeConfig::load_from(&[], &lookup, project.to_path_buf()).unwrap();
-    let events = Arc::new(EventBus::new(4096));
-    let mut rx = events.subscribe();
-    let agent = Arc::new(
-        Agent::create(
-            &config,
-            SessionStore::with_root(sessions.to_path_buf()),
-            events,
-        )
-        .unwrap(),
-    );
-
-    let trace = Arc::new(Mutex::new(Trace::default()));
-    let (a, t) = (agent.clone(), trace.clone());
-    tokio::spawn(async move {
-        while let Ok(envelope) = rx.recv().await {
-            match envelope.event {
-                RuntimeEvent::ToolCallProposed {
-                    tool_name,
-                    arguments,
-                    ..
-                } => {
-                    eprintln!("    tool: {tool_name} {arguments}");
-                    t.lock().unwrap().tools.push(tool_name);
-                }
-                RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
-                    a.supply_tool_decision(tool_call_id, ApprovalDecision::ApprovedOnce);
-                }
-                RuntimeEvent::TurnCompleted { stop_reason, .. } => {
-                    t.lock().unwrap().stop = Some(stop_reason);
-                }
-                _ => {}
-            }
-        }
-    });
-    Run { agent, trace }
+    /// MCP servers that connected (name, tool count) or failed (name, reason).
+    mcp: Arc<Mutex<Vec<McpStatus>>>,
 }
 
 impl Run {
+    fn watch(
+        agent: Arc<Agent>,
+        mut rx: tokio::sync::broadcast::Receiver<arbe_core::EventEnvelope>,
+        approve: Approve,
+    ) -> Self {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let mcp = Arc::new(Mutex::new(Vec::new()));
+        let (a, t, m) = (agent.clone(), trace.clone(), mcp.clone());
+        tokio::spawn(async move {
+            let mut names = HashMap::new();
+            while let Ok(envelope) = rx.recv().await {
+                match envelope.event {
+                    RuntimeEvent::ToolCallProposed {
+                        tool_call_id,
+                        tool_name,
+                        arguments,
+                        ..
+                    } => {
+                        eprintln!("    tool: {tool_name} {arguments}");
+                        names.insert(tool_call_id, tool_name.clone());
+                        t.lock()
+                            .unwrap()
+                            .calls
+                            .push((tool_name, arguments.to_string()));
+                    }
+                    RuntimeEvent::ToolApprovalRequested { tool_call_id, .. } => {
+                        let name = names.get(&tool_call_id).cloned().unwrap_or_default();
+                        let approved = match approve {
+                            Approve::All => true,
+                            Approve::AllBut(denied) => !denied.contains(&name.as_str()),
+                        };
+                        a.supply_tool_decision(
+                            tool_call_id,
+                            if approved {
+                                ApprovalDecision::ApprovedOnce
+                            } else {
+                                ApprovalDecision::DeniedOnce
+                            },
+                        );
+                    }
+                    RuntimeEvent::ToolCallDenied { tool_name, .. } => {
+                        t.lock().unwrap().denied.push(tool_name);
+                    }
+                    RuntimeEvent::ThinkingDelta { delta, .. } => {
+                        t.lock().unwrap().thinking_chars += delta.len();
+                    }
+                    RuntimeEvent::ToolExecuted {
+                        tool_name, result, ..
+                    } => {
+                        t.lock()
+                            .unwrap()
+                            .results
+                            .push((tool_name, result.output.to_string()));
+                    }
+                    RuntimeEvent::McpServerConnected { server, tools } => {
+                        m.lock().unwrap().push(Ok((server, tools)));
+                    }
+                    RuntimeEvent::McpServerFailed { server, reason } => {
+                        m.lock().unwrap().push(Err((server, reason)));
+                    }
+                    RuntimeEvent::CompactionPerformed { .. } => {
+                        t.lock().unwrap().compactions += 1;
+                    }
+                    RuntimeEvent::TurnCompleted { stop_reason, .. } => {
+                        t.lock().unwrap().stop = Some(stop_reason);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Self { agent, trace, mcp }
+    }
+
+    /// Waits for the first MCP server to connect; panics if it fails.
+    async fn wait_for_mcp(&self) -> usize {
+        for _ in 0..600 {
+            if let Some(status) = self.mcp.lock().unwrap().first() {
+                match status {
+                    Ok((_, tools)) => return *tools,
+                    Err((server, reason)) => panic!("MCP server {server} failed: {reason}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("MCP server didn't connect within 2 minutes");
+    }
+
     async fn ask(&self, prompt: &str) -> (String, Trace) {
         eprintln!("  > {prompt}");
-        let answer = self
-            .agent
-            .submit_message(prompt.to_string())
-            .await
-            .unwrap_or_else(|e| panic!("turn failed: {e}"));
-        // Let the event task drain the turn's last events.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let trace = std::mem::take(&mut *self.trace.lock().unwrap());
-        eprintln!("  < {answer:?} ({:?})", trace.stop);
+        let answer = tokio::time::timeout(
+            Duration::from_secs(300),
+            self.agent.submit_message(prompt.to_string()),
+        )
+        .await
+        .expect("turn took over 5 minutes")
+        .unwrap_or_else(|e| panic!("turn failed: {e}"));
+        let trace = self.take_trace().await;
+        eprintln!(
+            "  < {answer:?} ({:?}, {} chars of thinking)",
+            trace.stop, trace.thinking_chars
+        );
         (answer, trace)
+    }
+
+    async fn take_trace(&self) -> Trace {
+        // Let the watcher drain the turn's last events.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::mem::take(&mut *self.trace.lock().unwrap())
     }
 }
 
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
 #[tokio::test]
-#[ignore = "needs a local Ollama server with the default models"]
-async fn ollama_end_to_end() {
-    if env("ARBE_LIVE_OLLAMA").is_none() {
-        eprintln!("skipped (set ARBE_LIVE_OLLAMA=1)");
-        return;
-    }
-    // Keep the user's real ~/.arbe (memory, instructions, skills) out of
-    // it. This binary has a single test, so nothing races on the variable.
-    let home = tempfile::tempdir().unwrap();
-    // SAFETY: set before any other thread in this process reads the
-    // environment (the only test, before any agent exists).
-    unsafe { std::env::set_var("ARBE_HOME", home.path()) };
-    let sessions = home.path().join("sessions");
-
-    let coding = env("ARBE_LIVE_CODING_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into());
-    let general = env("ARBE_LIVE_GENERAL_MODEL").unwrap_or_else(|| "llama3.2:3b".into());
-    let mut failures = Vec::new();
-
-    // Coding profile: read a fact from the project, then change a file.
-    eprintln!("coding profile, {coding}:");
-    let project = tempfile::tempdir().unwrap();
-    std::fs::write(
-        project.path().join("server.toml"),
-        "[server]\nhost = \"0.0.0.0\"\nport = 8742\n",
-    )
-    .unwrap();
-    let run = start("coding", &coding, project.path(), &sessions);
+#[ignore = "needs a live model"]
+async fn reads_and_edits_files() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    bench.write("server.toml", "[server]\nhost = \"0.0.0.0\"\nport = 8742\n");
+    let run = bench.start(Approve::All);
 
     let (answer, trace) = run
         .ask("Which port does server.toml configure? Look at the file.")
         .await;
-    if !trace.tools.iter().any(|t| t == "read_file" || t == "grep") {
-        failures.push(format!(
-            "coding/read: never read the file ({:?})",
-            trace.tools
-        ));
-    }
-    if !answer.contains("8742") {
-        failures.push(format!("coding/read: answer lacks 8742: {answer:?}"));
-    }
+    assert!(trace.used("read_file") || trace.used("grep"), "{trace:?}");
+    assert!(answer.contains("8742"), "{answer}");
+    assert_eq!(trace.stop, Some(StopReason::EndTurn));
+
+    run.ask("Change the port in server.toml to 9100. Keep everything else as is.")
+        .await;
+    let file = bench.read("server.toml");
+    assert!(
+        file.contains("9100") && file.contains("host = \"0.0.0.0\""),
+        "{file}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn a_denied_edit_is_reported_and_leaves_the_file_alone() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    bench.write("notes.txt", "keep me\n");
+    let run = bench.start(Approve::AllBut(&["write_file", "edit_file", "execute"]));
+
+    let (answer, trace) = run
+        .ask("Replace the contents of notes.txt with the word 'gone'.")
+        .await;
+    assert!(
+        !trace.denied.is_empty(),
+        "no write was attempted: {trace:?}"
+    );
+    assert_eq!(bench.read("notes.txt"), "keep me\n");
+    assert_eq!(trace.stop, Some(StopReason::EndTurn));
+    eprintln!("  (answer after denial: {answer:?})");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn fixes_a_bug_by_running_the_tests_in_a_loop() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    let Some(python) = python() else {
+        eprintln!("skipped: no python on PATH");
+        return;
+    };
+    bench.write(
+        "calc.py",
+        "def average(values):\n    return sum(values) / len(values) + 1\n",
+    );
+    bench.write(
+        "test_calc.py",
+        "from calc import average\n\nassert average([2, 4]) == 3, average([2, 4])\nassert average([5]) == 5\nprint('all tests passed')\n",
+    );
+    let run = bench.start(Approve::All);
 
     let (_, trace) = run
-        .ask("Change the port in server.toml to 9100. Keep everything else as is.")
+        .ask(&format!(
+            "The tests in test_calc.py fail. Run them with `{python} test_calc.py`, fix the bug in calc.py (not the tests), and run them again to confirm."
+        ))
         .await;
-    let file = std::fs::read_to_string(project.path().join("server.toml")).unwrap();
-    if !file.contains("9100") || !file.contains("host = \"0.0.0.0\"") {
-        failures.push(format!(
-            "coding/edit: file not changed as asked ({:?}): {file:?}",
-            trace.tools
-        ));
-    }
+    assert!(trace.used("execute"), "never ran the tests: {trace:?}");
+    assert!(
+        trace.used("edit_file") || trace.used("write_file"),
+        "{trace:?}"
+    );
+    let out = std::process::Command::new(python)
+        .arg("test_calc.py")
+        .current_dir(bench.project())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "tests still fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(bench.read("test_calc.py").contains("average([2, 4]) == 3"));
+}
 
-    // General profile: a plain question, no file tools offered.
-    eprintln!("general profile, {general}:");
-    let other = tempfile::tempdir().unwrap();
-    let run = start("general", &general, other.path(), &sessions);
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn a_resumed_session_remembers_the_conversation() {
+    let bench = Bench::new(target_or_skip!(), "general");
+    let run = bench.start(Approve::All);
+    run.ask("My project's codename is BLUE-HERON-42. Just acknowledge it.")
+        .await;
+    let id = run.agent.session_id();
+    run.agent.close().unwrap();
+    drop(run);
+
+    let resumed = bench.resume(id, Approve::All);
+    let (answer, _) = resumed.ask("What is my project's codename?").await;
+    assert!(answer.contains("BLUE-HERON-42"), "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn remembered_notes_carry_over_to_a_new_session() {
+    let bench = Bench::new(target_or_skip!(), "general");
+    let run = bench.start(Approve::All);
+    let (_, trace) = run
+        .ask("Please remember for future sessions: I always want answers in British English, and my name is Remco.")
+        .await;
+    assert!(trace.used("remember"), "{trace:?}");
+    drop(run);
+
+    // A brand new session (no shared history) sees the note.
+    let fresh = bench.start(Approve::All);
+    let (answer, _) = fresh.ask("What's my name?").await;
+    assert!(answer.contains("Remco"), "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn loads_a_skill_on_demand_and_follows_it() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    std::fs::create_dir_all(bench.home.path().join("skills")).unwrap();
+    std::fs::write(
+        bench.home.path().join("skills").join("release-notes.md"),
+        "---\nname: release-notes\ndescription: How to write release notes for this team. Use whenever asked to write release notes.\n---\nRelease notes must start with the exact line `== RELEASE NOTES ==` and end with the exact line `-- signed, the build bot`.\n",
+    )
+    .unwrap();
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("Write release notes for version 1.2: we fixed a crash on startup. Reply with the notes only.")
+        .await;
+    assert!(trace.used("load_skill"), "{trace:?}");
+    assert!(
+        answer.contains("== RELEASE NOTES ==") && answer.contains("-- signed, the build bot"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn nested_instructions_apply_once_their_folder_is_touched() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    bench.write(
+        "billing/AGENTS.md",
+        "In the billing folder, amounts are stored in cents. Whenever you report an amount from this folder, also state it in euros.",
+    );
+    bench.write("billing/prices.toml", "basic_plan = 1999\n");
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("What is the basic plan price in billing/prices.toml?")
+        .await;
+    assert!(trace.used("read_file") || trace.used("grep"), "{trace:?}");
+    assert!(answer.contains("19.99"), "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn compaction_keeps_what_matters() {
+    let mut bench = Bench::new(target_or_skip!(), "general");
+    bench.config_toml = "[context]\nmemory_strategy = \"compact_summary\"\n".into();
+    let run = bench.start(Approve::All);
+    run.ask("Note this for later in our conversation: the deploy window is Thursday 14:00 UTC. Just acknowledge.")
+        .await;
+    run.ask("Unrelated: name three primary colours, briefly.")
+        .await;
+    assert!(run.agent.compact().await.unwrap(), "nothing was compacted");
+    assert_eq!(run.take_trace().await.compactions, 1);
+
+    let (answer, _) = run.ask("When is the deploy window?").await;
+    assert!(
+        answer.contains("14:00") && contains_ci(&answer, "thursday"),
+        "{answer}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn a_cancelled_turn_is_saved_and_the_session_continues() {
+    let bench = Bench::new(target_or_skip!(), "general");
+    let run = bench.start(Approve::All);
+    let agent = run.agent.clone();
+    let turn = tokio::spawn(async move {
+        agent
+            .submit_message("Write a 2000-word essay about the history of bridges.".into())
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(run.agent.cancel_turn());
+    let result = turn.await.unwrap();
+    assert!(matches!(result, Err(HarnessError::Cancelled)), "{result:?}");
+
+    let turns = bench.store().list_turns(run.agent.session_id()).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].stop_reason, Some(StopReason::Cancelled));
+
+    let (answer, _) = run.ask("Reply with just the word: ready").await;
+    assert!(contains_ci(&answer, "ready"), "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model"]
+async fn the_general_profile_answers_without_file_tools() {
+    let bench = Bench::new(target_or_skip!(), "general");
+    bench.write("secret.txt", "do not read\n");
+    let run = bench.start(Approve::All);
     let (answer, trace) = run.ask("What is the capital of France? One word.").await;
-    if !answer.to_lowercase().contains("paris") {
-        failures.push(format!("general/answer: {answer:?}"));
-    }
-    if trace.stop != Some(StopReason::EndTurn) {
-        failures.push(format!("general/answer: stopped with {:?}", trace.stop));
-    }
-    if !trace.tools.is_empty() {
-        // Reported, not failed: small models call whatever tool is offered
-        // (llama3.2:3b saves trivia with `remember`); the approval gate is
-        // what stops that in real use.
+    assert!(contains_ci(&answer, "paris"), "{answer}");
+    assert!(!trace.used("read_file"), "{trace:?}");
+    if !trace.calls.is_empty() {
         eprintln!(
             "  note: needless tool use for a plain question: {:?}",
-            trace.tools
+            trace.calls
         );
     }
+}
 
-    // The session was persisted and can be listed.
-    let listed = SessionStore::with_root(sessions).list_sessions().unwrap();
-    if listed.len() != 2 {
-        failures.push(format!(
-            "expected 2 persisted sessions, found {}",
-            listed.len()
-        ));
-    }
+fn python() -> Option<&'static str> {
+    ["python", "python3"].into_iter().find(|p| {
+        std::process::Command::new(p)
+            .arg("--version")
+            .output()
+            .is_ok()
+    })
+}
 
-    assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
+#[tokio::test]
+#[ignore = "needs a live model, Node/npx and network"]
+async fn uses_tools_from_an_mcp_server() {
+    let mut bench = Bench::new(target_or_skip!(), "coding");
+    bench.config_toml = r#"
+[mcp.servers.everything]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+timeout_secs = 120
+"#
+    .into();
+    let run = bench.start(Approve::All);
+    assert!(run.wait_for_mcp().await > 0);
+
+    let (answer, trace) = run
+        .ask(
+            "Use a tool from the `everything` MCP server to add 17 and 25, and tell me the result.",
+        )
+        .await;
+    // Tool names vary between versions of the reference server (`add`,
+    // `get-sum`, ...); what matters is that an MCP tool did the sum.
+    assert!(
+        trace
+            .results
+            .iter()
+            .any(|(tool, out)| tool.starts_with("everything__") && out.contains("42")),
+        "{trace:?}"
+    );
+    assert!(answer.contains("42"), "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs a live model and python"]
+async fn a_hook_can_veto_a_models_command() {
+    let mut bench = Bench::new(target_or_skip!(), "coding");
+    let Some(python) = python() else {
+        eprintln!("skipped: no python on PATH");
+        return;
+    };
+    let guard = bench.home.path().join("guard.py");
+    std::fs::write(
+        &guard,
+        r#"import json, sys
+call = json.load(sys.stdin)
+if call["tool_name"] == "execute":
+    print(json.dumps({"veto": "shell commands are disabled by policy"}))
+"#,
+    )
+    .unwrap();
+    // Forward slashes: valid on every OS, and no TOML escaping needed.
+    let guard = guard.display().to_string().replace('\\', "/");
+    bench.config_toml = format!(
+        "[[hooks.commands]]\nphase = \"before_tool_execute\"\ncommand = '{python} \"{guard}\"'\n"
+    );
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("Run the shell command `echo hook-probe > probe.txt` using the execute tool.")
+        .await;
+    // A vetoed call is denied before it's ever proposed for approval.
+    assert!(trace.denied.iter().any(|t| t == "execute"), "{trace:?}");
+    assert!(
+        !trace.results.iter().any(|(t, _)| t == "execute"),
+        "{trace:?}"
+    );
+    assert!(
+        !bench.project().join("probe.txt").exists(),
+        "the command ran"
+    );
+    eprintln!("  (answer after veto: {answer:?})");
 }

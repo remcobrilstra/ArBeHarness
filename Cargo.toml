@@ -52,8 +52,11 @@ license.workspace = true
 [dependencies]
 arbe-runtime = { workspace = true }
 arbe-tui = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "io-std"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }

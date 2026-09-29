@@ -1,4 +1,5 @@
 mod cli;
+mod headless;
 mod print;
 
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
     let code = match cli.mode.clone() {
         Mode::Print { prompt } => runtime.block_on(print::run(&harness, &cli, prompt)),
+        Mode::Headless => runtime.block_on(headless::run(harness)),
         Mode::Interactive { prompt } => runtime.block_on(interactive(harness, &cli, prompt)),
         Mode::Help | Mode::Version => unreachable!(),
     };

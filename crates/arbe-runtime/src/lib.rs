@@ -16,5 +16,6 @@ pub use event_bus::EventBus;
 pub use harness::{Harness, HarnessBuilder, Session};
 
 pub use arbe_core;
+pub use arbe_providers;
 pub use arbe_storage;
 pub use arbe_tools;

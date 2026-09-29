@@ -68,6 +68,7 @@ The agent works on the directory you start it in. To point it somewhere else, us
 | `--name <title>` | | Name the session (its `title` in `meta.json`). Without it, a session is named after the first line of its first message. |
 | `--prompt <text>` | | Send `<text>` as the first message, then carry on interactively. |
 | `--print <text>` | | Run `<text>` as a single turn without the chat screen, print the answer, and exit. See [Headless mode](#headless-mode). |
+| `--headless` | | Instead of the chat screen, take requests as JSON-RPC on stdin and answer on stdout, for editors and other programs. Can't be combined with `--prompt`, `--print`, `--resume` or `--name`. See [JSON-RPC](#json-rpc---headless). |
 | `--approve <policy>` | | With `--print` only: `none`, `reads` or `all`. See [Headless mode](#headless-mode). |
 | `--output <format>` | | With `--print` only: `text` or `json`. See [Headless mode](#headless-mode). |
 | `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, or one defined in a config file. |
@@ -88,7 +89,20 @@ cargo run --release -- --workdir ../my-project
 
 Everything else is configured with a [configuration file](#configuration-file) or [environment variables](#environment-variables).
 
+### Workdir vs. harness home
+
+These two are easy to mix up:
+
+- **Workdir** (`--workdir`): the code the agent reads, edits, and runs commands in. The TUI header shows it as `workdir: ...`.
+- **Harness home** (`~/.arbe/`, overridable with `--dev-home`): where ArBeHarness keeps *its own* data, such as sessions, skills, and global instructions. Normal use never needs to move it.
+
+---
+
 ## Headless mode
+
+There are two ways to use ArBeHarness without the chat screen: `--print` for a single prompt, and `--headless` for a program that drives it over [JSON-RPC](#json-rpc---headless).
+
+### One prompt: `--print`
 
 `--print` runs one turn without the chat screen — for scripts and for programs that use ArBeHarness in the background:
 
@@ -116,12 +130,60 @@ Calls your [approval settings](#approvals) already allow or deny are unaffected:
 
 **Exit status.** `0` the model answered; `1` the turn failed (for example the provider couldn't be reached); `2` invalid arguments or configuration; `3` stopped before answering (a [loop limit](#generation-and-context)); `130` interrupted with Ctrl+C (what the turn did so far is saved).
 
-### Workdir vs. harness home
+### JSON-RPC: `--headless`
 
-These two are easy to mix up:
+`arbeharness --headless` reads [JSON-RPC 2.0](https://www.jsonrpc.org/specification) requests from stdin and writes responses and notifications to stdout, **one JSON object per line**. It serves until it receives `shutdown` or its stdin closes; either way it stops any running turn and closes every session first. `--workdir`, `--profile`, `--model`, `--config` and the other configuration options apply to every session it opens.
 
-- **Workdir** (`--workdir`): the code the agent reads, edits, and runs commands in. The TUI header shows it as `workdir: ...`.
-- **Harness home** (`~/.arbe/`, overridable with `--dev-home`): where ArBeHarness keeps *its own* data, such as sessions, skills, and global instructions. Normal use never needs to move it.
+Requests are handled concurrently: while a `turn/send` is waiting for its turn to finish, you can answer approvals or cancel it.
+
+| Method | Params | Result |
+|---|---|---|
+| `initialize` | none | `{"server": "arbeharness", "version", "protocol_version": 1}` |
+| `session/new` | `name` (optional) | `{"session_id", "session": <meta.json contents>}` |
+| `session/resume` | `session_id`, `name` (optional) | same as `session/new` |
+| `session/list` | none | `{"sessions": [<meta.json contents>, …]}`, newest first |
+| `session/set_title` | `session_id`, `title` | `{}` |
+| `session/close` | `session_id` | `{}` (stops a running turn first) |
+| `turn/send` | `session_id`, `message` | `{"answer", "stop_reason"}` once the turn ends |
+| `turn/cancel` | `session_id` | `{"cancelled": true/false}` (whether a turn was running) |
+| `approval/decide` | `session_id`, `tool_call_id`, `decision` | `{"accepted": true/false}` (false if nothing was waiting on that call) |
+| `shutdown` | none | `{}`, then the process exits |
+
+**Events.** Every event of an open session is sent as a notification — the same events the chat screen and `--print --output json` show:
+
+```json
+{"jsonrpc":"2.0","method":"event","params":{"session_id":"…","seq":12,"event":{"type":"tool_approval_requested","turn_id":"…","tool_call_id":"…"}}}
+```
+
+`seq` counts up per session; a jump means events were dropped because the client read too slowly. A turn's `turn/send` response is always sent **after** every event that turn produced.
+
+**Approvals.** Nothing is approved on your behalf beyond your [approval settings](#approvals). When a `tool_approval_requested` event arrives, the turn waits until you call `approval/decide` with one of `approved_once`, `denied_once`, `approved_for_session` or `always_denied_for_session` (the chat dialog's `y`, `n`, `a`, `d`). The preceding `tool_call_proposed` event carries the tool name, arguments and risk.
+
+**Errors** use the standard JSON-RPC codes (`-32700` invalid JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal error) plus:
+
+| Code | Meaning |
+|---|---|
+| `-32001` | No such session (not open, or for `session/resume`, not saved). |
+| `-32002` | A turn is already running in that session. |
+| `-32003` | The turn failed (for example the provider couldn't be reached); the message says why. |
+| `-32004` | The turn was cancelled. What it did so far is saved. |
+
+A request without an `id` is a notification: it's carried out, but nothing is sent back, not even an error.
+
+Example exchange (`>` sent, `<` received; events shortened):
+
+```text
+> {"jsonrpc":"2.0","id":1,"method":"session/new","params":{"name":"fix tests"}}
+< {"jsonrpc":"2.0","id":1,"result":{"session_id":"6f1c…","session":{…}}}
+> {"jsonrpc":"2.0","id":2,"method":"turn/send","params":{"session_id":"6f1c…","message":"Which port does server.toml set?"}}
+< {"jsonrpc":"2.0","method":"event","params":{"session_id":"6f1c…","seq":1,"event":{"type":"turn_started",…}}}
+< {"jsonrpc":"2.0","method":"event","params":{…,"event":{"type":"tool_call_proposed","tool_name":"read_file","arguments":{"path":"server.toml"},"risk":"low",…}}}
+< {"jsonrpc":"2.0","method":"event","params":{…,"event":{"type":"tool_approval_requested","tool_call_id":"9a2e…",…}}}
+> {"jsonrpc":"2.0","id":3,"method":"approval/decide","params":{"session_id":"6f1c…","tool_call_id":"9a2e…","decision":"approved_once"}}
+< {"jsonrpc":"2.0","id":3,"result":{"accepted":true}}
+< … more events, ending with turn_completed …
+< {"jsonrpc":"2.0","id":2,"result":{"answer":"server.toml sets port 8742.","stop_reason":{"kind":"end_turn"}}}
+```
 
 ---
 
@@ -327,7 +389,13 @@ The maximum response length is fixed at 4096 output tokens.
 | `ollama` | no | `http://localhost:11434` | Runs with an 8,192-token context window. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. Some models (such as `qwen2.5-coder`) write a tool call as plain JSON text instead of using Ollama's tool-call format; when a reply consists only of such calls to offered tools, the harness treats them as real tool calls. A reply that could be one is shown once it's complete rather than word by word. |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | Chat Completions API. |
 | `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | Messages API. Supports extended thinking (`ARBE_THINKING_BUDGET`). |
-| `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. |
+| `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (xAI, vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. Reasoning that the server streams as `reasoning_content` (xAI, DeepSeek, vLLM) is shown as thinking. |
+
+For example, xAI's Grok models (the key goes in `ARBE_API_KEY`):
+
+```bash
+ARBE_PROVIDER=openai_compatible ARBE_BASE_URL=https://api.x.ai/v1 ARBE_API_KEY=xai-... ARBE_MODEL=grok-4.7 arbeharness
+```
 
 **Context windows.** The harness sizes the context budget from a built-in table of known models, matched by name prefix:
 

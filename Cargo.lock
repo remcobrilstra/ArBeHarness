@@ -175,6 +175,9 @@ version = "0.1.0"
 dependencies = [
  "arbe-runtime",
  "arbe-tui",
+ "async-trait",
+ "futures-util",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

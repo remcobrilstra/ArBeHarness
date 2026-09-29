@@ -15,6 +15,9 @@
 //! - Ollama: `ARBE_LIVE_OLLAMA=1` with a local server (model:
 //!   `ARBE_LIVE_OLLAMA_MODEL`, default `qwen2.5-coder:3b`; `ARBE_BASE_URL` overrides
 //!   the server address)
+//! - Any OpenAI-compatible server (e.g. xAI): `ARBE_LIVE_COMPAT_BASE_URL`
+//!   (e.g. `https://api.x.ai/v1`), `ARBE_LIVE_COMPAT_MODEL`, and
+//!   `ARBE_LIVE_COMPAT_API_KEY` if the server needs one
 
 use arbe_core::{Message, Role, StopReason, ToolSpec};
 use arbe_providers::{CancellationToken, ModelProvider, ModelRequest, build_provider, infer};
@@ -40,6 +43,13 @@ fn target(name: &str) -> Option<Target> {
             Some(env("ANTHROPIC_API_KEY")?),
             env("ARBE_LIVE_ANTHROPIC_MODEL").unwrap_or_else(|| "claude-haiku-4-5-20251001".into()),
         ),
+        "openai_compatible" => {
+            env("ARBE_LIVE_COMPAT_BASE_URL")?;
+            (
+                env("ARBE_LIVE_COMPAT_API_KEY"),
+                env("ARBE_LIVE_COMPAT_MODEL")?,
+            )
+        }
         "ollama" => {
             env("ARBE_LIVE_OLLAMA")?;
             (
@@ -49,10 +59,10 @@ fn target(name: &str) -> Option<Target> {
         }
         _ => unreachable!(),
     };
-    let base_url = if name == "ollama" {
-        env("ARBE_BASE_URL")
-    } else {
-        None
+    let base_url = match name {
+        "ollama" => env("ARBE_BASE_URL"),
+        "openai_compatible" => env("ARBE_LIVE_COMPAT_BASE_URL"),
+        _ => None,
     };
     Some(Target {
         provider: build_provider(name, api_key, base_url).expect("provider builds"),
@@ -193,4 +203,11 @@ async fn anthropic_live() {
 async fn ollama_live() {
     text_round_trip("ollama").await;
     tool_round_trip("ollama").await;
+}
+
+#[tokio::test]
+#[ignore = "hits a real OpenAI-compatible server"]
+async fn openai_compatible_live() {
+    text_round_trip("openai_compatible").await;
+    tool_round_trip("openai_compatible").await;
 }

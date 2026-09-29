@@ -20,6 +20,8 @@ Session:
       --prompt <TEXT>      Send TEXT as the first message, then stay interactive
 
 Headless:
+      --headless           Serve JSON-RPC 2.0 on stdin/stdout (one message per line)
+                           instead of starting the UI
       --print <TEXT>       Run TEXT as a single turn, print the answer, and exit
       --approve <POLICY>   With --print, for tool calls that need approval:
                            `none` denies them [default]; `reads` approves low-risk
@@ -62,6 +64,7 @@ pub enum OutputFormat {
 pub enum Mode {
     Interactive { prompt: Option<String> },
     Print { prompt: String },
+    Headless,
     Help,
     Version,
 }
@@ -99,6 +102,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     };
     let mut prompt = None;
     let mut print = None;
+    let mut headless = false;
     let mut approve = None;
     let mut output = None;
     let mut seen = Vec::new();
@@ -146,6 +150,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             "--name" => cli.name = Some(value()?),
             "--prompt" => prompt = Some(value()?),
             "--print" => print = Some(value()?),
+            "--headless" => headless = true,
             "--resume" => {
                 let raw = value()?;
                 cli.resume = Some(
@@ -181,6 +186,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         seen.push(flag);
     }
 
+    if headless {
+        if prompt.is_some() || print.is_some() || cli.resume.is_some() || cli.name.is_some() {
+            return Err("--headless can't be combined with --prompt, --print, --resume or --name                  (sessions are opened through the protocol)"
+                .into());
+        }
+        if approve.is_some() || output.is_some() {
+            return Err("--approve and --output only apply with --print".into());
+        }
+        cli.mode = Mode::Headless;
+        return Ok(cli);
+    }
     cli.mode = match (prompt, print) {
         (Some(_), Some(_)) => return Err("--prompt and --print can't be combined".into()),
         (_, Some(prompt)) => {
@@ -278,6 +294,13 @@ mod tests {
     }
 
     #[test]
+    fn headless_is_its_own_mode() {
+        let cli = parse_str(&["--headless", "--workdir", "/repo"]).unwrap();
+        assert_eq!(cli.mode, Mode::Headless);
+        assert_eq!(cli.workdir, Some(PathBuf::from("/repo")));
+    }
+
+    #[test]
     fn mistakes_are_errors_not_ignored() {
         for (args, expected) in [
             (&["--verison"][..], "unknown option --verison"),
@@ -292,6 +315,7 @@ mod tests {
             ),
             (&["--print", "x", "--prompt", "y"][..], "can't be combined"),
             (&["--print", " "][..], "non-empty"),
+            (&["--headless", "--print", "x"][..], "can't be combined"),
         ] {
             let err = parse_str(args).unwrap_err();
             assert!(err.contains(expected), "{args:?}: {err}");

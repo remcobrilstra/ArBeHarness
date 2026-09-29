@@ -98,15 +98,34 @@ fn a_headless_run_reports_events_and_a_failed_result_as_json() {
     assert!(meta.get("pid").is_none() && meta.get("activity").is_none());
 }
 
-/// Needs a local Ollama with the default coding model:
-/// `ARBE_LIVE_OLLAMA=1 cargo test --test cli -- --ignored`.
-#[test]
-#[ignore = "needs a local Ollama server"]
-fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
-    if std::env::var("ARBE_LIVE_OLLAMA").is_err() {
-        eprintln!("skipped (set ARBE_LIVE_OLLAMA=1)");
-        return;
+/// Provider settings for the live test: an OpenAI-compatible server
+/// (`ARBE_LIVE_COMPAT_BASE_URL`, `ARBE_LIVE_COMPAT_MODEL`,
+/// `ARBE_LIVE_COMPAT_API_KEY`) or local Ollama (`ARBE_LIVE_OLLAMA=1`).
+fn live_env() -> Option<Vec<(&'static str, String)>> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(url) = var("ARBE_LIVE_COMPAT_BASE_URL") {
+        let mut env = vec![
+            ("ARBE_PROVIDER", "openai_compatible".to_string()),
+            ("ARBE_BASE_URL", url),
+            ("ARBE_MODEL", var("ARBE_LIVE_COMPAT_MODEL")?),
+        ];
+        if let Some(key) = var("ARBE_LIVE_COMPAT_API_KEY") {
+            env.push(("ARBE_API_KEY", key));
+        }
+        return Some(env);
     }
+    var("ARBE_LIVE_OLLAMA").map(|_| Vec::new())
+}
+
+/// `cargo test --test cli -- --ignored` with a live target (see [`live_env`]).
+#[test]
+#[ignore = "needs a live model"]
+fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
+    let Some(live) = live_env() else {
+        eprintln!("skipped: set ARBE_LIVE_COMPAT_BASE_URL or ARBE_LIVE_OLLAMA");
+        return;
+    };
+    let live: Vec<(&str, &str)> = live.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let home = tempfile::tempdir().unwrap();
     let workdir = tempfile::tempdir().unwrap();
     let file = workdir.path().join("server.toml");
@@ -115,7 +134,7 @@ fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
     let out = arbeharness(
         home.path(),
         workdir.path(),
-        &[],
+        &live,
         &[
             "--print",
             "Which port does server.toml set? Read it.",
@@ -142,7 +161,7 @@ fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
     let out = arbeharness(
         home.path(),
         workdir.path(),
-        &[],
+        &live,
         &[
             "--resume",
             &id,
@@ -160,7 +179,7 @@ fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
     let out = arbeharness(
         home.path(),
         workdir.path(),
-        &[],
+        &live,
         &[
             "--resume",
             &id,
@@ -172,4 +191,73 @@ fn a_headless_run_answers_resumes_and_honors_the_approval_policy() {
     );
     assert_eq!(out.status.code(), Some(0));
     assert!(std::fs::read_to_string(&file).unwrap().contains("9100"));
+}
+
+#[test]
+fn headless_mode_speaks_json_rpc_over_stdio() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let home = tempfile::tempdir().unwrap();
+    let workdir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arbeharness"))
+        .arg("--headless")
+        .arg("--dev-home")
+        .arg(home.path())
+        .arg("--workdir")
+        .arg(workdir.path())
+        .env_remove("ARBE_PROVIDER")
+        .env_remove("ARBE_MODEL")
+        // Unreachable: the turn fails fast, without a real model.
+        .env("ARBE_BASE_URL", "http://127.0.0.1:9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut request = |id: u32, method: &str, params: serde_json::Value| {
+        let message =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(stdin, "{message}").unwrap();
+    };
+    let mut read_until_response = |id: u32| {
+        let mut before = Vec::new();
+        loop {
+            let line = lines.next().expect("stdout closed").unwrap();
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if message["id"] == id {
+                return (message, before);
+            }
+            before.push(message);
+        }
+    };
+
+    request(1, "initialize", serde_json::Value::Null);
+    let (init, _) = read_until_response(1);
+    assert_eq!(init["result"]["server"], "arbeharness");
+
+    request(2, "session/new", serde_json::json!({"name": "via rpc"}));
+    let (opened, _) = read_until_response(2);
+    let session_id = opened["result"]["session_id"].clone();
+
+    request(
+        3,
+        "turn/send",
+        serde_json::json!({"session_id": session_id, "message": "hi"}),
+    );
+    let (failed, events) = read_until_response(3);
+    assert_eq!(failed["error"]["code"], -32003, "{failed}");
+    let types: Vec<&str> = events
+        .iter()
+        .filter(|m| m["method"] == "event")
+        .map(|m| m["params"]["event"]["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"turn_started"), "{types:?}");
+    assert!(types.contains(&"runtime_error"), "{types:?}");
+
+    request(4, "shutdown", serde_json::Value::Null);
+    let (bye, _) = read_until_response(4);
+    assert_eq!(bye["result"], serde_json::json!({}));
+    assert!(child.wait().unwrap().success());
 }
