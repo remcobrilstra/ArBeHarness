@@ -16,10 +16,15 @@ use crate::tokens::{estimate_block_tokens, estimate_message_tokens};
 /// ~15 tokens, and small results are often the most informative).
 const MIN_PRUNABLE_TOKENS: u64 = 200;
 
+const STUB_PREFIX: &str = "[tool output omitted to save context";
+
 fn stub(tokens: u64) -> String {
-    format!(
-        "[tool output omitted to save context (~{tokens} tokens); re-run the tool if it's needed again]"
-    )
+    format!("{STUB_PREFIX} (~{tokens} tokens); re-run the tool if it's needed again]")
+}
+
+/// Whether a tool result's text is a pruning stub.
+pub(crate) fn is_stub(text: &str) -> bool {
+    text.starts_with(STUB_PREFIX)
 }
 
 /// Stubs out tool results, oldest first, until the estimated size of

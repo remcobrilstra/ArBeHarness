@@ -146,6 +146,7 @@ Requests are handled concurrently: while a `turn/send` is waiting for its turn t
 | `session/list` | none | `{"sessions": [<meta.json contents>, …]}`, newest first |
 | `session/set_title` | `session_id`, `title` | `{}` |
 | `session/close` | `session_id` | `{}` (stops a running turn first) |
+| `session/context` | `session_id` | `{"usage": {"breakdown", "total_tokens", "budget_tokens", "context_window", "compaction_threshold_tokens"}}` — the latest model call's context by source (`null` before the first call); also sent before every call as a `context_updated` event |
 | `turn/send` | `session_id`, `message` | `{"answer", "stop_reason"}` once the turn ends |
 | `turn/cancel` | `session_id` | `{"cancelled": true/false}` (whether a turn was running) |
 | `approval/decide` | `session_id`, `tool_call_id`, `decision` | `{"accepted": true/false}` (false if nothing was waiting on that call) |
@@ -443,7 +444,22 @@ ARBE_PROVIDER=openai_compatible ARBE_BASE_URL=https://api.x.ai/v1 ARBE_API_KEY=x
 
 If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to avoid "context length exceeded" errors.
 
-**Token counts** in the header are estimates (about 4 characters per token). After the first reply, the harness calibrates the estimate against the provider's reported usage.
+**Token counts** in the header are estimates (about 4 characters per token). After each model call, the harness calibrates the estimate against the input tokens the provider reports: the first call sets the correction outright, later ones refine it. Code and JSON count denser than prose, so expect the first call's figure in a session to be low (about a quarter, in a live check on grok-4.7) and later ones to be close.
+
+**What's in the context.** Type `/context` in the chat screen for the latest model call's context by source, in tokens and as a share of the total:
+
+```
+Context of the latest model call: ~6908 tokens (6% of the 123904 budget; window 128000)
+  system prompt               345    5.0%
+  instruction files          2338   33.8%
+  tool definitions           2327   33.7%
+  this turn: user              25    0.4%
+  this turn: tool results     897   13.0%
+  ...
+  earlier turns: 0 in context, 0 left out
+```
+
+The sources are: the harness's own **system prompt**; your **instruction files** (`~/.arbe/instructions/agent.md` and the project's `agent.md`/`CLAUDE.md`); **skills**; **memory** notes; the **compaction summary**; the **tool definitions** offered to the model (MCP servers can add many); earlier turns (**history**) and **this turn**, each split into your text, the model's text, thinking, tool calls, tool results, images and the harness's own notes. It also says how many earlier turns are in the context and how many were left out, how many old tool results were shortened, and where automatic compaction starts. The same breakdown is sent before every model call as a `context_updated` event (`--print --output json`, `--headless`), and `session/context` returns the latest one.
 
 ---
 
@@ -451,7 +467,7 @@ If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to a
 
 The screen has three parts:
 
-1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent. `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
+1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent, against the context budget: `~12.3k/124k (10%)` (type `/context` for what it's made of). `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
 
 **Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, reasoning models on OpenAI-compatible servers such as xAI), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
 2. **Transcript**: your messages, the assistant's replies (basic Markdown formatting), tool activity, and `[error]` / `[info]` status lines. Replies stream in as they are generated, including any text the model writes between tool calls. If you scroll up, new output doesn't pull you back down. Scroll to the bottom to follow it again.
@@ -530,6 +546,7 @@ Anything you type is sent to the model, except lines starting with a recognized 
 |---|---|
 | `/profile` | Open the profile picker (same as `Ctrl+P`). |
 | `/profile <name>` | Switch this session to profile `<name>` — see [Switching models with profiles](#switching-models-with-profiles). |
+| `/context` | Show what the latest model call's context was made of: system prompt, instruction files, skills, memory, summary, tool definitions, history and this turn, in tokens and percent (see [Token counts](#providers-and-models)). |
 | `/compact` | Have the model summarize everything but your latest exchange now, to free up context. Works with either memory strategy. |
 | `/tool <name> <json-args>` | Run one of the [builtin tools](#builtin-tools) yourself. It goes through exactly the same path as a call from the model: the same approval dialog, the same output limit, the same transcript lines. Handy for checking that a tool works. Invalid JSON is treated as `{}`. Not available while a turn is running. |
 

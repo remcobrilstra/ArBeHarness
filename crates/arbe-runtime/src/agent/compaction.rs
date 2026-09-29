@@ -13,7 +13,7 @@ use super::Agent;
 use super::tools::truncate_middle;
 
 /// Compact once history passes this share of the budget...
-const TRIGGER_RATIO: f64 = 0.8;
+pub(super) const TRIGGER_RATIO: f64 = 0.8;
 /// ...down to about this share, so it doesn't happen again next turn.
 const TARGET_RATIO: f64 = 0.4;
 /// How much of each tool result the summarizer sees.

@@ -4,6 +4,7 @@
 //! either presentation state (`app.rs`) or rendering (`ui.rs`).
 
 pub mod app;
+pub mod context_view;
 pub mod markdown;
 pub mod ui;
 
@@ -188,6 +189,10 @@ fn drain_runtime_events(
                 app.activity = Some(format!(
                     "calling model (~{estimated_tokens} tokens context)…"
                 ));
+            }
+            Ok(RuntimeEvent::ContextUpdated { usage, .. }) => {
+                app.last_estimated_tokens = usage.total_tokens;
+                app.context = Some(usage);
             }
             Ok(RuntimeEvent::ProviderRetrying {
                 attempt,
@@ -724,6 +729,8 @@ fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
     app.model = new_agent.model().to_string();
     app.session_tokens = new_agent.usage().total_tokens();
     app.session_cost_usd = new_agent.cost_usd();
+    app.context = new_agent.context_usage();
+    app.last_estimated_tokens = new_agent.last_estimated_tokens();
     app.clear_transcript();
     app.pending_approval = None;
     app.proposed_tool_calls.clear();
@@ -887,6 +894,19 @@ fn submit_input(
     let content = app.take_input();
     app.status_message = None;
     app.notice = None;
+
+    if content.trim() == "/context" {
+        match agent.context_usage() {
+            Some(usage) => app.push_line(Role::System, context_view::report(&usage)),
+            None => {
+                app.notice = Some(
+                    "no model call yet in this session — the breakdown appears after the first one"
+                        .to_string(),
+                )
+            }
+        }
+        return;
+    }
 
     if content.trim() == "/compact" {
         app.working = true;

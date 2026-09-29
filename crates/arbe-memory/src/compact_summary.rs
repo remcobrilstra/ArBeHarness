@@ -53,6 +53,7 @@ impl ContextStrategy for CompactWithSummaryStrategy {
             estimated_tokens,
             truncated: dropped_count > 0,
             pruned_tool_results: 0,
+            ..Default::default()
         }
     }
 }

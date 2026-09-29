@@ -65,6 +65,9 @@ struct Settings {
     temperature: f32,
     max_tokens: u64,
     budget_tokens: u64,
+    /// The model's context window (for reporting; budgeting uses
+    /// `budget_tokens`).
+    context_window: u64,
     max_tool_rounds: u32,
     max_turn_tokens: Option<u64>,
     max_tool_output_chars: usize,
@@ -92,6 +95,8 @@ struct SessionState {
     pinned_turn_indices: Vec<u64>,
     next_turn_index: u64,
     last_estimated_tokens: u64,
+    /// What the latest model request's context was made of.
+    last_context: Option<arbe_core::ContextUsage>,
     calibration: TokenCalibration,
     pipeline: ContextPipeline,
     /// The latest compaction; history holds only the turns after it.
@@ -212,7 +217,26 @@ fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
 /// than cached, so edits take effect on the next turn without restarting.
 /// A read error degrades to an absent section — instructions are additive,
 /// not load-bearing, so a transient error can't take down a turn.
-fn build_system_prompt(template: &PromptTemplate, project_dir: &Path, home: &Path) -> String {
+/// A rendered system prompt, and how many (estimated) tokens of it are
+/// instruction files rather than the template's own text.
+struct SystemPrompt {
+    text: String,
+    instruction_file_tokens: u64,
+}
+
+impl SystemPrompt {
+    fn render(template: &str, global: Option<&str>, project: Option<&str>) -> Self {
+        let text = crate::system_prompt::render_template(template, global, project);
+        let bare = crate::system_prompt::render_template(template, None, None);
+        Self {
+            instruction_file_tokens: arbe_memory::estimate_tokens(&text)
+                .saturating_sub(arbe_memory::estimate_tokens(&bare)),
+            text,
+        }
+    }
+}
+
+fn build_system_prompt(template: &PromptTemplate, project_dir: &Path, home: &Path) -> SystemPrompt {
     let global =
         arbe_storage::instructions::read_global_instructions_at(home).unwrap_or_else(|err| {
             tracing::warn!(%err, "failed to read global instructions; continuing without them");
@@ -223,7 +247,7 @@ fn build_system_prompt(template: &PromptTemplate, project_dir: &Path, home: &Pat
             tracing::warn!(%err, "failed to read project instructions; continuing without them");
             None
         });
-    crate::system_prompt::render_template(&template.text(), global.as_deref(), project.as_deref())
+    SystemPrompt::render(&template.text(), global.as_deref(), project.as_deref())
 }
 
 /// [`build_system_prompt`] off the async executor: `arbe_storage`'s readers
@@ -232,7 +256,7 @@ async fn build_system_prompt_async(
     template: &PromptTemplate,
     project_dir: &Path,
     home: &Path,
-) -> String {
+) -> SystemPrompt {
     let template = template.clone();
     let project_dir = project_dir.to_path_buf();
     let home = home.to_path_buf();
@@ -240,7 +264,10 @@ async fn build_system_prompt_async(
         .await
         .unwrap_or_else(|err| {
             tracing::warn!(%err, "system prompt render task panicked; using template with no instructions");
-            crate::system_prompt::render_system_prompt(None, None)
+            SystemPrompt {
+                text: crate::system_prompt::render_system_prompt(None, None),
+                instruction_file_tokens: 0,
+            }
         })
 }
 
@@ -355,6 +382,7 @@ impl Agent {
                 pinned_turn_indices: Vec::new(),
                 next_turn_index: parts.next_turn_index,
                 last_estimated_tokens: 0,
+                last_context: None,
                 calibration: TokenCalibration::default(),
                 summary: parts.summary,
                 shown_instruction_dirs: Default::default(),
@@ -466,6 +494,7 @@ impl Agent {
                 temperature: config.temperature,
                 max_tokens: config.max_tokens,
                 budget_tokens,
+                context_window: capabilities.max_context_tokens,
                 max_tool_rounds: config.max_tool_rounds,
                 max_turn_tokens: config.max_turn_tokens,
                 max_tool_output_chars: config.max_tool_output_chars,
@@ -748,6 +777,14 @@ impl Agent {
     /// status display (TUI-FR-4); `0` before the first turn.
     pub fn last_estimated_tokens(&self) -> u64 {
         self.state().last_estimated_tokens
+    }
+
+    /// What the most recent model request's context was made of, by
+    /// source, against the budget; `None` before the first model call.
+    /// Updated before every model call (also published as
+    /// `RuntimeEvent::ContextUpdated`).
+    pub fn context_usage(&self) -> Option<arbe_core::ContextUsage> {
+        self.state().last_context.clone()
     }
 
     /// Provider-reported token usage over the whole session.

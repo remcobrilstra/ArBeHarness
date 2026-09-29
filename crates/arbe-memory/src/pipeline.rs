@@ -1,8 +1,9 @@
-use arbe_core::{Message, Role};
+use arbe_core::{ContextBreakdown, Message, Role};
 
+use crate::breakdown::{count_stubbed_results, count_turns, measure_messages};
 use crate::history::HistoryEntry;
 use crate::prune::prune_tool_results;
-use crate::tokens::estimate_message_tokens;
+use crate::tokens::{estimate_message_tokens, estimate_tokens};
 use crate::{ContextInput, ContextOutput, ContextStrategy};
 
 /// Assembles a full turn's context: system instructions, global
@@ -25,13 +26,36 @@ pub struct ContextPipeline {
     /// A summary standing in for compacted older turns; placed right after
     /// the instructions, before the remaining history.
     pub conversation_summary: Option<String>,
+    /// How much of `system_instructions` is instruction files substituted
+    /// into the prompt template (estimator units), so the breakdown can
+    /// report them apart from the harness's own prompt.
+    pub instruction_file_tokens: u64,
 }
 
 impl ContextPipeline {
-    fn preamble(&self) -> Vec<Message> {
-        let summary = self.conversation_summary.as_ref().map(|s| {
+    fn summary_text(&self) -> Option<String> {
+        self.conversation_summary.as_ref().map(|s| {
             format!("Summary of the earlier conversation (older messages were compacted to save space):\n{s}")
-        });
+        })
+    }
+
+    /// The preamble's share of the breakdown: everything before history.
+    fn measure_preamble(&self) -> ContextBreakdown {
+        let sum = |texts: &[String]| texts.iter().map(|t| estimate_tokens(t)).sum::<u64>();
+        let system = sum(&self.system_instructions);
+        let instruction_files = self.instruction_file_tokens.min(system);
+        ContextBreakdown {
+            system_prompt: system - instruction_files,
+            instructions: instruction_files + sum(&self.global_instructions),
+            skills: sum(&self.skill_instructions),
+            memory: sum(&self.memory_notes),
+            summary: self.summary_text().map_or(0, |t| estimate_tokens(&t)),
+            ..Default::default()
+        }
+    }
+
+    fn preamble(&self) -> Vec<Message> {
+        let summary = self.summary_text();
         self.system_instructions
             .iter()
             .chain(self.global_instructions.iter())
@@ -91,6 +115,20 @@ impl ContextPipeline {
             pinned_turn_indices,
         });
 
+        let history_messages = &history_output.messages;
+        let history_turns = count_turns(history_messages);
+        let mut all_turns: Vec<u64> = history.iter().map(|e| e.turn_index).collect();
+        all_turns.dedup();
+        let breakdown = ContextBreakdown {
+            history: measure_messages(history_messages),
+            current_turn: measure_messages(std::slice::from_ref(&user_message)),
+            history_turns,
+            omitted_turns: (all_turns.len() as u64).saturating_sub(history_turns),
+            stubbed_tool_results: count_stubbed_results(history_messages),
+            ..self.measure_preamble()
+        };
+
+        let preamble_messages = preamble.len();
         let mut messages = preamble;
         messages.extend(history_output.messages);
         messages.push(user_message);
@@ -102,6 +140,8 @@ impl ContextPipeline {
             estimated_tokens,
             truncated: history_output.truncated,
             pruned_tool_results,
+            breakdown,
+            preamble_messages,
         }
     }
 }
@@ -126,6 +166,7 @@ mod tests {
             skill_instructions: vec!["skill: rust".to_string()],
             memory_notes: vec!["remembered fact".to_string()],
             conversation_summary: None,
+            instruction_file_tokens: 0,
         };
         let strategy = TruncationStrategy;
         let out = pipeline.assemble(
@@ -203,6 +244,48 @@ mod tests {
         assert_eq!(out.pruned_tool_results, 1);
         assert!(!out.truncated);
         assert!(out.estimated_tokens < 1_000);
+    }
+
+    #[test]
+    fn the_breakdown_accounts_for_every_message_by_source() {
+        let pipeline = ContextPipeline {
+            system_instructions: vec!["x".repeat(400)],
+            instruction_file_tokens: 60,
+            skill_instructions: vec!["s".repeat(40)],
+            memory_notes: vec!["m".repeat(20)],
+            conversation_summary: Some("earlier".to_string()),
+            ..Default::default()
+        };
+        let history: Vec<HistoryEntry> = (0..6)
+            .flat_map(|t| {
+                [
+                    history_entry(t, &"q".repeat(400)),
+                    HistoryEntry {
+                        turn_index: t,
+                        message: Message::new(Role::Assistant, "a".repeat(400)),
+                    },
+                ]
+            })
+            .collect();
+        let out = pipeline.assemble(
+            &TruncationStrategy,
+            &history,
+            &[],
+            Message::new(Role::User, "now"),
+            600,
+        );
+        let b = &out.breakdown;
+        assert_eq!(b.system_prompt, 40);
+        assert_eq!(b.instructions, 60);
+        assert_eq!(b.skills, 10);
+        assert_eq!(b.memory, 5);
+        assert!(b.summary > 0);
+        assert_eq!(b.tools, 0);
+        assert_eq!(b.current_turn.user, 1);
+        assert!(b.history_turns < 6 && b.history_turns > 0);
+        assert_eq!(b.history_turns + b.omitted_turns, 6);
+        assert_eq!(b.history.user, b.history_turns * 100);
+        assert_eq!(b.total(), out.estimated_tokens);
     }
 
     #[test]

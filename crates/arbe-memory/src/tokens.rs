@@ -37,17 +37,23 @@ pub(crate) fn estimate_block_tokens(block: &ContentBlock) -> u64 {
 /// Learns how far [`estimate_tokens`]'s ~4-chars/token heuristic is off
 /// for the current model and content, from the input token counts the
 /// provider actually reports (v2 plan P2.7). The ratio also absorbs what
-/// the estimate never sees — tool definitions and per-message formatting
-/// overhead — so budgeting against the calibrated estimate keeps real
-/// requests inside the window.
+/// the estimate never sees — per-message formatting overhead and the
+/// tokenizer's real density for this content (code and JSON run denser
+/// than the heuristic) — so budgeting against the calibrated estimate
+/// keeps real requests inside the window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TokenCalibration {
     factor: f64,
+    /// Whether any request has been observed yet.
+    observed: bool,
 }
 
 impl Default for TokenCalibration {
     fn default() -> Self {
-        Self { factor: 1.0 }
+        Self {
+            factor: 1.0,
+            observed: false,
+        }
     }
 }
 
@@ -64,13 +70,20 @@ impl TokenCalibration {
     }
 
     /// Records one request: its estimated prompt size vs. the provider's
-    /// reported input tokens (including cached ones).
+    /// reported input tokens (including cached ones). The first observation
+    /// is taken as is — the default of 1.0 is a guess, not evidence — and
+    /// later ones are averaged in.
     pub fn observe(&mut self, estimated: u64, actual: u64) {
         if estimated == 0 || actual == 0 {
             return;
         }
         let ratio = (actual as f64 / estimated as f64).clamp(Self::MIN, Self::MAX);
-        self.factor = (1.0 - Self::ALPHA) * self.factor + Self::ALPHA * ratio;
+        self.factor = if self.observed {
+            (1.0 - Self::ALPHA) * self.factor + Self::ALPHA * ratio
+        } else {
+            ratio
+        };
+        self.observed = true;
     }
 
     /// An estimate corrected toward real token counts.
@@ -95,10 +108,14 @@ mod tests {
     fn calibration_moves_toward_observed_ratios_within_bounds() {
         let mut cal = TokenCalibration::default();
         assert_eq!(cal.calibrate(1_000), 1_000);
-        cal.observe(1_000, 2_000);
+        // The first observation replaces the default outright...
+        cal.observe(1_000, 1_300);
         assert!((cal.factor() - 1.3).abs() < 1e-9);
         assert_eq!(cal.calibrate(1_000), 1_300);
         assert_eq!(cal.budget_in_estimate_units(1_300), 1_000);
+        // ...later ones are averaged in.
+        cal.observe(1_000, 2_300);
+        assert!((cal.factor() - 1.6).abs() < 1e-9);
         for _ in 0..50 {
             cal.observe(10, 1_000_000);
         }

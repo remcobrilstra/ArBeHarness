@@ -3,7 +3,7 @@
 //!
 //! Requests (client → harness): `initialize`, `session/new`,
 //! `session/resume`, `session/list`, `session/set_title`, `session/close`,
-//! `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
+//! `session/context`, `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
 //! `shutdown`. Every event
 //! of an open session arrives as an `event` notification
 //! (`{"session_id", "seq", "event"}`). Requests run concurrently: while
@@ -301,6 +301,10 @@ impl Server {
                 Ok(json!({}))
             }),
             "session/close" => params::<SessionParams>(raw).and_then(|p| self.close(p.session_id)),
+            "session/context" => params::<SessionParams>(raw).and_then(|p| {
+                let usage = self.with_session(p.session_id, |s| Ok(s.context_usage()))?;
+                Ok(json!({"usage": usage}))
+            }),
             "turn/send" => match params::<SendParams>(raw) {
                 // Answered by the session's forwarder, after the turn's events.
                 Ok(p) => match self.send_turn(id.clone(), p) {
@@ -697,6 +701,25 @@ mod tests {
             .expect("turn_completed was sent");
         let answered = client.seen.iter().position(|m| m["id"] == 3).unwrap();
         assert!(completed < answered);
+        // Each model call's context was reported, and the latest can be asked for.
+        let updates = client
+            .seen
+            .iter()
+            .filter(|m| m["params"]["event"]["type"] == "context_updated")
+            .count();
+        assert_eq!(updates, 2);
+        let context = client
+            .call(6, "session/context", json!({"session_id": session_id}))
+            .await;
+        let usage = &context["result"]["usage"];
+        assert!(usage["breakdown"]["tools"].as_u64().unwrap() > 0);
+        assert!(
+            usage["breakdown"]["current_turn"]["tool_results"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(usage["budget_tokens"].as_u64().unwrap() > 0);
 
         let shutdown = client.call(5, "shutdown", Value::Null).await;
         assert_eq!(shutdown["result"], json!({}));

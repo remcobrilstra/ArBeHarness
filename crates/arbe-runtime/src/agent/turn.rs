@@ -3,8 +3,9 @@
 //! it's produced.
 
 use arbe_core::{
-    ContentBlock, HarnessError, LoopMachine, LoopPhase, MemoryError, Message, ProviderError,
-    RequestedToolCall, Role, RuntimeEvent, StopReason, ToolSpec, Turn, TurnId, Usage,
+    ContentBlock, ContextBreakdown, ContextUsage, HarnessError, LoopMachine, LoopPhase,
+    MemoryError, Message, ProviderError, RequestedToolCall, Role, RuntimeEvent, StopReason,
+    ToolSpec, Turn, TurnId, Usage,
 };
 use arbe_hooks::HookPhase;
 use arbe_memory::HistoryEntry;
@@ -17,6 +18,14 @@ use futures_util::StreamExt;
 
 use super::hooks::{self, ErrorPayload, ModelCallPayload, ModelResultPayload, TurnPayload};
 use super::{Agent, build_system_prompt_async, compaction, memory, tools};
+
+/// The assembled context as measured for the first model call; later
+/// rounds are measured afresh from their messages.
+struct MeasuredContext {
+    /// Messages before the history (instructions, skills, memory, summary).
+    preamble_len: usize,
+    breakdown: ContextBreakdown,
+}
 
 /// How many consecutive rounds may request the identical set of tool calls
 /// before the turn is stopped as stuck.
@@ -342,16 +351,33 @@ impl TurnRunner<'_> {
                 .unwrap_or_default()
         };
         let user_message = Message::new(Role::User, content);
+
+        // Tool definitions are part of every request: measured, and taken
+        // out of the budget before history gets what's left.
+        agent.refresh_mcp_tools().await;
+        let tool_specs = if agent
+            .provider
+            .capabilities(&agent.settings.model)
+            .tool_calls
+        {
+            agent.registry_snapshot().specs()
+        } else {
+            Vec::new()
+        };
+        let tool_tokens = arbe_memory::estimate_tool_specs(&tool_specs);
+
         let (context, estimated_display) = {
             let mut state = agent.state();
-            state.pipeline.system_instructions = vec![system_prompt];
+            state.pipeline.system_instructions = vec![system_prompt.text];
+            state.pipeline.instruction_file_tokens = system_prompt.instruction_file_tokens;
             state.pipeline.memory_notes = memory_notes;
             state.pipeline.conversation_summary = state.summary.as_ref().map(|c| c.summary.clone());
             // The pipeline budgets in estimator units; convert so the real
             // prompt lands inside the budget.
             let budget = state
                 .calibration
-                .budget_in_estimate_units(agent.settings.budget_tokens);
+                .budget_in_estimate_units(agent.settings.budget_tokens)
+                .saturating_sub(tool_tokens);
             // Stub out old tool output in the live history itself (the
             // full text is on disk), down to a bit under the budget so the
             // pipeline rarely has to copy and prune it again each turn.
@@ -363,7 +389,9 @@ impl TurnRunner<'_> {
                 user_message.clone(),
                 budget,
             );
-            let display = state.calibration.calibrate(context.estimated_tokens);
+            let display = state
+                .calibration
+                .calibrate(context.estimated_tokens + tool_tokens);
             state.last_estimated_tokens = display;
             (context, display)
         };
@@ -374,35 +402,103 @@ impl TurnRunner<'_> {
         self.record(user_message);
 
         advance(&mut self.machine, LoopPhase::PlanOrDirectRespond)?;
-        agent.refresh_mcp_tools().await;
-        let tool_specs = if agent
-            .provider
-            .capabilities(&agent.settings.model)
-            .tool_calls
-        {
-            agent.registry_snapshot().specs()
-        } else {
-            Vec::new()
+        let measured = MeasuredContext {
+            preamble_len: context.preamble_messages,
+            breakdown: ContextBreakdown {
+                tools: tool_tokens,
+                ..context.breakdown
+            },
         };
-
-        self.model_loop(context.messages, context.estimated_tokens, tool_specs)
+        self.model_loop(context.messages, measured, tool_specs)
             .await
+    }
+
+    /// A long tool loop grows the turn's own messages without bound: stubs
+    /// out older tool results once they no longer fit (the persisted trace
+    /// keeps them in full; the newest results — the ones the model hasn't
+    /// read yet — are never touched). If that isn't enough (e.g. a single
+    /// huge result that must stay whole), drops the oldest earlier turns
+    /// from this request — never the preamble, never this turn. Returns how
+    /// many messages were removed before `turn_start`.
+    fn make_room(
+        &self,
+        messages: &mut Vec<Message>,
+        history_start: usize,
+        turn_start: usize,
+        tool_tokens: u64,
+    ) -> usize {
+        let agent = self.agent;
+        let budget = agent
+            .state()
+            .calibration
+            .budget_in_estimate_units(agent.settings.budget_tokens)
+            .saturating_sub(tool_tokens);
+        let pruned = arbe_memory::prune_tool_results(messages, budget, 1);
+        let removed = arbe_memory::drop_oldest_turns(messages, history_start, turn_start, budget);
+        if pruned + removed > 0 {
+            tracing::debug!(pruned, removed, "made room within the turn");
+        }
+        removed
+    }
+
+    /// Measures the request about to be sent — `messages[history]` is the
+    /// earlier history, everything after it this turn — publishes it as
+    /// `ContextUpdated` (calibrated), and returns its size in estimator
+    /// units. `first` is the first round's measurement, for what doesn't
+    /// change between rounds (instructions, tools).
+    fn publish_context(
+        &self,
+        round: u32,
+        messages: &[Message],
+        history: std::ops::Range<usize>,
+        first: &ContextBreakdown,
+    ) -> u64 {
+        let agent = self.agent;
+        let earlier = &messages[history.clone()];
+        let history_turns = arbe_memory::count_turns(earlier);
+        let breakdown = ContextBreakdown {
+            history: arbe_memory::measure_messages(earlier),
+            current_turn: arbe_memory::measure_messages(&messages[history.end..]),
+            history_turns,
+            // Turns dropped since the first round were omitted too.
+            omitted_turns: first.omitted_turns + first.history_turns.saturating_sub(history_turns),
+            stubbed_tool_results: arbe_memory::count_stubbed_results(&messages[history.start..]),
+            ..first.clone()
+        };
+        let estimated = breakdown.total();
+        let settings = &agent.settings;
+        let usage = {
+            let mut state = agent.state();
+            let usage = ContextUsage::new(
+                breakdown.scaled(state.calibration.factor()),
+                settings.budget_tokens,
+                settings.context_window,
+                settings
+                    .auto_compact
+                    .then_some((settings.budget_tokens as f64 * compaction::TRIGGER_RATIO) as u64),
+            );
+            state.last_context = Some(usage.clone());
+            usage
+        };
+        agent.events.publish(RuntimeEvent::ContextUpdated {
+            turn_id: self.turn_id(),
+            round,
+            usage,
+        });
+        estimated
     }
 
     async fn model_loop(
         &mut self,
         mut messages: Vec<Message>,
-        estimated_prompt_tokens: u64,
+        measured: MeasuredContext,
         tool_specs: Vec<ToolSpec>,
     ) -> Result<LoopEnd, HarnessError> {
         let agent = self.agent;
         let turn_id = self.turn_id();
         // Where earlier history starts (after the instructions/summary) and
         // where this turn starts (its user message), for in-turn trimming.
-        let history_start = messages
-            .iter()
-            .take_while(|m| m.role == Role::System)
-            .count();
+        let history_start = measured.preamble_len;
         let mut turn_start = messages.len().saturating_sub(1);
         let mut previous_calls: Option<Vec<(String, String)>> = None;
         let mut identical_rounds = 1;
@@ -432,31 +528,21 @@ impl TurnRunner<'_> {
             )
             .await;
 
-            // A long tool loop grows the turn's own messages without bound;
-            // stub out its older tool results once they no longer fit
-            // (the persisted trace keeps them in full). The newest results
-            // — the ones the model hasn't read yet — are never touched.
             if round > 0 {
-                let budget = agent
-                    .state()
-                    .calibration
-                    .budget_in_estimate_units(agent.settings.budget_tokens);
-                let pruned = arbe_memory::prune_tool_results(&mut messages, budget, 1);
-                // Still too big (e.g. a single huge result that must stay
-                // whole): make room by dropping the oldest earlier turns
-                // from this request — never the preamble, never this turn.
-                let removed = arbe_memory::drop_oldest_turns(
+                turn_start -= self.make_room(
                     &mut messages,
                     history_start,
                     turn_start,
-                    budget,
+                    measured.breakdown.tools,
                 );
-                turn_start -= removed;
-                if pruned + removed > 0 {
-                    tracing::debug!(pruned, removed, "made room within the turn");
-                }
             }
 
+            let estimated_prompt_tokens = self.publish_context(
+                round,
+                &messages,
+                history_start..turn_start,
+                &measured.breakdown,
+            );
             let request = ModelRequest {
                 model: agent.settings.model.clone(),
                 messages: messages.clone(),
@@ -467,17 +553,15 @@ impl TurnRunner<'_> {
             };
             let (response, cancelled) = self.stream_inference(request).await?;
             self.usage += response.usage;
-            if round == 0 {
-                // Only the first round's prompt is exactly what was
-                // estimated; later rounds add the tool trace.
-                let actual = response.usage.input_tokens
-                    + response.usage.cache_read_tokens
-                    + response.usage.cache_write_tokens;
-                agent
-                    .state()
-                    .calibration
-                    .observe(estimated_prompt_tokens, actual);
-            }
+            // Every round's request was measured whole (tools included),
+            // so each one teaches the calibration.
+            let actual = response.usage.input_tokens
+                + response.usage.cache_read_tokens
+                + response.usage.cache_write_tokens;
+            agent
+                .state()
+                .calibration
+                .observe(estimated_prompt_tokens, actual);
             let tool_calls = response.message.tool_uses();
 
             hooks::run(

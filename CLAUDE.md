@@ -78,6 +78,8 @@ Phase 7 (hardening) is done: cross-crate integration coverage was added at the `
 
 **v2 P6 additions:** `ask_user` (`agent/ask.rs`; a `QuestionMailbox` shared through the subagent `Lineage` like approval decisions; `Agent::answer_question`); background processes (`arbe-tools/src/builtin/processes.rs`, a per-registry `ProcessTable` shared by `execute`/`process_output`/`process_kill`); web tools (`builtin/web.rs`; `[web.search]` is trust-stripped from project config and its key redacted); observability (the *binary* installs the log subscriber in `src/main.rs` — the library never does; spans `turn` → `tool`; `Pricing`/`cost_usd`). Two `ToolExecutor` hooks to know: `requires_approval()` (false = skip the human prompt, but still through the gate — deny rules and dry-run apply) and `close()` (called by `Agent::close` via `ToolRegistry::close_all`: release anything that must not outlive the session). Commits are gated on the full suite passing.
 
+**Context accounting** (v2 plan P5.7): every model round's request is measured whole — `ContextBreakdown` by source (system prompt, instruction files, skills, memory, summary, tool definitions, history / current turn by content kind) — and published calibrated as `RuntimeEvent::ContextUpdated`; `Agent::context_usage()` returns the latest. Anything new that goes into a request (a new preamble section, extra per-request payload) must be counted there too, or the breakdown stops adding up to what's sent — `the_breakdown_accounts_for_every_message_by_source` checks the sum.
+
 v1 is a real, working, tested product core — not a finished release. Work now follows `docs/v2-implementation-plan.md`; its status table is the source of truth for what's done.
 
 ## Non-negotiable architecture rules

@@ -66,7 +66,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             app.model,
             app.session_id,
             phase,
-            app.last_estimated_tokens,
+            crate::context_view::header_label(app.context.as_ref(), app.last_estimated_tokens)
+                .trim_start_matches('~'),
             app.session_tokens
         )),
     ];

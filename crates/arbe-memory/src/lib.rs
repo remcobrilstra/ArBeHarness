@@ -4,6 +4,7 @@
 //! turns) plus the pipeline that assembles a full context from
 //! instructions/skills/memory/history/user-input (overall design §5.2).
 
+pub mod breakdown;
 pub mod compact_summary;
 pub mod history;
 pub mod pipeline;
@@ -11,6 +12,7 @@ pub mod prune;
 pub mod tokens;
 pub mod truncation;
 
+pub use breakdown::{count_stubbed_results, count_turns, estimate_tool_specs, measure_messages};
 pub use compact_summary::CompactWithSummaryStrategy;
 pub use history::HistoryEntry;
 pub use pipeline::ContextPipeline;
@@ -31,7 +33,7 @@ pub struct ContextInput<'a> {
     pub pinned_turn_indices: &'a [u64],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextOutput {
     pub messages: Vec<arbe_core::Message>,
     pub estimated_tokens: u64,
@@ -40,6 +42,15 @@ pub struct ContextOutput {
     /// before any history had to be dropped.
     #[serde(default)]
     pub pruned_tool_results: usize,
+    /// What `messages` is made of, by source (estimator units; tool
+    /// definitions aren't part of `messages`, so `tools` is 0). Filled in
+    /// by [`ContextPipeline::assemble`]; strategies leave it empty.
+    #[serde(default)]
+    pub breakdown: arbe_core::ContextBreakdown,
+    /// How many of messages come before the history (instructions,
+    /// skills, memory, summary).
+    #[serde(default)]
+    pub preamble_messages: usize,
 }
 
 /// Selects/budgets session history. Config-selectable per overall design §7

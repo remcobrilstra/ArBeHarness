@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::context::ContextUsage;
 use crate::ids::{SessionId, ToolCallId, TurnId};
 use crate::tool::{ApprovalDecision, RiskLevel, ToolResult};
 use crate::usage::{StopReason, Usage};
@@ -31,6 +32,15 @@ pub enum RuntimeEvent {
     ContextBuilt {
         turn_id: TurnId,
         estimated_tokens: u64,
+    },
+    /// What the next model request's context is made of, sent before
+    /// every model call of a turn (the context grows with each tool
+    /// round). Token figures are calibrated estimates.
+    ContextUpdated {
+        turn_id: TurnId,
+        /// 0 for the turn's first model call.
+        round: u32,
+        usage: ContextUsage,
     },
     ModelStreamChunk {
         turn_id: TurnId,

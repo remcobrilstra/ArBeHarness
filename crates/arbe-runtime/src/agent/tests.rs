@@ -247,6 +247,7 @@ fn test_parts(
             temperature: 0.2,
             max_tokens: 100,
             budget_tokens: 8_000,
+            context_window: 16_000,
             max_tool_rounds: 50,
             max_turn_tokens: None,
             max_tool_output_chars: 50_000,
@@ -492,10 +493,61 @@ async fn reported_input_tokens_calibrate_the_estimator() {
     ]);
     let t = test_agent(ScriptedProvider::new(vec![], big_input));
     t.agent.submit_message("hi".into()).await.unwrap();
-    let first = t.agent.state().calibration.factor();
-    assert!(first > 1.0, "factor {first}");
+    // Far more than estimated: the factor goes straight to its ceiling.
+    assert_eq!(t.agent.state().calibration.factor(), 3.0);
     t.agent.submit_message("hi".into()).await.unwrap();
-    assert!(t.agent.state().calibration.factor() > first);
+    assert!((t.agent.state().calibration.factor() - 3.0).abs() < 1e-9);
+    // Published figures are calibrated: three times the raw estimate.
+    let usage = t.agent.context_usage().unwrap();
+    assert_eq!(usage.breakdown.system_prompt % 3, 0);
+}
+
+#[tokio::test]
+async fn every_model_call_publishes_what_its_context_is_made_of() {
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "echo", json!({"x": "y".repeat(400)}))]),
+            answer("done"),
+        ],
+        answer("second"),
+    );
+    let (t, mut rx) = test_agent_with(provider, allow(&["echo"]));
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    assert!(t.agent.context_usage().is_none());
+
+    t.agent.submit_message("use echo".into()).await.unwrap();
+    let updates: Vec<(u32, arbe_core::ContextUsage)> = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::ContextUpdated { round, usage, .. } => Some((round, usage)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.iter().map(|(r, _)| *r).collect::<Vec<_>>(), [0, 1]);
+    let (first, second) = (&updates[0].1.breakdown, &updates[1].1.breakdown);
+    assert!(first.system_prompt > 0 && first.tools > 0);
+    assert_eq!(first.history.total(), 0);
+    assert_eq!(first.history_turns, 0);
+    assert!(first.current_turn.user > 0);
+    assert_eq!(first.current_turn.tool_results, 0);
+    // The second call carries the first round's call and result.
+    assert!(second.current_turn.tool_calls > 0 && second.current_turn.tool_results > 0);
+    for (_, usage) in &updates {
+        assert_eq!(usage.total_tokens, usage.breakdown.total());
+        assert_eq!(usage.budget_tokens, 8_000);
+        assert_eq!(usage.context_window, 16_000);
+        assert_eq!(usage.compaction_threshold_tokens, None);
+    }
+    assert_eq!(t.agent.context_usage().as_ref(), Some(&updates[1].1));
+
+    // Next turn: the first turn is history now, tool trace included.
+    t.agent.submit_message("again".into()).await.unwrap();
+    let latest = t.agent.context_usage().unwrap().breakdown;
+    assert_eq!(latest.history_turns, 1);
+    assert_eq!(latest.omitted_turns, 0);
+    assert!(latest.history.tool_calls > 0 && latest.history.tool_results > 0);
+    assert!(latest.history.assistant > 0);
+    assert_eq!(latest.current_turn.tool_results, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -397,6 +397,13 @@ impl Session {
         self.agent.answer_question(id, answer)
     }
 
+    /// What the latest model request's context was made of, against the
+    /// budget (`None` before the first model call). See
+    /// `RuntimeEvent::ContextUpdated`.
+    pub fn context_usage(&self) -> Option<arbe_core::ContextUsage> {
+        self.agent.context_usage()
+    }
+
     /// Cancels the running turn, keeping what it produced so far. Returns
     /// whether a turn was running.
     pub fn cancel(&self) -> bool {

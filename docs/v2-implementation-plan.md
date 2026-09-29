@@ -19,7 +19,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested. Ollama verified live (qwen2.5-coder:3b, llama3.2:3b). **Not Done yet:** the exit criterion also needs live OpenAI and Anthropic runs (no API keys here) |
 | P3 | Agent loop v2 | Done | 10 / 10 | All exit criteria met; the TUI was accepted by the maintainer after using it against grok-4.7 (2026-09-29) |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
-| P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
+| P5 | Context management v2 | Done | 7 / 7 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | In progress | 7 / 8 | All exit criteria met. P6.1–P6.5, P6.7, P6.8 done (OpenTelemetry export deferred); P6.6 plan mode postponed by the maintainer. Desktop control designed (`docs/desktop-control-design.md`), awaiting review |
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
@@ -30,6 +30,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-30 — P5.7 context accounting.** Per-request context breakdown by source (event, `/context`, header %, `session/context`); tool definitions now counted against the budget; calibration learns from every round and adopts its first observation. Groundwork for further context-management work.
 - **2026-09-30 — P3 closed, pending work consolidated.** The maintainer accepted the TUI (P3's last exit criterion). All open items now live in one list: `docs/v2-status.md` → Pending work. `v2` merged into `main`.
 
 - **2026-09-30 — P6.8 observability.** Log file, spans, per-session cost; OpenTelemetry deferred. P6 is done apart from plan mode (P6.6, postponed by the maintainer).
@@ -281,6 +282,22 @@ Make the harness configurable from files and connect the parts v1 built but neve
   - *Done:* `agent/nested.rs` — directories between the root (exclusive) and a successful path-subject tool call's target, first `AGENTS.md`/`agent.md`/`CLAUDE.md` in each, appended to that tool result once per session (tracked in session state; not persisted, so a resumed session re-shows them on first touch).
 - [x] **P5.6 Persistent memory tool.** A `memory` tool the model can use to read/append to the global and project `memory.md` files (currently read-only inputs), gated like any other write.
   - *Done:* `agent/memory.rs` — `~/.arbe/memory/global/memory.md` + `projects/<name>-<fnv32>/memory.md`, read every turn into the stable prefix (capped), `remember {note, scope}` appends a line (medium risk, not parallel-safe). Included in the `general` profile's tools.
+
+- [x] **P5.7 Context accounting.** Know, per request, what the context is made of and what it costs before any further context-management work (smarter compaction, per-source limits) builds on it.
+  - *Done (2026-09-30):*
+    - **Types:** `arbe_core::ContextBreakdown` (system prompt, instruction files, skills, memory, summary, tool definitions, plus `MessageTokens` for history and the current turn — user / assistant / thinking / tool calls / tool results / images / notices — with turns in context, turns omitted and stubbed results) and `ContextUsage` (plus total, budget, window and compaction threshold).
+    - **Measuring:** `arbe_memory::breakdown` does it (`measure_messages`, `estimate_tool_specs`, `count_turns`, `count_stubbed_results`). `ContextPipeline::assemble` fills `ContextOutput::breakdown` and `preamble_messages`. The instruction-file share of the system prompt is measured by rendering the template with and without the files.
+    - **Runtime:** it measures every round's request whole, including tools (`TurnRunner::publish_context`), and publishes `RuntimeEvent::ContextUpdated { round, usage }` with calibrated figures. `Agent::context_usage()`, `Session::context_usage()` and headless `session/context` return the latest. In the TUI, the header shows `~N/budget (x%)` and `/context` prints the breakdown.
+    - **Behavior changes:**
+      - Tool definitions are now charged against the budget. They used to be hidden inside the calibration factor.
+      - Calibration now observes every round, not just the first.
+      - The first observation sets the factor outright.
+    - **Verified live on grok-4.7:** the breakdown sums exactly to the estimate. On a small read-a-file turn, the project `CLAUDE.md` (≈2.3k) and the tool definitions (≈2.3k) were two thirds of the context. The first call's figure was ~25% low before calibration.
+    - **Not done:**
+      - No per-category calibration.
+      - No real tokenizer.
+      - Compaction's trigger still ignores tool definitions.
+      - No `/context` preview before the first model call.
 
 **Exit criteria:** a scripted 200-turn session with large tool outputs stays within budget without ever breaking tool-use/result pairing (test-verified); compaction is persisted and survives resume.
 

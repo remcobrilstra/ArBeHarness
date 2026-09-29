@@ -2,6 +2,7 @@
 //! ArBeHarness crates. See `docs/v1-overall-design.md` and
 //! `docs/v1-harness-spec.md` for the specification this crate implements.
 
+pub mod context;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -12,6 +13,7 @@ pub mod tool;
 pub mod turn;
 pub mod usage;
 
+pub use context::{ContextBreakdown, ContextUsage, MessageTokens};
 pub use error::{
     ConfigError, HarnessError, HookError, MemoryError, ProviderError, ToolError, UserFacing,
 };

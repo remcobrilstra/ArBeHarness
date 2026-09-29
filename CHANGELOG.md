@@ -34,6 +34,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 ### Long sessions
 
 - Old tool output is pruned first; then, with `memory_strategy = "compact_summary"`, the model summarizes older turns (also on demand with `/compact`); whole turns are dropped only as a last resort. Tool calls and their results are never split.
+- **Context breakdown**: before every model call the harness reports what the context is made of: system prompt, instruction files, skills, memory, compaction summary, tool definitions, and history and the current turn split by kind. It also reports the budget, window and compaction threshold. See `/context` and the header's `~12.3k/124k (10%)` in the chat screen, the `context_updated` event, and `session/context` in headless mode. Tool definitions are now counted against the budget, and the token estimate is calibrated after every model call rather than only the first of a turn.
 
 ### Configuration & safety
 

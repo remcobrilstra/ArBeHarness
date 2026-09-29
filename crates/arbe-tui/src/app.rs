@@ -204,6 +204,8 @@ pub struct App {
     pub profile_picker: Option<ProfilePicker>,
     pub should_quit: bool,
     pub last_estimated_tokens: u64,
+    /// What the latest model call's context was made of (`/context`).
+    pub context: Option<arbe_runtime::arbe_core::ContextUsage>,
     /// Provider-reported tokens used by the whole session so far.
     pub session_tokens: u64,
     /// The session's cost so far, when the model's prices are configured.
@@ -258,6 +260,7 @@ impl App {
             profile_picker: None,
             should_quit: false,
             last_estimated_tokens: 0,
+            context: None,
             session_tokens: 0,
             session_cost_usd: None,
             scroll: 0,
