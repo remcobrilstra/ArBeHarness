@@ -612,8 +612,14 @@ fn is_trusted(project_dir: &Path, trusted: &[PathBuf]) -> bool {
 /// rest, so a not-yet-existing path compares consistently with existing
 /// ones (on Windows `canonicalize` also switches to the `\\?\` form, so
 /// mixing canonical and as-written paths would never match).
+///
+/// `.` and `..` are resolved textually first, as Windows does anyway: on
+/// Unix, `canonicalize` walks `..` through the real directories, so
+/// `trusted/missing/../repo` would fail to resolve — and a path ending in
+/// `..` has no last component to split off — leaving the entry unmatched.
 fn canonical(path: &Path) -> PathBuf {
-    let mut existing = path;
+    let path = &lexically_normal(path);
+    let mut existing = path.as_path();
     let mut rest = Vec::new();
     loop {
         if let Ok(resolved) = std::fs::canonicalize(existing) {
@@ -627,6 +633,25 @@ fn canonical(path: &Path) -> PathBuf {
             _ => return path.to_path_buf(),
         }
     }
+}
+
+/// `path` with `.` removed and each `..` cancelling the component before
+/// it, without touching the filesystem.
+fn lexically_normal(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn project_dir_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
