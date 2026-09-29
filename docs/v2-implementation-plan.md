@@ -17,19 +17,20 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P0 | Housekeeping & quick correctness fixes | Done | 6 / 6 | 223 tests, fmt/clippy clean. P0.3 not verified against a live Ollama server (none available) |
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested. Ollama verified live (qwen2.5-coder:3b, llama3.2:3b). **Not Done yet:** the exit criterion also needs live OpenAI and Anthropic runs (no API keys here) |
-| P3 | Agent loop v2 | In progress | 9 / 10 | Open: P3.10 thinking view + live tool-arg rendering; interactive TUI run by a human still pending |
+| P3 | Agent loop v2 | In progress | 10 / 10 | All tasks done. **Exit criterion open:** an interactive TUI run verified by a human at a real terminal (can't be done from this environment) |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | In progress | 3 / 8 | P6.1–P6.3 done; all three exit criteria met (binary-spawning headless test, subagent isolation + approval-routing test, embedder example compiles). Remaining P6.4–P6.8 are optional per the risk register's release bar |
 | P7 | Verification, hardening & release | In progress | 5 / 8 | P7.1, P7.3–P7.6 done. P7.2 partial (live runs on Ollama + xAI pass; api.openai.com / Anthropic not run — no keys; no CI job). P7.7 (push + CI) and P7.8 (release) need the maintainer |
 
 **Current focus:** P7 (verification & release) — P6.4+ are optional
-**Last updated:** 2026-09-29 · test count: 469 (+21 ignored live tests)
+**Last updated:** 2026-09-29 · test count: 471 (+21 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-29 — P3.10 TUI thinking view + live tool arguments.** P3's tasks are complete; only the human terminal check remains.
 - **2026-09-29 — P3.7 image tool results.** `read_file` returns images to vision models (all three adapters); verified live on grok-4.7.
 - **2026-09-29 — P7.5/P7.6 benchmarks.** Criterion benches for context assembly, resume and streaming; all fast (see P7.6), so P7.5 is closed without a code change.
 - **2026-09-29 — P7.4 gate enforcement.** Running a tool without approval no longer compiles outside `arbe-tools`. 464 → 466 tests.
@@ -221,8 +222,8 @@ Replace the 1 358-line `Agent` with a small, cancellable loop that persists ever
   - *Done:* all seven phases fire; payload structs in `agent/hooks.rs`. `BeforeToolExecute` runs before the gate (so the human approves the final arguments) and can rewrite `arguments` or set `veto`. `Hook::run` does not get the cancellation token — hooks already have a hard timeout, so it wasn't worth another trait change.
 - [x] **P3.9 Remove the manual `/tool` bypass path's duplication.** `propose_tool_call`/`resolve_tool_call` become a thin "inject a synthetic tool-use" entry point into the same `TurnRunner` path, so there is exactly one execution path to test.
   - *Done:* `Agent::invoke_tool` runs a one-call round through `tools::run_round`; `propose_tool_call`/`resolve_tool_call`/`pending_tool_calls` are gone.
-- [ ] **P3.10 TUI port.** Update `arbe-tui` for the v2 events: thinking display (collapsible), live tool-argument rendering, parallel tool status, `Esc` to cancel a turn, usage/cost in the header, and the existing session picker wired to `resume`.
-  - *Mostly done:* `Arc<Agent>`, `Esc` cancels (also from the approval modal), stop-reason notices, session tokens in the header, retry/thinking/tool-prep/progress in the activity line; resume shows tool-call counts. **Remaining:** a collapsible thinking view and live tool-argument rendering (both only surface in the activity line today), cost (needs prices in the catalog), and a human run at a real terminal.
+- [x] **P3.10 TUI port.** Update `arbe-tui` for the v2 events: thinking display (collapsible), live tool-argument rendering, parallel tool status, `Esc` to cancel a turn, usage/cost in the header, and the existing session picker wired to `resume`.
+  - *Mostly done:* `Arc<Agent>`, `Esc` cancels (also from the approval modal), stop-reason notices, session tokens in the header, retry/thinking/tool-prep/progress in the activity line; resume shows tool-call counts. *Done (2026-09-29):* thinking streams into its own `[thinking]` transcript entry, collapsed to one line by default, `Ctrl+T` toggles all (render cache and scroll line counts are rebuilt; a test checks rendered lines == counted lines both ways); streaming tool arguments preview live in the activity line (the full call lands in the transcript when proposed — per-call transcript lines would break the "only the last entry mutates" cache invariant with parallel calls). **Not done:** cost in the header (the catalog has no prices; tokens are shown) — deferred, not part of the release bar's exit criterion. A human run at a real terminal is still required (P3 exit criterion).
 
 **Exit criteria:** `Agent`-level tests (with a scripted fake provider) cover: multi-round tool use, parallel tools with ordering, cancel mid-stream and mid-tool, crash-then-resume mid-turn with trace intact, every loop guard; `agent.rs`-equivalent modules have no function over ~150 lines; interactive TUI run verified by a human at a real terminal.
 

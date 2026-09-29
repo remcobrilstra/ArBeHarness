@@ -197,15 +197,35 @@ fn drain_runtime_events(
                     "{reason} — retrying in {secs}s (attempt {attempt})…"
                 ));
             }
-            Ok(RuntimeEvent::ThinkingDelta { .. }) => {
+            Ok(RuntimeEvent::ThinkingDelta { delta, .. }) => {
                 app.activity = Some("thinking…".to_string());
+                app.append_thinking_delta(&delta);
             }
             Ok(RuntimeEvent::ModelStreamChunk { delta, .. }) => {
                 app.activity = None;
                 app.append_assistant_delta(&delta);
             }
-            Ok(RuntimeEvent::ToolUseStarted { tool_name, .. }) => {
+            Ok(RuntimeEvent::ToolUseStarted {
+                provider_call_id,
+                tool_name,
+                ..
+            }) => {
                 app.activity = Some(format!("preparing {tool_name} call…"));
+                app.streaming_tool_args
+                    .insert(provider_call_id, (tool_name, String::new()));
+            }
+            Ok(RuntimeEvent::ToolUseInputDelta {
+                provider_call_id,
+                partial_json,
+                ..
+            }) => {
+                if let Some((name, args)) = app.streaming_tool_args.get_mut(&provider_call_id) {
+                    args.push_str(&partial_json);
+                    app.activity = Some(format!(
+                        "preparing {name} {}",
+                        tail(args, ARGS_PREVIEW_CHARS)
+                    ));
+                }
             }
             Ok(RuntimeEvent::ToolProgress { update, .. }) => {
                 app.activity = Some(update);
@@ -257,6 +277,7 @@ fn drain_runtime_events(
                 risk,
             }) => {
                 let arguments_pretty = serde_json::to_string(&arguments).unwrap_or_default();
+                app.streaming_tool_args.clear();
                 app.activity = Some(format!("running tool: {tool_name}…"));
                 app.push_line(
                     Role::Tool,
@@ -380,6 +401,22 @@ fn apply_subagent_event(app: &mut App, event: &RuntimeEvent) {
             app.activity = Some("subagent working…".to_string());
         }
         _ => {}
+    }
+}
+
+/// How much of a streaming tool call's arguments the activity line shows.
+const ARGS_PREVIEW_CHARS: usize = 60;
+
+/// The last `max` characters of `text` (on one line), with a leading `…`
+/// if anything was cut.
+fn tail(text: &str, max: usize) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let count = flat.chars().count();
+    if count <= max {
+        flat
+    } else {
+        let tail: String = flat.chars().skip(count - max).collect();
+        format!("…{tail}")
     }
 }
 
@@ -533,6 +570,7 @@ fn handle_key(
                 app.activity = Some("cancelling…".to_string());
             }
         }
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) => app.toggle_thinking(),
         (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
             app.clear_transcript();
             app.scroll = 0;

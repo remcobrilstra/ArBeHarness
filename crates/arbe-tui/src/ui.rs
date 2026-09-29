@@ -100,7 +100,29 @@ fn role_label(role: Role) -> &'static str {
 /// line always maps to exactly one rendered `Line`, which is what keeps
 /// `App::content_line_count`'s scroll math correct without it needing to
 /// know about markdown.
-fn render_entry(entry: &crate::app::TranscriptLine) -> Vec<Line<'static>> {
+fn render_entry(entry: &crate::app::TranscriptLine, show_thinking: bool) -> Vec<Line<'static>> {
+    if entry.thinking {
+        let style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let label = Span::styled("[thinking] ", style.add_modifier(Modifier::BOLD));
+        if !show_thinking {
+            let lines = entry.content.split('\n').count();
+            return vec![Line::from(vec![
+                label,
+                Span::styled(format!("▸ {lines} line(s) — Ctrl+T to show"), style),
+            ])];
+        }
+        // Plain text, one display line per content line (like markdown
+        // rendering, so the scroll math holds).
+        let mut lines: Vec<Line<'static>> = entry
+            .content
+            .split('\n')
+            .map(|l| Line::from(Span::styled(l.to_string(), style)))
+            .collect();
+        lines[0].spans.insert(0, label);
+        return lines;
+    }
     let base_style = role_style(entry.role);
     let mut rendered = crate::markdown::render_markdown(&entry.content, base_style);
     let mut first = if rendered.is_empty() {
@@ -129,14 +151,15 @@ fn transcript_lines(app: &mut App) -> Vec<Line<'static>> {
     let settled_count = app.transcript.len().saturating_sub(1);
     if app.rendered_cache_entry_count < settled_count {
         for entry in &app.transcript[app.rendered_cache_entry_count..settled_count] {
-            app.rendered_cache.extend(render_entry(entry));
+            app.rendered_cache
+                .extend(render_entry(entry, app.show_thinking));
         }
         app.rendered_cache_entry_count = settled_count;
     }
 
     let mut lines = app.rendered_cache.clone();
     if let Some(last) = app.transcript.last() {
-        lines.extend(render_entry(last));
+        lines.extend(render_entry(last, app.show_thinking));
     }
     if let Some(status) = &app.status_message {
         lines.push(Line::from(Span::styled(
@@ -199,7 +222,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.working {
         "Esc: cancel turn | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+C: quit"
     } else {
-        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
+        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+T: thinking | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
     };
     let text = app.input.as_str();
     let paragraph = Paragraph::new(text)
@@ -381,6 +404,21 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(text.contains("hi there"));
         assert!(text.contains("another one"));
+    }
+
+    #[test]
+    fn rendered_lines_match_the_counted_lines_with_thinking_collapsed_or_not() {
+        let mut app = test_app();
+        app.working = true;
+        app.push_line(Role::User, "q".to_string());
+        app.append_thinking_delta("a\nb\nc");
+        app.append_assistant_delta("answer\nline two");
+        for _ in 0..2 {
+            let rendered = transcript_lines(&mut app);
+            assert_eq!(rendered.len(), app.content_line_count() as usize);
+            app.toggle_thinking();
+        }
+        assert!(plain_text(&transcript_lines(&mut app)).contains("Ctrl+T to show"));
     }
 
     #[test]

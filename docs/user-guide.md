@@ -423,7 +423,9 @@ If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to a
 
 The screen has three parts:
 
-1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent. `used` is the total tokens the provider has reported for this session.
+1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent. `used` is the total tokens the provider has reported for this session. While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
+
+**Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, reasoning models on OpenAI-compatible servers such as xAI), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
 2. **Transcript**: your messages, the assistant's replies (basic Markdown formatting), tool activity, and `[error]` / `[info]` status lines. Replies stream in as they are generated, including any text the model writes between tool calls. If you scroll up, new output doesn't pull you back down. Scroll to the bottom to follow it again.
 3. **Input box**: what you are typing. Its title shows the available keys.
 
@@ -446,6 +448,7 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 | `↑` / `↓` | Scroll the transcript one line |
 | `PgUp` / `PgDn` | Scroll one page |
 | `Ctrl+U` / `Ctrl+D` | Scroll half a page up / down |
+| `Ctrl+T` | Show or hide the model's reasoning ([thinking](#the-chat-screen)) in the transcript |
 | `Ctrl+L` | Clear the transcript view (nothing is deleted from disk) |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+R` | Open the session picker to resume an earlier session |
@@ -918,4 +921,3 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
 | Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
-| Showing the model's reasoning | Extended thinking is saved in `turns.jsonl`, but the chat screen only shows `thinking…` while it happens, not the text. |

@@ -5,6 +5,9 @@ use arbe_runtime::arbe_core::{RiskLevel, Role, SessionId, SessionMeta, ToolCallI
 pub struct TranscriptLine {
     pub role: Role,
     pub content: String,
+    /// The model's reasoning rather than its answer: shown collapsed to
+    /// one line unless `App::show_thinking` (Ctrl+T).
+    pub thinking: bool,
 }
 
 /// A tool call awaiting a human decision (TUI-FR-2). Populated from the
@@ -141,6 +144,12 @@ pub struct App {
     /// used to clamp scroll on the next key press (there is no viewport
     /// size available outside of `ui::draw`).
     pub last_viewport_height: u16,
+    /// Whether thinking entries are expanded (Ctrl+T toggles).
+    pub show_thinking: bool,
+    /// Tool calls whose arguments are still streaming in, by the
+    /// provider's call id: `(tool name, arguments so far)`. Previewed in
+    /// the activity line until the call is complete.
+    pub streaming_tool_args: std::collections::HashMap<String, (String, String)>,
 }
 
 impl App {
@@ -177,12 +186,18 @@ impl App {
             scroll: 0,
             follow_tail: true,
             last_viewport_height: 0,
+            show_thinking: false,
+            streaming_tool_args: std::collections::HashMap::new(),
         }
     }
 
     pub fn push_line(&mut self, role: Role, content: String) {
         self.settle_last_entry();
-        self.transcript.push(TranscriptLine { role, content });
+        self.transcript.push(TranscriptLine {
+            role,
+            content,
+            thinking: false,
+        });
     }
 
     /// Clears the transcript and its rendering/line-count caches together —
@@ -199,12 +214,52 @@ impl App {
         content.split('\n').count().max(1) as u32
     }
 
+    /// Display lines for one entry: a collapsed thinking entry is one line.
+    fn entry_line_count(&self, entry: &TranscriptLine) -> u32 {
+        if entry.thinking && !self.show_thinking {
+            1
+        } else {
+            Self::line_count(&entry.content)
+        }
+    }
+
+    /// Expands or collapses every thinking entry. Their rendering and line
+    /// counts change, so the caches are rebuilt from scratch.
+    pub fn toggle_thinking(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        self.rendered_cache.clear();
+        self.rendered_cache_entry_count = 0;
+        let settled = self.transcript.len().saturating_sub(1);
+        self.settled_content_lines = self.transcript[..settled]
+            .iter()
+            .map(|e| self.entry_line_count(e))
+            .sum();
+    }
+
+    /// Appends streamed reasoning to the in-progress thinking entry,
+    /// starting one if needed.
+    pub fn append_thinking_delta(&mut self, delta: &str) {
+        if let Some(last) = self.transcript.last_mut()
+            && last.thinking
+            && self.working
+        {
+            last.content.push_str(delta);
+            return;
+        }
+        self.settle_last_entry();
+        self.transcript.push(TranscriptLine {
+            role: Role::Assistant,
+            content: delta.to_string(),
+            thinking: true,
+        });
+    }
+
     /// Folds the current last entry's line count into `settled_content_lines`
     /// — called just before a new entry becomes the last one, since that's
     /// the moment the previous last entry stops being mutable.
     fn settle_last_entry(&mut self) {
         if let Some(prev) = self.transcript.last() {
-            self.settled_content_lines += Self::line_count(&prev.content);
+            self.settled_content_lines += self.entry_line_count(prev);
         }
     }
 
@@ -224,6 +279,7 @@ impl App {
     pub fn append_assistant_delta(&mut self, delta: &str) {
         if let Some(last) = self.transcript.last_mut()
             && last.role == Role::Assistant
+            && !last.thinking
             && self.working
         {
             last.content.push_str(delta);
@@ -233,6 +289,7 @@ impl App {
         self.transcript.push(TranscriptLine {
             role: Role::Assistant,
             content: delta.to_string(),
+            thinking: false,
         });
     }
 
@@ -242,7 +299,7 @@ impl App {
     pub fn content_line_count(&self) -> u16 {
         let mut lines = self.settled_content_lines;
         if let Some(last) = self.transcript.last() {
-            lines += Self::line_count(&last.content);
+            lines += self.entry_line_count(last);
         }
         if self.status_message.is_some() {
             lines += 1;
@@ -363,6 +420,26 @@ mod tests {
 
         a.status_message = Some("oops".to_string());
         assert_eq!(a.content_line_count(), 5);
+    }
+
+    #[test]
+    fn thinking_streams_into_its_own_entry_and_counts_one_line_until_expanded() {
+        let mut a = app();
+        a.working = true;
+        a.push_line(Role::User, "question".to_string());
+        a.append_thinking_delta("step one\n");
+        a.append_thinking_delta("step two\nstep three");
+        a.append_assistant_delta("the answer");
+        assert_eq!(a.transcript.len(), 3);
+        assert!(a.transcript[1].thinking);
+        assert_eq!(a.transcript[1].content, "step one\nstep two\nstep three");
+        assert!(!a.transcript[2].thinking);
+        // Collapsed: question + one thinking line + answer.
+        assert_eq!(a.content_line_count(), 3);
+        a.toggle_thinking();
+        assert_eq!(a.content_line_count(), 5);
+        a.toggle_thinking();
+        assert_eq!(a.content_line_count(), 3);
     }
 
     #[test]
