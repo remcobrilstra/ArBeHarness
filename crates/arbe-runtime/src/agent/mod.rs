@@ -757,6 +757,9 @@ impl Agent {
     /// Marks the session closed. Doesn't interrupt a running turn — call
     /// [`cancel_turn`](Self::cancel_turn) first for that.
     pub fn close(&self) -> Result<(), arbe_storage::StorageError> {
+        // Background processes and the like end with the session, not
+        // whenever this agent happens to be dropped.
+        self.registry_snapshot().close_all();
         let mut state = self.state();
         state.meta.touch(SessionStatus::Closed);
         state.meta.activity = None;

@@ -562,11 +562,22 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
 | `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
-| `execute` | `command`, optional `timeout_secs` (default 30, max 300) | **high** | Runs a shell command (`cmd /C` on Windows, `sh -c` elsewhere) in the workdir. On timeout, the whole process tree is killed. |
+| `execute` | `command`, optional `timeout_secs` (default 30, max 300), optional `background` | **high** | Runs a shell command (`cmd /C` on Windows, `sh -c` elsewhere) in the workdir. On timeout, the whole process tree is killed. With `background: true` it keeps running and returns a handle (`bg-1`, …) instead of waiting — see [Background processes](#background-processes). |
+| `process_output` | optional `handle`, optional `wait_secs` (0–30) | low | Reads what a background process printed since the last read (up to 32 KB per call), and whether it's still running (with its exit code once it has exited). Without a handle, lists all background processes. Never needs approval (it only reads). |
+| `process_kill` | `handle` | low | Stops a background process and everything it started. |
 
 **Sandboxing.** Every file tool resolves its path inside the workdir and refuses anything outside it, including through `..`. `glob` and `grep` skip `.git`, `target`, `node_modules`, and `.venv`. `execute` is **not** sandboxed: a shell command can do anything your user account can. That is why it is marked high-risk and always asks you first.
 
 If a tool fails (bad arguments, file not found, unknown tool) or you deny it, that result goes back to the model so it can adjust or explain. The turn itself does not fail.
+
+### Background processes
+
+`execute` with `background: true` is for commands that keep running — a dev server, a file watcher, a long build — while the agent carries on. It returns a handle; the agent reads new output with `process_output` (optionally waiting a few seconds for it) and stops the process with `process_kill`.
+
+- Starting one is approved like any `execute` call; reading its output needs no approval; stopping it is a low-risk call.
+- Each process keeps its newest 256 KB of combined output; if the agent reads less often than that fills up, it's told how much was dropped.
+- At most 16 background processes per session.
+- **They belong to the session:** when the session ends (you quit, start a new session, or resume another), every background process still running is stopped, including anything it started. A [subagent](#subagents)'s background processes stop when it finishes.
 
 ### Subagents
 

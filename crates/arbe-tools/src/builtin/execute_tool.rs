@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arbe_core::{RiskLevel, ToolError, ToolInvocation, ToolResult};
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
+use super::processes::ProcessTable;
 use crate::{ToolContext, ToolDescription, ToolExecutor};
 
 /// Default and maximum allowed `timeout_secs` — a command with no timeout
@@ -22,8 +24,14 @@ struct Args {
     /// The command line to run (via `cmd /C` on Windows, `sh -c` elsewhere).
     command: String,
     /// Seconds before the command is killed. Defaults to 30, capped at 300.
+    /// Ignored with `background`.
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Start the command and return at once with a handle, instead of
+    /// waiting for it to finish — for servers, watchers and long builds.
+    /// Read its output with `process_output`, stop it with `process_kill`.
+    #[serde(default)]
+    background: bool,
 }
 
 /// Runs a shell command with the agent's project directory as its working
@@ -34,11 +42,19 @@ struct Args {
 /// other tool; nothing about this executor bypasses that.
 pub struct ExecuteTool {
     root: PathBuf,
+    /// Where `background: true` commands go (shared with `process_output`
+    /// and `process_kill`).
+    processes: Arc<ProcessTable>,
 }
 
 impl ExecuteTool {
+    /// With a background-process table of its own.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_processes(root, Arc::new(ProcessTable::new()))
+    }
+
+    pub fn with_processes(root: PathBuf, processes: Arc<ProcessTable>) -> Self {
+        Self { root, processes }
     }
 }
 
@@ -54,7 +70,7 @@ impl ToolExecutor for ExecuteTool {
 
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
-            "Run a shell command with the project directory as its working directory. Highest-risk tool — always approval-gated.",
+            "Run a shell command with the project directory as its working directory and return its output. With `background: true` it keeps running and you get a handle for `process_output` / `process_kill`. Highest-risk tool — always approval-gated.",
         )
     }
 
@@ -67,6 +83,11 @@ impl ToolExecutor for ExecuteTool {
         false
     }
 
+    /// Background processes don't outlive their session.
+    fn close(&self) {
+        self.processes.kill_all();
+    }
+
     async fn execute(
         &self,
         invocation: ToolInvocation,
@@ -74,6 +95,20 @@ impl ToolExecutor for ExecuteTool {
     ) -> Result<ToolResult, ToolError> {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid execute arguments: {e}")))?;
+        if args.background {
+            let (handle, pid) = self.processes.spawn(&args.command, &self.root)?;
+            return Ok(ToolResult {
+                id: invocation.id,
+                output: json!({
+                    "handle": handle,
+                    "pid": pid,
+                    "status": "running in the background",
+                    "next": "read its output with process_output; stop it with process_kill",
+                }),
+                is_error: false,
+                attachments: Vec::new(),
+            });
+        }
         let timeout_secs = args
             .timeout_secs
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -143,7 +178,7 @@ impl ToolExecutor for ExecuteTool {
 /// command (`a && b`, pipelines) does the same. A survivor keeps running
 /// after a timeout/cancel and holds the output pipes open. Best effort —
 /// failures are ignored, since the tree may already have exited.
-async fn kill_process_tree(pid: u32) {
+pub(super) async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     let mut killer = {
         let mut c = Command::new("taskkill");
@@ -164,6 +199,27 @@ async fn kill_process_tree(pid: u32) {
         .stderr(Stdio::null())
         .status()
         .await;
+}
+
+/// [`kill_process_tree`] for places that can't await (e.g. `Drop`).
+pub(super) fn kill_process_tree_blocking(pid: u32) {
+    #[cfg(windows)]
+    let mut killer = {
+        let mut c = std::process::Command::new("taskkill");
+        c.args(["/T", "/F", "/PID", &pid.to_string()]);
+        c
+    };
+    #[cfg(unix)]
+    let mut killer = {
+        let mut c = std::process::Command::new("kill");
+        c.args(["-KILL", "--", &format!("-{pid}")]);
+        c
+    };
+    let _ = killer
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Wraps `command` in the platform shell, so callers can use pipes,

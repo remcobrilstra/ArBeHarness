@@ -266,6 +266,11 @@ pub trait ToolExecutor: Send + Sync {
         true
     }
 
+    /// The session this tool belongs to is ending: release anything that
+    /// must not outlive it (e.g. `execute` stops its background
+    /// processes). Called by [`ToolRegistry::close_all`].
+    fn close(&self) {}
+
     /// What a call acts on, for permission rules like `tool(pattern)`: a
     /// path for file tools, the command line for `execute`. `None` (the
     /// default) means rules can only match this tool by name.

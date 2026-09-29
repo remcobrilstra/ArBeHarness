@@ -33,6 +33,13 @@ impl ToolRegistry {
         self.executors.contains_key(tool_name)
     }
 
+    /// Tells every tool its session is ending (see `ToolExecutor::close`).
+    pub fn close_all(&self) {
+        for executor in self.executors.values() {
+            executor.close();
+        }
+    }
+
     /// Keeps only the tools `keep` accepts (e.g. a profile's allow-set).
     /// A removed tool is neither offered to the model nor callable.
     pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {

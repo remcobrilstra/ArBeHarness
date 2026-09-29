@@ -686,3 +686,31 @@ async fn asks_the_user_and_follows_the_answer() {
     assert!(bench.project().join("hello.py").exists(), "{trace:?}");
     assert!(!bench.project().join("hello.go").exists());
 }
+
+#[tokio::test]
+#[ignore = "needs a live model and python"]
+async fn runs_a_server_in_the_background_and_stops_it() {
+    let bench = Bench::new(target_or_skip!(), "coding");
+    let Some(python) = python() else {
+        eprintln!("skipped: no python on PATH");
+        return;
+    };
+    bench.write("index.html", "<h1>hello from the test</h1>");
+    let run = bench.start(Approve::All);
+    let (_, trace) = run
+        .ask(&format!(
+            "Start `{python} -m http.server 8765` in the background, use process_output (with a few seconds of wait) to confirm it's serving, then stop it with process_kill. Tell me what the server printed."
+        ))
+        .await;
+    assert!(
+        trace
+            .calls
+            .iter()
+            .any(|(t, args)| t == "execute" && args.contains("\"background\":true")),
+        "{trace:?}"
+    );
+    assert!(trace.used("process_output"), "{trace:?}");
+    assert!(trace.used("process_kill"), "{trace:?}");
+    // The port is free again.
+    assert!(std::net::TcpListener::bind("127.0.0.1:8765").is_ok());
+}

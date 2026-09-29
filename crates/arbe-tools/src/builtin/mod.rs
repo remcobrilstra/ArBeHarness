@@ -15,6 +15,7 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod list_dir;
 pub mod path_guard;
+pub mod processes;
 pub mod read_file;
 pub mod todo_write;
 pub mod write_file;
@@ -36,6 +37,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",
     "execute",
+    "process_output",
+    "process_kill",
     "todo_write",
 ];
 
@@ -66,9 +69,23 @@ pub fn register_all(registry: &mut ToolRegistry, root: &Path) {
         "grep",
         Arc::new(grep_tool::GrepTool::new(root.to_path_buf())),
     );
+    // One table per registry (= per session): background processes die
+    // with the session.
+    let processes = Arc::new(processes::ProcessTable::new());
     registry.register(
         "execute",
-        Arc::new(execute_tool::ExecuteTool::new(root.to_path_buf())),
+        Arc::new(execute_tool::ExecuteTool::with_processes(
+            root.to_path_buf(),
+            processes.clone(),
+        )),
+    );
+    registry.register(
+        "process_output",
+        Arc::new(processes::ProcessOutputTool::new(processes.clone())),
+    );
+    registry.register(
+        "process_kill",
+        Arc::new(processes::ProcessKillTool::new(processes)),
     );
     registry.register("todo_write", Arc::new(todo_write::TodoWriteTool::new()));
 }
