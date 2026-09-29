@@ -141,7 +141,23 @@ pub(super) async fn run_turn(
         usage: Usage::default(),
     };
 
-    match runner.execute(content).await {
+    let started = std::time::Instant::now();
+    let outcome = runner.execute(content).await;
+    match &outcome {
+        Ok(end) => tracing::info!(
+            stop = ?end.stop_reason,
+            input_tokens = runner.usage.input_tokens,
+            output_tokens = runner.usage.output_tokens,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "turn finished"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "turn ended without an answer"
+        ),
+    }
+    match outcome {
         Ok(end) => {
             let answer = runner.final_answer();
             runner.commit(end.stop_reason.clone())?;
@@ -259,20 +275,22 @@ impl TurnRunner<'_> {
                     message: message.clone(),
                 }));
             state.next_turn_index = turn.index + 1;
-            state.meta.usage += turn.usage;
+            super::add_usage(&mut state.meta, turn.usage, agent.settings.pricing);
             state.meta.touch(arbe_core::SessionStatus::Active);
             if let Err(err) = agent.store.save_meta(&state.meta) {
                 // The turn itself is safely persisted; only meta.json's
                 // running usage total/timestamp is stale.
                 tracing::warn!(%err, "failed to update session metadata");
             }
-            state.meta.usage
+            (state.meta.usage, state.meta.cost_usd)
         };
+        let (session_usage, session_cost_usd) = session_usage;
         agent.events.publish(RuntimeEvent::UsageUpdated {
             session_id: agent.session_id(),
             turn_id: turn.id,
             turn: turn.usage,
             session: session_usage,
+            session_cost_usd,
         });
         Ok(())
     }
@@ -535,6 +553,7 @@ impl TurnRunner<'_> {
         let agent = self.agent;
         let turn_id = self.turn_id();
         let events = &agent.events;
+        let started = std::time::Instant::now();
         let mut stream = stream_with_retry(
             agent.provider.as_ref(),
             request,
@@ -551,6 +570,8 @@ impl TurnRunner<'_> {
         )
         .await
         .map_err(provider_error)?;
+        // `stream_with_retry` returns once the first event has arrived.
+        let first_event_ms = started.elapsed().as_millis() as u64;
 
         let mut acc = ResponseAccumulator::new();
         while let Some(event) = stream.next().await {
@@ -588,7 +609,19 @@ impl TurnRunner<'_> {
             }
             acc.push(event);
         }
-        Ok((acc.finish(), false))
+        let response = acc.finish();
+        tracing::info!(
+            model = %agent.settings.model,
+            first_event_ms,
+            duration_ms = started.elapsed().as_millis() as u64,
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            cache_read_tokens = response.usage.cache_read_tokens,
+            tool_calls = response.message.tool_uses().len(),
+            stop = ?response.stop_reason,
+            "model call"
+        );
+        Ok((response, false))
     }
 }
 

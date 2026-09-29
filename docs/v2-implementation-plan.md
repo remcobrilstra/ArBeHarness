@@ -30,6 +30,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-30 — P6.8 observability.** Log file, spans, per-session cost; OpenTelemetry deferred. P6 is done apart from plan mode (P6.6, postponed by the maintainer).
 - **2026-09-30 — P6.7 web tools.** See P6.7.
 - **2026-09-30 — P6.4 background processes.** See P6.4.
 - **2026-09-29 — P6.5 `ask_user`.** See P6.5.
@@ -301,7 +302,8 @@ Make the harness configurable from files and connect the parts v1 built but neve
 - [ ] **P6.6 Plan mode.** A read-only mode (write/execute tools auto-denied) with `exit_plan_mode` requiring user approval of the plan — implemented as a profile/policy overlay, not a new `LoopPhase`.
 - [x] **P6.7 Web tools (optional, `general` profile).** `web_fetch` (HTML → text, size-capped) and a pluggable `web_search` backend configured in config; medium risk.
   - *Done (2026-09-30):* `arbe-tools/src/builtin/web.rs` — `web_fetch` (http/https only, 3 MB read cap, `html2text` for HTML + `<title>`, text/JSON as-is, binaries refused, 4xx/5xx are `is_error` results; rule subject = URL) and `web_search` over Brave / Tavily / SearXNG, normalized to `{title, url, snippet}` (rule subject = query). `[web.search]` config (`backend`, `api_key_env`, `base_url`), validated at load; stripped from untrusted project config; key redacted. Both in the `general` profile. Tests: wiremock for fetch and all three search backends; live: grok-4.7 fetched example.com. `web_search` not run against a real service (no key).
-- [ ] **P6.8 Observability.** `tracing` spans per turn/round/tool with a file sink under `~/.arbe/logs/`, optional OpenTelemetry export behind a feature flag, and per-session usage/cost summaries.
+- [x] **P6.8 Observability.** *(OpenTelemetry deferred)* `tracing` spans per turn/round/tool with a file sink under `~/.arbe/logs/`, optional OpenTelemetry export behind a feature flag, and per-session usage/cost summaries.
+  - *Done (2026-09-30):* the binary logs to `~/.arbe/logs/arbeharness.<date>.log` (tracing-appender, daily, 14 kept; `ARBE_LOG` filter; never the terminal). Spans: `turn{session,provider,model}` → `tool{name,call}` (subagents nest under their `task` call); events per model call (first_event_ms, duration, tokens, stop), per tool call, per turn, and a session summary on close. Cost: `[[models]]` gains `input_price`/`output_price`/`cache_*_price` (USD per Mtok; `context_window` now optional), `arbe_core::Pricing::cost`, `meta.json` `cost_usd`, `UsageUpdated.session_cost_usd`, shown in the TUI header; compaction calls count. No built-in prices (they go stale). **Deferred:** OpenTelemetry export (a large dependency stack for little gain until someone needs a collector). Verified live on grok-4.7: log lines and cost match a hand calculation.
 
 **Exit criteria:** the headless mode is driven end-to-end by an integration test (spawns the binary, sends a message, reads events); a subagent test shows context isolation and approval routing; the minimal embedder example compiles in CI.
 

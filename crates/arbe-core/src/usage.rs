@@ -20,6 +20,37 @@ impl Usage {
     }
 }
 
+/// A model's prices, in US dollars per million tokens (set by the user in
+/// config; the harness ships no prices, since they change).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Pricing {
+    pub input: f64,
+    pub output: f64,
+    /// For tokens served from the prompt cache (default: the input price).
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    /// For tokens written to the prompt cache (default: the input price).
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+}
+
+impl Pricing {
+    /// What `usage` cost, in US dollars.
+    pub fn cost(&self, usage: &Usage) -> f64 {
+        let per_token = |price: f64, tokens: u64| price * tokens as f64 / 1_000_000.0;
+        per_token(self.input, usage.input_tokens)
+            + per_token(self.output, usage.output_tokens)
+            + per_token(
+                self.cache_read.unwrap_or(self.input),
+                usage.cache_read_tokens,
+            )
+            + per_token(
+                self.cache_write.unwrap_or(self.input),
+                usage.cache_write_tokens,
+            )
+    }
+}
+
 impl std::ops::AddAssign for Usage {
     fn add_assign(&mut self, rhs: Self) {
         self.input_tokens += rhs.input_tokens;
@@ -60,6 +91,24 @@ pub enum StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_prices_each_kind_of_token() {
+        let pricing = Pricing {
+            input: 3.0,
+            output: 15.0,
+            cache_read: Some(0.3),
+            cache_write: None,
+        };
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cache_read_tokens: 2_000_000,
+            cache_write_tokens: 1_000_000,
+        };
+        // 3 + 1.5 + 0.6 + 3 (cache writes at the input price)
+        assert!((pricing.cost(&usage) - 8.1).abs() < 1e-9);
+    }
 
     #[test]
     fn usage_adds_field_by_field() {

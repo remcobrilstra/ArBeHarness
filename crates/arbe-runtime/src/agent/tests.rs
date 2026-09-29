@@ -258,6 +258,7 @@ fn test_parts(
             project_dir: temp_dir("no-project"),
             prompt: crate::system_prompt::PromptTemplate::Coding,
             home: temp_dir("no-home"),
+            pricing: None,
         },
         store,
         meta,
@@ -2052,5 +2053,43 @@ async fn ask_user_waits_for_the_answer_without_asking_for_approval() {
     assert_eq!(
         t.store.load_meta(t.session_id).unwrap().activity,
         Some(arbe_core::SessionActivity::Idle)
+    );
+}
+
+#[tokio::test]
+async fn cost_is_tracked_when_the_models_prices_are_known() {
+    // Scripted usage per call: 10 input, 5 output tokens.
+    let (t, mut rx) = test_agent_with(ScriptedProvider::new(vec![], answer("ok")), |parts| {
+        parts.settings.pricing = Some(arbe_core::Pricing {
+            input: 1_000.0,
+            output: 2_000.0,
+            cache_read: None,
+            cache_write: None,
+        });
+    });
+    t.agent.submit_message("one".into()).await.unwrap();
+    t.agent.submit_message("two".into()).await.unwrap();
+    // Per turn: 10 * 1000/1M + 5 * 2000/1M = 0.02.
+    let cost = t.store.load_meta(t.session_id).unwrap().cost_usd.unwrap();
+    assert!((cost - 0.04).abs() < 1e-9, "{cost}");
+    assert_eq!(t.agent.cost_usd(), Some(cost));
+    let published = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::UsageUpdated {
+                session_cost_usd, ..
+            } => session_cost_usd,
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert!((published - 0.04).abs() < 1e-9);
+
+    // Without prices, no cost at all.
+    let plain = test_agent(ScriptedProvider::new(vec![], answer("ok")));
+    plain.agent.submit_message("x".into()).await.unwrap();
+    assert_eq!(
+        plain.store.load_meta(plain.session_id).unwrap().cost_usd,
+        None
     );
 }

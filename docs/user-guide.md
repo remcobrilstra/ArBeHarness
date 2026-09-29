@@ -308,7 +308,7 @@ context_window = 32768
 | `hooks.timeout_ms` | `500` | Default time limit for hooks that don't set their own. |
 | `[[hooks.commands]]` | none | Shell commands run at points in a turn. See [Hooks](#hooks). |
 | `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
-| `[[models]]` | none | Corrects the [context-window table](#providers-and-models) for one model: `provider`, exact `name`, `context_window`, and optionally `tool_calls`, `vision`, `thinking`. For Ollama this also sets the context size the server is asked to allocate. |
+| `[[models]]` | none | Settings for one model, by `provider` and exact `name`: `context_window` (corrects the [context-window table](#providers-and-models); for Ollama also the context size the server allocates), `tool_calls`, `vision`, `thinking`, and prices for [cost tracking](#costs) — `input_price` and `output_price` (both required for prices), `cache_read_price`, `cache_write_price`, in US dollars per million tokens. All optional except `provider` and `name`. |
 
 ---
 
@@ -410,6 +410,7 @@ The maximum response length is fixed at 4096 output tokens.
 |---|---|---|
 | `ARBE_WORKDIR` | current directory | Same as `--workdir`. |
 | `ARBE_HOME` | `~/.arbe` | Same as `--dev-home`. Development/testing only. |
+| `ARBE_LOG` | `info` | How much goes into the [log file](#logs-and-troubleshooting): `warn`, `info`, `debug`, `trace`, or per module (`info,arbe_runtime=debug`). |
 
 ---
 
@@ -450,7 +451,7 @@ If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to a
 
 The screen has three parts:
 
-1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent. `used` is the total tokens the provider has reported for this session. While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
+1. **Header**: `workdir`, then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent. `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
 
 **Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, reasoning models on OpenAI-compatible servers such as xAI), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
 2. **Transcript**: your messages, the assistant's replies (basic Markdown formatting), tool activity, and `[error]` / `[info]` status lines. Replies stream in as they are generated, including any text the model writes between tool calls. If you scroll up, new output doesn't pull you back down. Scroll to the bottom to follow it again.
@@ -895,6 +896,7 @@ Rewritten atomically (temp file + rename) whenever the session changes.
 | `status` | `created`, `active`, `closed` or `failed`. |
 | `title` | The session's name: from `--name`, else the first line of the first message (up to 60 characters). Absent until one of those happens. |
 | `usage` | Token totals for the session. |
+| `cost_usd` | What the session's model calls cost, in US dollars, when the model's [prices](#costs) are set. Absent otherwise. |
 | `workdir` | Absolute path of the project directory the session works in (updated when it's resumed). |
 | `branch` | The git branch checked out in `workdir` when the session was last opened. Absent outside a repository or on a detached HEAD. |
 | `activity` | While the session is open: `idle` (waiting for your message), `running` (a turn is in progress), `awaiting_approval` (a tool call is waiting for your decision) or `awaiting_answer` (the model asked you a question). Absent once closed. |
@@ -952,7 +954,24 @@ Markdown with a `---` frontmatter block. See [Skills](#skills). A leading byte-o
 
 ## Logs and troubleshooting
 
-**The only log files are for MCP servers:** `~/.arbe/logs/mcp/<server>.log` holds what each stdio server printed to its error output. The harness's own internal warnings, such as an unreadable instructions file or a malformed skill, are currently dropped rather than shown. Errors that stop a turn appear in the transcript as `[error] ...` lines. Startup failures are printed to the terminal after the app exits.
+**The log file** is `~/.arbe/logs/arbeharness.<date>.log` — one file per day, the last 14 kept. It records the harness's warnings (an unreadable instructions file, a skipped skill, a failed hook) and, at the default `info` level, one line per model call (time to the first token, duration, tokens, stop reason), one per tool call (duration, outcome), one per finished turn, and a summary when a session closes (turns, tokens, cost). Each line is tagged with its session, model and tool, so you can follow one turn. Set `ARBE_LOG=debug` for more, `ARBE_LOG=warn` for less. Nothing is logged to the terminal.
+
+MCP servers additionally get `~/.arbe/logs/mcp/<server>.log` with what each stdio server printed to its error output. Errors that stop a turn appear in the transcript as `[error] ...` lines. Startup failures are printed to the terminal after the app exits.
+
+### Costs
+
+The harness ships no prices (they change too often), but you can give it yours per model, and it will add up what each session costs:
+
+```toml
+[[models]]
+provider = "openai_compatible"
+name = "grok-4.7"
+input_price = 2.0        # US dollars per million input tokens
+output_price = 10.0
+cache_read_price = 0.5   # optional; defaults to input_price
+```
+
+The running total shows in the chat screen's header and in the session's `meta.json` (`cost_usd`), and the log's session summary includes it. Model calls for compaction count too. A session that switches to a model without prices stops adding to its total.
 
 What you can inspect today:
 
@@ -991,5 +1010,4 @@ These have code in the repository but **can't be used yet**. They're listed so y
 | Feature | Status |
 |---|---|
 | Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
-| Harness log file | Only MCP servers get log files (`~/.arbe/logs/mcp/`); the harness's own warnings aren't written anywhere yet. |
 | `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |

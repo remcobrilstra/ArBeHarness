@@ -421,7 +421,21 @@ async fn run_batch(
                 })
             })),
         };
-        let outcome = authorized.execute(run).await;
+        let span = tracing::info_span!("tool", name = %tool_name, call = %id);
+        let started = std::time::Instant::now();
+        let outcome = tracing::Instrument::instrument(authorized.execute(run), span.clone()).await;
+        span.in_scope(|| match &outcome {
+            Ok(result) => tracing::info!(
+                duration_ms = started.elapsed().as_millis() as u64,
+                is_error = result.is_error,
+                "tool call"
+            ),
+            Err(err) => tracing::info!(
+                duration_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "tool call failed"
+            ),
+        });
         (index, id, tool_name, outcome)
     });
 

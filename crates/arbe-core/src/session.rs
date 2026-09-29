@@ -64,6 +64,11 @@ pub struct SessionMeta {
     /// the session (e.g. it crashed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// What the session's model calls cost so far, in US dollars — only
+    /// when the model's prices are configured (`[[models]]`); turns on a
+    /// model without prices add nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     /// For a subagent's session: the session whose `task` call started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<SessionId>,
@@ -91,6 +96,7 @@ impl SessionMeta {
             activity: None,
             pid: None,
             parent: None,
+            cost_usd: None,
         }
     }
 

@@ -199,7 +199,7 @@ pub(super) async fn compact(
         let mut state = agent.state();
         state.history.retain(|e| e.turn_index > through);
         state.summary = Some(compaction.clone());
-        state.meta.usage += compaction.usage;
+        super::add_usage(&mut state.meta, compaction.usage, agent.settings.pricing);
         if let Err(err) = agent.store.save_meta(&state.meta) {
             tracing::warn!(%err, "failed to update session metadata");
         }

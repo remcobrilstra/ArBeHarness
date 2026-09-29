@@ -80,6 +80,8 @@ struct Settings {
     prompt: PromptTemplate,
     /// Harness home (`~/.arbe`): global instructions and persistent memory.
     home: PathBuf,
+    /// The model's prices, when configured: the session's cost is kept.
+    pricing: Option<arbe_core::Pricing>,
 }
 
 /// Mutable session state. Only ever locked briefly, never across an
@@ -173,6 +175,15 @@ fn mark_open(meta: &mut SessionMeta, config: &RuntimeConfig, store: &SessionStor
     meta.pid = Some(std::process::id());
     if let Err(err) = store.save_meta(meta) {
         tracing::warn!(%err, "failed to update session metadata");
+    }
+}
+
+/// Adds a model call's usage to the session's totals, and its cost when
+/// the model's prices are known.
+fn add_usage(meta: &mut SessionMeta, usage: Usage, pricing: Option<arbe_core::Pricing>) {
+    meta.usage += usage;
+    if let Some(pricing) = pricing {
+        meta.cost_usd = Some(meta.cost_usd.unwrap_or(0.0) + pricing.cost(&usage));
     }
 }
 
@@ -464,6 +475,7 @@ impl Agent {
                 project_dir: config.project_dir.clone(),
                 prompt: config.prompt.clone(),
                 home: config.home.clone(),
+                pricing: config.pricing,
             },
             store,
             meta,
@@ -743,6 +755,12 @@ impl Agent {
         self.state().meta.usage
     }
 
+    /// The session's cost so far in US dollars, if its model's prices are
+    /// configured.
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.state().meta.cost_usd
+    }
+
     /// Problems found while setting up the session (e.g. skill files that
     /// couldn't be loaded), for the UI to show once.
     pub fn startup_warnings(&self) -> &[String] {
@@ -768,6 +786,14 @@ impl Agent {
         // whenever this agent happens to be dropped.
         self.registry_snapshot().close_all();
         let mut state = self.state();
+        tracing::info!(
+            session = %state.meta.id,
+            turns = state.next_turn_index,
+            input_tokens = state.meta.usage.input_tokens,
+            output_tokens = state.meta.usage.output_tokens,
+            cost_usd = state.meta.cost_usd,
+            "session closed"
+        );
         state.meta.touch(SessionStatus::Closed);
         state.meta.activity = None;
         state.meta.pid = None;
@@ -849,7 +875,13 @@ impl Agent {
     /// cancellation as `TurnCancelled`.
     pub async fn submit_message(&self, content: String) -> Result<String, HarnessError> {
         let active = self.begin_exclusive()?;
-        turn::run_turn(self, content, &active.cancel).await
+        let span = tracing::info_span!(
+            "turn",
+            session = %self.session_id(),
+            provider = %self.settings.provider_name,
+            model = %self.settings.model,
+        );
+        tracing::Instrument::instrument(turn::run_turn(self, content, &active.cancel), span).await
     }
 
     /// Summarizes all but the newest turn with the model (the `/compact`

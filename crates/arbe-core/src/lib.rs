@@ -25,4 +25,4 @@ pub use tool::{
     ToolSpec,
 };
 pub use turn::{Compaction, TURN_SCHEMA_VERSION, Turn};
-pub use usage::{StopReason, Usage};
+pub use usage::{Pricing, StopReason, Usage};

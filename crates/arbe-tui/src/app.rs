@@ -206,6 +206,8 @@ pub struct App {
     pub last_estimated_tokens: u64,
     /// Provider-reported tokens used by the whole session so far.
     pub session_tokens: u64,
+    /// The session's cost so far, when the model's prices are configured.
+    pub session_cost_usd: Option<f64>,
     /// Top-line offset into the (unwrapped) transcript content.
     pub scroll: u16,
     /// When true, the transcript view stays pinned to the newest content
@@ -257,6 +259,7 @@ impl App {
             should_quit: false,
             last_estimated_tokens: 0,
             session_tokens: 0,
+            session_cost_usd: None,
             scroll: 0,
             follow_tail: true,
             last_viewport_height: 0,

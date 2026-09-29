@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use arbe_core::{ApprovalPolicyMode, ConfigError};
-use arbe_providers::{ModelCatalog, RetryPolicy, catalog};
+use arbe_providers::{ModelCatalog, RetryPolicy};
 
 pub use crate::system_prompt::PromptTemplate;
 use file::Layer;
@@ -94,6 +94,8 @@ pub struct RuntimeConfig {
     pub subagent_max_depth: u32,
     /// Subagents running at once across a session's whole tree.
     pub subagent_max_concurrent: usize,
+    /// The configured model's prices (`[[models]]`), for cost tracking.
+    pub pricing: Option<arbe_core::Pricing>,
     /// The `web_search` service, if one is configured (`[web.search]`).
     pub web_search: Option<arbe_tools::builtin::web::SearchSettings>,
     /// MCP servers to connect for each session (enabled ones only).
@@ -140,6 +142,8 @@ struct Pending {
     mcp_servers: BTreeMap<String, arbe_mcp::McpServerSettings>,
     /// `[web.search]`, merged across layers; resolved once env is known.
     web_search: file::WebSearchSection,
+    /// Prices from `[[models]]` by (provider, model); later files win.
+    prices: BTreeMap<(String, String), arbe_core::Pricing>,
 }
 
 impl RuntimeConfig {
@@ -175,6 +179,7 @@ impl RuntimeConfig {
             subagent_max_depth: 1,
             subagent_max_concurrent: 4,
             web_search: None,
+            pricing: None,
             prompt: PromptTemplate::Coding,
             project_dir,
             home: arbe_storage::paths::arbe_home(),
@@ -357,7 +362,7 @@ impl RuntimeConfig {
                 reject_top_level_only(profile_layer, &profile, path)?;
                 config.apply(profile_layer, path, &mut pending)?;
             }
-            config.add_models(layer, path)?;
+            config.add_models(layer, path, &mut pending)?;
         }
         config.apply_env(env, &mut pending)?;
         config.finish(pending, env)?;
@@ -497,17 +502,59 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    fn add_models(&mut self, layer: &Layer, path: &Path) -> Result<(), ConfigError> {
+    fn add_models(
+        &mut self,
+        layer: &Layer,
+        path: &Path,
+        pending: &mut Pending,
+    ) -> Result<(), ConfigError> {
         for entry in &layer.models {
-            if entry.context_window == 0 {
+            if entry.context_window == Some(0) {
                 return Err(invalid(
                     path,
                     "models: context_window must be greater than 0",
                 ));
             }
-            let base = catalog::provider_default(&entry.provider);
+            match (entry.input_price, entry.output_price) {
+                (Some(input), Some(output)) => {
+                    let prices = [
+                        Some(input),
+                        Some(output),
+                        entry.cache_read_price,
+                        entry.cache_write_price,
+                    ];
+                    if prices.iter().flatten().any(|p| !p.is_finite() || *p < 0.0) {
+                        return Err(invalid(path, "models: prices must be 0 or more"));
+                    }
+                    pending.prices.insert(
+                        (entry.provider.clone(), entry.name.clone()),
+                        arbe_core::Pricing {
+                            input,
+                            output,
+                            cache_read: entry.cache_read_price,
+                            cache_write: entry.cache_write_price,
+                        },
+                    );
+                }
+                (None, None)
+                    if entry.cache_read_price.is_none() && entry.cache_write_price.is_none() => {}
+                _ => {
+                    return Err(invalid(
+                        path,
+                        "models: give both input_price and output_price (per million tokens)",
+                    ));
+                }
+            }
+            if entry.context_window.is_none()
+                && entry.tool_calls.is_none()
+                && entry.vision.is_none()
+                && entry.thinking.is_none()
+            {
+                continue;
+            }
+            let base = self.catalog.lookup(&entry.provider, &entry.name);
             let caps = arbe_providers::ModelCapabilities {
-                max_context_tokens: entry.context_window,
+                max_context_tokens: entry.context_window.unwrap_or(base.max_context_tokens),
                 tool_calls: entry.tool_calls.unwrap_or(base.tool_calls),
                 vision: entry.vision.unwrap_or(base.vision),
                 thinking: entry.thinking.unwrap_or(base.thinking),
@@ -589,6 +636,10 @@ impl RuntimeConfig {
         self.model = pending
             .model
             .unwrap_or_else(|| default_model(&self.provider_name, &self.prompt).to_string());
+        self.pricing = pending
+            .prices
+            .get(&(self.provider_name.clone(), self.model.clone()))
+            .copied();
         self.temperature = pending
             .temperature
             .unwrap_or_else(|| default_temperature(&self.provider_name));
@@ -1169,6 +1220,43 @@ mod tests {
         assert!(tool_allowed(&allowed, "github__search"));
         assert!(!tool_allowed(&allowed, "read_files"));
         assert!(!tool_allowed(&allowed, "gitlab__search"));
+    }
+
+    #[test]
+    fn model_prices_apply_to_the_configured_model_only() {
+        let dir = temp_dir();
+        let file = write(
+            &dir,
+            "p.toml",
+            "[provider]\nname = \"openai\"\nmodel = \"gpt-5\"\n\n[[models]]\nprovider = \"openai\"\nname = \"gpt-5\"\ninput_price = 1.25\noutput_price = 10.0\n\n[[models]]\nprovider = \"openai\"\nname = \"gpt-5-mini\"\ninput_price = 0.25\noutput_price = 2.0\n",
+        );
+        let c = load(
+            std::slice::from_ref(&file),
+            &env_of(&[("OPENAI_API_KEY", "k")]),
+        )
+        .unwrap();
+        let pricing = c.pricing.unwrap();
+        assert_eq!((pricing.input, pricing.output), (1.25, 10.0));
+        // Prices alone don't touch the context window.
+        assert_eq!(
+            c.catalog.lookup("openai", "gpt-5").max_context_tokens,
+            RuntimeConfig::defaults(PathBuf::from("/p"))
+                .catalog
+                .lookup("openai", "gpt-5")
+                .max_context_tokens
+        );
+        let other = load(
+            &[file],
+            &env_of(&[("OPENAI_API_KEY", "k"), ("ARBE_MODEL", "o3")]),
+        )
+        .unwrap();
+        assert!(other.pricing.is_none());
+        let half = write(
+            &dir,
+            "h.toml",
+            "[[models]]\nprovider = \"openai\"\nname = \"x\"\ninput_price = 1.0\n",
+        );
+        assert!(load(&[half], &no_env).is_err());
     }
 
     #[test]

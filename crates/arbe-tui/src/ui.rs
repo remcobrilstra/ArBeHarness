@@ -53,10 +53,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "idle".to_string()
     };
+    let cost = app
+        .session_cost_usd
+        .map(|c| format!(" (${c:.4})"))
+        .unwrap_or_default();
     let lines = vec![
         Line::from(format!(" workdir: {} ", app.project_dir)),
         Line::from(format!(
-            " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  context: ~{}  |  used: {} ",
+            " profile: {}  |  provider: {}  |  model: {}  |  session: {}  |  phase: {}  |  context: ~{}  |  used: {}{cost} ",
             app.profile,
             app.provider_name,
             app.model,

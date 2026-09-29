@@ -210,10 +210,16 @@ pub struct CommandHookEntry {
 pub struct ModelEntry {
     pub provider: String,
     pub name: String,
-    pub context_window: u64,
+    /// Omitted: the built-in table's value stays (e.g. to set only prices).
+    pub context_window: Option<u64>,
     pub tool_calls: Option<bool>,
     pub vision: Option<bool>,
     pub thinking: Option<bool>,
+    /// Prices in US dollars per million tokens, for cost tracking.
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub cache_read_price: Option<f64>,
+    pub cache_write_price: Option<f64>,
 }
 
 /// Parses one config file's text. The error message carries toml's
@@ -292,7 +298,7 @@ mod tests {
             Some(ApprovalPolicyMode::AllowlistAuto)
         );
         assert_eq!(layer.profiles["review"].tools.as_ref().unwrap().len(), 3);
-        assert_eq!(layer.models[0].context_window, 32_768);
+        assert_eq!(layer.models[0].context_window, Some(32_768));
         assert_eq!(
             layer.mcp.unwrap().servers["github"].command.as_deref(),
             Some("npx")

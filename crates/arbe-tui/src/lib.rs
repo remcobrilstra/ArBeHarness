@@ -251,8 +251,13 @@ fn drain_runtime_events(
                     "compacted {compacted_messages} older message(s) into a summary"
                 ));
             }
-            Ok(RuntimeEvent::UsageUpdated { session, .. }) => {
+            Ok(RuntimeEvent::UsageUpdated {
+                session,
+                session_cost_usd,
+                ..
+            }) => {
                 app.session_tokens = session.total_tokens();
+                app.session_cost_usd = session_cost_usd;
             }
             Ok(RuntimeEvent::TurnCompleted { stop_reason, .. }) => {
                 app.working = false;
@@ -718,6 +723,7 @@ fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
     app.provider_name = new_agent.provider_name().to_string();
     app.model = new_agent.model().to_string();
     app.session_tokens = new_agent.usage().total_tokens();
+    app.session_cost_usd = new_agent.cost_usd();
     app.clear_transcript();
     app.pending_approval = None;
     app.proposed_tool_calls.clear();

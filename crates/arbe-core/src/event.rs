@@ -100,6 +100,10 @@ pub enum RuntimeEvent {
         turn_id: TurnId,
         turn: Usage,
         session: Usage,
+        /// The session's cost so far in US dollars, if the model's prices
+        /// are configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_cost_usd: Option<f64>,
     },
     /// An MCP server connected and its tools were registered.
     McpServerConnected {
