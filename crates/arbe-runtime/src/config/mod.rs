@@ -970,7 +970,11 @@ mod tests {
         assert_eq!(c.profile, "general");
         assert_eq!(
             c.tools,
-            Some(vec!["todo_write".to_string(), "remember".to_string()])
+            Some(vec![
+                "todo_write".to_string(),
+                "remember".to_string(),
+                "ask_user".to_string()
+            ])
         );
         assert_eq!(c.prompt, PromptTemplate::General);
         assert_eq!(c.model, "llama3.2:3b");
