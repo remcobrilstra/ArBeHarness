@@ -17,18 +17,20 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P0 | Housekeeping & quick correctness fixes | Done | 6 / 6 | 223 tests, fmt/clippy clean. P0.3 not verified against a live Ollama server (none available) |
 | P1 | Core types v2 (content blocks, events, cancellation, persistence schema) | Done | 7 / 7 | 265 tests, fmt/clippy clean. Pulled forward parts of P2.2/P2.3 (adapters on the new trait, streamed tool calls, usage), P3.2 (streaming every round) and P3.7 (tool errors go back to the model) |
 | P2 | Provider layer v2 | In progress | 9 / 9 | All implemented and fixture-tested. Ollama verified live (qwen2.5-coder:3b, llama3.2:3b). **Not Done yet:** the exit criterion also needs live OpenAI and Anthropic runs (no API keys here) |
-| P3 | Agent loop v2 | In progress | 10 / 10 | All tasks done. **Exit criterion open:** an interactive TUI run verified by a human at a real terminal (can't be done from this environment) |
+| P3 | Agent loop v2 | Done | 10 / 10 | All exit criteria met; the TUI was accepted by the maintainer after using it against grok-4.7 (2026-09-29) |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
 | P6 | Multi-purpose & embedding | In progress | 7 / 8 | All exit criteria met. P6.1–P6.5, P6.7, P6.8 done (OpenTelemetry export deferred); P6.6 plan mode postponed by the maintainer. Desktop control designed (`docs/desktop-control-design.md`), awaiting review |
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
-**Current focus:** release blockers that need the maintainer (see `docs/v2-status.md`): push + CI, OpenAI/Anthropic live runs, human TUI check, LICENSE, tag
-**Last updated:** 2026-09-29 · test count: 476 (+21 ignored live tests)
+**Current focus:** everything open is listed under **Pending work** in `docs/v2-status.md`: OpenAI/Anthropic live runs (keys), `v0.2.0` tag + binaries, plan mode (postponed), desktop control (awaiting review)
+**Last updated:** 2026-09-30 · test count: 495 on Windows, 497 on Linux (+24 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
+
+- **2026-09-30 — P3 closed, pending work consolidated.** The maintainer accepted the TUI (P3's last exit criterion). All open items now live in one list: `docs/v2-status.md` → Pending work. `v2` merged into `main`.
 
 - **2026-09-30 — P6.8 observability.** Log file, spans, per-session cost; OpenTelemetry deferred. P6 is done apart from plan mode (P6.6, postponed by the maintainer).
 - **2026-09-30 — P6.7 web tools.** See P6.7.
@@ -230,7 +232,7 @@ Replace the 1 358-line `Agent` with a small, cancellable loop that persists ever
 - [x] **P3.9 Remove the manual `/tool` bypass path's duplication.** `propose_tool_call`/`resolve_tool_call` become a thin "inject a synthetic tool-use" entry point into the same `TurnRunner` path, so there is exactly one execution path to test.
   - *Done:* `Agent::invoke_tool` runs a one-call round through `tools::run_round`; `propose_tool_call`/`resolve_tool_call`/`pending_tool_calls` are gone.
 - [x] **P3.10 TUI port.** Update `arbe-tui` for the v2 events: thinking display (collapsible), live tool-argument rendering, parallel tool status, `Esc` to cancel a turn, usage/cost in the header, and the existing session picker wired to `resume`.
-  - *Mostly done:* `Arc<Agent>`, `Esc` cancels (also from the approval modal), stop-reason notices, session tokens in the header, retry/thinking/tool-prep/progress in the activity line; resume shows tool-call counts. *Done (2026-09-29):* thinking streams into its own `[thinking]` transcript entry, collapsed to one line by default, `Ctrl+T` toggles all (render cache and scroll line counts are rebuilt; a test checks rendered lines == counted lines both ways); streaming tool arguments preview live in the activity line (the full call lands in the transcript when proposed — per-call transcript lines would break the "only the last entry mutates" cache invariant with parallel calls). **Not done:** cost in the header (the catalog has no prices; tokens are shown) — deferred, not part of the release bar's exit criterion. A human run at a real terminal is still required (P3 exit criterion).
+  - *Mostly done:* `Arc<Agent>`, `Esc` cancels (also from the approval modal), stop-reason notices, session tokens in the header, retry/thinking/tool-prep/progress in the activity line; resume shows tool-call counts. *Done (2026-09-29):* thinking streams into its own `[thinking]` transcript entry, collapsed to one line by default, `Ctrl+T` toggles all (render cache and scroll line counts are rebuilt; a test checks rendered lines == counted lines both ways); streaming tool arguments preview live in the activity line (the full call lands in the transcript when proposed — per-call transcript lines would break the "only the last entry mutates" cache invariant with parallel calls). **Not done:** cost in the header (the catalog has no prices; tokens are shown) — deferred, not part of the release bar's exit criterion. *Verified (2026-09-29):* accepted by the maintainer after interactive use against grok-4.7. Cost in the header landed with P6.8.
 
 **Exit criteria:** `Agent`-level tests (with a scripted fake provider) cover: multi-round tool use, parallel tools with ordering, cancel mid-stream and mid-tool, crash-then-resume mid-turn with trace intact, every loop guard; `agent.rs`-equivalent modules have no function over ~150 lines; interactive TUI run verified by a human at a real terminal.
 

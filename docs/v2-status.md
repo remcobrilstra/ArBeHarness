@@ -11,13 +11,13 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 | P0 Housekeeping | Met | — |
 | P1 Core types | Met | — |
 | P2 Provider layer | **Open** | Live runs against api.openai.com and Anthropic (no keys available here) |
-| P3 Agent loop | **Open** | An interactive TUI session checked by a human at a real terminal |
+| P3 Agent loop | Met | — |
 | P4 Config, profiles, extensions | Met | — |
 | P5 Context management | Met | — |
-| P6.1–P6.3 Embedding, headless, subagents | Met | — (P6.4–P6.8 are outside the release bar) |
+| P6.1–P6.3 Embedding, headless, subagents | Met | — (of P6.4–P6.8, outside the release bar, only P6.6 plan mode is open) |
 | P7 Verification & release | **Open** | Live runs above; `v0.2.0` tag and binaries |
 
-**Tests:** 471 passing, 21 `#[ignore]`d live tests; `cargo fmt`, `cargo clippy --workspace --all-targets -D warnings` and `cargo deny check` clean — on Windows locally, and in GitHub Actions on Linux, macOS and Windows (run 36579578868, commit `2823e18`, all green).
+**Tests:** 495 passing on Windows (497 on Linux, which runs two Unix-only tests), 24 `#[ignore]`d live tests; `cargo fmt`, `cargo clippy --workspace --all-targets -D warnings` and `cargo deny check` clean. Last full GitHub Actions run on Linux, macOS and Windows: run 36579578868, commit `2823e18`, all green; later commits verified locally on Windows and in a Linux container.
 
 ## P0 — Housekeeping & quick correctness fixes — Met
 
@@ -42,11 +42,11 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 
 **To close:** run `cargo test -p arbe-providers --test live -- --ignored --nocapture` with `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` set (or trigger `.github/workflows/live.yml` with those secrets).
 
-## P3 — Agent loop v2 — Open
+## P3 — Agent loop v2 — Met
 
 - *Agent-level tests (scripted provider) for multi-round tool use, parallel tools with ordering, cancel mid-stream and mid-tool, crash-then-resume mid-turn, every loop guard:* met — `crates/arbe-runtime/src/agent/tests.rs`.
 - *No agent-module function over ~150 lines:* met — the longest is `turn::model_loop` at 152 lines (measured 2026-09-29).
-- *Interactive TUI run verified by a human at a real terminal:* **open.** This environment has no interactive terminal. The TUI's logic is unit-tested (22 tests, including rendering/scroll consistency) and its layout was confirmed by a captured run, but nobody has typed into it since v2's changes. Worth checking in particular: streaming a reply, the approval dialog (including a subagent's approval), `Esc` to cancel, `Ctrl+T` thinking, `Ctrl+R` resume, and `--prompt`.
+- *Interactive TUI run verified by a human at a real terminal:* met — the maintainer used the TUI against grok-4.7 (including the Ctrl+P profile switch) and accepted it on 2026-09-29. The TUI's logic is also unit-tested (rendering/scroll consistency, dialogs, profile picker).
 
 ## P4 — Config, profiles & extension wiring — Met
 
@@ -65,7 +65,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 - *A subagent test shows context isolation and approval routing:* met — `a_subagent_works_in_its_own_context_and_its_approvals_reach_the_parent`, `cancelling_the_parent_cancels_a_waiting_subagent`; live, `delegates_research_to_a_subagent`.
 - *The minimal embedder example compiles in CI:* met — `crates/arbe-runtime/examples/embed.rs` builds under `clippy --all-targets` in CI on all three OSes, and ran against a local model.
 
-Outside the release bar and not started: P6.4 background execution, P6.5 `ask_user`, P6.6 plan mode, P6.7 web tools, P6.8 observability.
+Outside the release bar: P6.4 background processes, P6.5 `ask_user`, P6.7 web tools and P6.8 observability are done and were verified live on grok-4.7 (`web_search` only against a mock server; OpenTelemetry deferred). P6.6 plan mode is postponed — see [Pending work](#pending-work).
 
 ## P7 — Verification, hardening & release — Open
 
@@ -80,9 +80,38 @@ Outside the release bar and not started: P6.4 background execution, P6.5 `ask_us
 | P7.7 CI actually running | Met | First run on GitHub (2026-09-29) failed on Linux/macOS: a real bug — `trusted_projects` entries with `..` never matched on Unix (fixed in `2823e18`, reproduced and verified in a Linux container). Second run green on all three OSes + `cargo-deny`. |
 | P7.8 Docs & release | **Open** | This file, README and CHANGELOG are written. `LICENSE` added: proprietary, all rights reserved, until a license is chosen. Open: the `v0.2.0` tag and prebuilt binaries. |
 
+## Pending work
+
+Everything not done yet, in one place. Nothing here blocks using the harness today.
+
+**Needs the maintainer**
+
+| Item | What's needed |
+|---|---|
+| P2 / P7.2 live runs on OpenAI and Anthropic | API keys. The tests exist (`cargo test -p arbe-providers --test live -- --ignored`, `live_agent`, `.github/workflows/live.yml` with secrets); OpenAI's wire format already runs live through `openai_compatible` against xAI. |
+| P7.8 `v0.2.0` tag and prebuilt binaries | A release workflow (not written yet) and the go-ahead to tag. |
+| License | `LICENSE` is proprietary (all rights reserved) until one is chosen. |
+| Desktop control | Review of [`desktop-control-design.md`](desktop-control-design.md) and two decisions: allow BSD-2-Clause in `deny.toml` (for `xcap`) or write our own capture code; on Linux, one binary that needs `libxkbcommon` or two builds. |
+
+**Features not built**
+
+| Item | State |
+|---|---|
+| P6.6 Plan mode | Postponed by the maintainer. A read-only overlay (write/execute tools denied) with an `exit_plan_mode` tool the user approves. |
+| Desktop control | Designed only (see above). |
+| OpenTelemetry export (P6.8) | Deferred; the daily log file covers local debugging. |
+| `events.jsonl` | Not written; events are available live (TUI, `--print --output json`, `--headless`). |
+| Subagent gaps | Subagents use the parent's configuration (no per-call profile), don't connect MCP servers, and their tokens and cost aren't added to the parent's totals. |
+| Smaller ideas | [`todo.md`](todo.md): nested project instruction files, MCP schema lookup before use, output-formatting conventions. A punch list, not a commitment. |
+
+**Built but not verified against the real thing**
+
+| Item | What's missing |
+|---|---|
+| `web_search` | Tested only against a mock server; no Brave/Tavily/SearXNG account here. |
+| `.github/workflows/live.yml` | Never run (needs repository secrets). |
+
 ## Known limitations (by design or deferred)
 
-- Subagents use the parent's configuration (no per-call profile), don't connect MCP servers, and their token use isn't added to the parent's total.
-- No cost display (the model catalog has no prices).
-- `events.jsonl` isn't written (the event stream is available live, via the TUI, `--print --output json` and `--headless`).
+- No built-in model prices (they go stale): costs appear only for models whose prices you set in `[[models]]`.
 - Small local models (3B) are unreliable at tool use: `llama3.2:3b` calls `remember` on trivia, and `qwen2.5-coder:3b` sometimes repeats a tool call. The harness handles both safely (approval gate, repeated-call guard) but can't make them good agents.
