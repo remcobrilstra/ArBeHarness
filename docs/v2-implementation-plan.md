@@ -20,7 +20,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P3 | Agent loop v2 | In progress | 10 / 10 | All tasks done. **Exit criterion open:** an interactive TUI run verified by a human at a real terminal (can't be done from this environment) |
 | P4 | Config, profiles & extension wiring | Done | 9 / 9 | All exit criteria verified (profile switch test, live MCP reference server, command-hook veto). Plus a project-config trust gate added as a security fix |
 | P5 | Context management v2 | Done | 6 / 6 | Exit criteria verified: 200-turn stress test within budget with intact tool pairs; compaction survives resume |
-| P6 | Multi-purpose & embedding | In progress | 3 / 8 | P6.1–P6.3 done; all three exit criteria met (binary-spawning headless test, subagent isolation + approval-routing test, embedder example compiles). Remaining P6.4–P6.8 are optional per the risk register's release bar |
+| P6 | Multi-purpose & embedding | In progress | 7 / 8 | All exit criteria met. P6.1–P6.5, P6.7, P6.8 done (OpenTelemetry export deferred); P6.6 plan mode postponed by the maintainer. Desktop control designed (`docs/desktop-control-design.md`), awaiting review |
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
 **Current focus:** release blockers that need the maintainer (see `docs/v2-status.md`): push + CI, OpenAI/Anthropic live runs, human TUI check, LICENSE, tag
