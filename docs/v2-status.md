@@ -15,9 +15,9 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 | P4 Config, profiles, extensions | Met | — |
 | P5 Context management | Met | — |
 | P6.1–P6.3 Embedding, headless, subagents | Met | — (P6.4–P6.8 are outside the release bar) |
-| P7 Verification & release | **Open** | CI green on GitHub (needs a push); live runs above; `v0.2.0` tag and binaries |
+| P7 Verification & release | **Open** | Live runs above; `v0.2.0` tag and binaries |
 
-**Tests:** 471 passing, 21 `#[ignore]`d live tests; `cargo fmt`, `cargo clippy --workspace --all-targets -D warnings` and `cargo deny check` clean — on Windows (the development machine). Linux and macOS have not been run (see P7).
+**Tests:** 471 passing, 21 `#[ignore]`d live tests; `cargo fmt`, `cargo clippy --workspace --all-targets -D warnings` and `cargo deny check` clean — on Windows locally, and in GitHub Actions on Linux, macOS and Windows (run 36579578868, commit `2823e18`, all green).
 
 ## P0 — Housekeeping & quick correctness fixes — Met
 
@@ -63,7 +63,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 
 - *Headless mode driven end-to-end by an integration test that spawns the binary:* met — `tests/cli.rs::headless_mode_speaks_json_rpc_over_stdio`; plus in-process protocol tests, and a 24-check client run against xAI.
 - *A subagent test shows context isolation and approval routing:* met — `a_subagent_works_in_its_own_context_and_its_approvals_reach_the_parent`, `cancelling_the_parent_cancels_a_waiting_subagent`; live, `delegates_research_to_a_subagent`.
-- *The minimal embedder example compiles in CI:* met locally — `crates/arbe-runtime/examples/embed.rs` builds under `clippy --all-targets` and ran against a local model. "In CI" depends on P7.7.
+- *The minimal embedder example compiles in CI:* met — `crates/arbe-runtime/examples/embed.rs` builds under `clippy --all-targets` in CI on all three OSes, and ran against a local model.
 
 Outside the release bar and not started: P6.4 background execution, P6.5 `ask_user`, P6.6 plan mode, P6.7 web tools, P6.8 observability.
 
@@ -77,7 +77,7 @@ Outside the release bar and not started: P6.4 background execution, P6.5 `ask_us
 | P7.4 Gate enforcement | Met | `ToolContext` is issued only by the gate; `compile_fail` doctests. |
 | P7.5 JSONL read performance | Met (by measurement) | Resume of 5,000 turns / 46 MB reads in 66 ms; no change needed. |
 | P7.6 Benchmarks | Met | `cargo bench` in arbe-memory, arbe-storage, arbe-providers; results in the plan. |
-| P7.7 CI actually running | **Open** | Workflows + `cargo-deny` are in the repo and pass locally; never run on GitHub. Needs a push. |
+| P7.7 CI actually running | Met | First run on GitHub (2026-09-29) failed on Linux/macOS: a real bug — `trusted_projects` entries with `..` never matched on Unix (fixed in `2823e18`, reproduced and verified in a Linux container). Second run green on all three OSes + `cargo-deny`. |
 | P7.8 Docs & release | **Open** | This file, README and CHANGELOG are written. `LICENSE` added: proprietary, all rights reserved, until a license is chosen. Open: the `v0.2.0` tag and prebuilt binaries. |
 
 ## Known limitations (by design or deferred)
