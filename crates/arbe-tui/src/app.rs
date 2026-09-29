@@ -70,6 +70,42 @@ impl SessionPicker {
     }
 }
 
+/// Profile-picker overlay state: switch the session to another configured
+/// profile (and with it, usually, another provider/model).
+#[derive(Debug, Clone)]
+pub struct ProfilePicker {
+    pub profiles: Vec<arbe_runtime::ProfileInfo>,
+    pub selected: usize,
+    /// The active profile's name, marked in the list.
+    pub current: String,
+}
+
+impl ProfilePicker {
+    /// Starts with the active profile selected.
+    pub fn new(profiles: Vec<arbe_runtime::ProfileInfo>, current: &str) -> Self {
+        let selected = profiles.iter().position(|p| p.name == current).unwrap_or(0);
+        Self {
+            profiles,
+            selected,
+            current: current.to_string(),
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.profiles.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_name(&self) -> Option<&str> {
+        self.profiles.get(self.selected).map(|p| p.name.as_str())
+    }
+}
+
 /// How many render-loop ticks (`event::poll` iterations, ~80ms each — see
 /// `lib.rs::event_loop`) a pending approval waits before auto-denying.
 pub const APPROVAL_TIMEOUT_TICKS: u32 = (30_000 / 80) as u32;
@@ -130,6 +166,7 @@ pub struct App {
     pub pending_approval: Option<PendingApproval>,
     pub proposed_tool_calls: std::collections::HashMap<ToolCallId, ProposedToolCall>,
     pub session_picker: Option<SessionPicker>,
+    pub profile_picker: Option<ProfilePicker>,
     pub should_quit: bool,
     pub last_estimated_tokens: u64,
     /// Provider-reported tokens used by the whole session so far.
@@ -180,6 +217,7 @@ impl App {
             pending_approval: None,
             proposed_tool_calls: std::collections::HashMap::new(),
             session_picker: None,
+            profile_picker: None,
             should_quit: false,
             last_estimated_tokens: 0,
             session_tokens: 0,
@@ -512,6 +550,31 @@ mod tests {
         assert_eq!(taken, "élo\n!");
         assert_eq!(a.input, "");
         assert_eq!(a.input_cursor, 0);
+    }
+
+    #[test]
+    fn profile_picker_starts_on_the_active_profile_and_clamps() {
+        let profile = |name: &str| arbe_runtime::ProfileInfo {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let mut picker = ProfilePicker::new(
+            vec![profile("coding"), profile("general"), profile("grok")],
+            "general",
+        );
+        assert_eq!(picker.selected_name(), Some("general"));
+        picker.move_down();
+        picker.move_down();
+        assert_eq!(picker.selected_name(), Some("grok"));
+        picker.move_up();
+        picker.move_up();
+        picker.move_up();
+        assert_eq!(picker.selected_name(), Some("coding"));
+        // An unknown current profile starts at the top.
+        assert_eq!(
+            ProfilePicker::new(vec![profile("a")], "zzz").selected_name(),
+            Some("a")
+        );
     }
 
     #[test]

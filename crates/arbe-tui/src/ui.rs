@@ -36,6 +36,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_approval_modal(frame, area, approval);
     } else if let Some(picker) = &app.session_picker {
         draw_session_picker(frame, area, picker);
+    } else if let Some(picker) = &app.profile_picker {
+        draw_profile_picker(frame, area, picker);
     }
 }
 
@@ -217,12 +219,14 @@ fn cursor_row_col(app: &App) -> (u16, u16) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.pending_approval.is_some() {
         "approval pending — see modal"
+    } else if app.profile_picker.is_some() {
+        "profile picker — \u{2191}/\u{2193} choose, Enter switch, Esc cancel"
     } else if app.session_picker.is_some() {
         "session picker — see modal"
     } else if app.working {
         "Esc: cancel turn | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+C: quit"
     } else {
-        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+T: thinking | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
+        "Enter: send | Shift/Alt+Enter: newline | \u{2191}/\u{2193}/PgUp/PgDn: scroll | Ctrl+T: thinking | Ctrl+P: model | Ctrl+N: new | Ctrl+R: resume | Ctrl+C: quit"
     };
     let text = app.input.as_str();
     let paragraph = Paragraph::new(text)
@@ -312,6 +316,53 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
                 .style(Style::default().fg(Color::Yellow)),
         );
     frame.render_widget(paragraph, popup);
+}
+
+/// One line per profile: its name, then the provider/model it sets (or
+/// that it keeps the current one), the active profile marked.
+fn profile_line(profile: &arbe_runtime::ProfileInfo, current: &str) -> String {
+    let marker = if profile.name == current { "●" } else { " " };
+    let target = if profile.sets_provider() {
+        format!(
+            "{} / {}",
+            profile.provider.as_deref().unwrap_or("(current provider)"),
+            profile.model.as_deref().unwrap_or("(its default model)")
+        )
+    } else {
+        "keeps the current provider and model".to_string()
+    };
+    let builtin = if profile.builtin { "  (built-in)" } else { "" };
+    format!("{marker} {:<18} {target}{builtin}", profile.name)
+}
+
+fn draw_profile_picker(frame: &mut Frame, area: Rect, picker: &crate::app::ProfilePicker) {
+    let width = area.width.saturating_sub(10).clamp(40, 90);
+    let height = (picker.profiles.len() as u16 + 4)
+        .min(area.height.saturating_sub(4))
+        .max(6);
+    let popup = Rect {
+        x: (area.width.saturating_sub(width)) / 2,
+        y: (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = picker
+        .profiles
+        .iter()
+        .map(|p| ListItem::new(profile_line(p, &picker.current)))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(picker.selected));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Switch profile — Enter to switch, Esc to cancel")
+                .style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
 }
 
 fn draw_session_picker(frame: &mut Frame, area: Rect, picker: &crate::app::SessionPicker) {
@@ -419,6 +470,28 @@ mod tests {
             app.toggle_thinking();
         }
         assert!(plain_text(&transcript_lines(&mut app)).contains("Ctrl+T to show"));
+    }
+
+    #[test]
+    fn profile_lines_show_what_switching_gives_and_mark_the_active_one() {
+        let grok = arbe_runtime::ProfileInfo {
+            name: "grok".into(),
+            provider: Some("openai_compatible".into()),
+            model: Some("grok-4.7".into()),
+            ..Default::default()
+        };
+        let general = arbe_runtime::ProfileInfo {
+            name: "general".into(),
+            builtin: true,
+            ..Default::default()
+        };
+        let line = profile_line(&grok, "grok");
+        assert!(line.starts_with('●') && line.contains("openai_compatible / grok-4.7"));
+        let line = profile_line(&general, "grok");
+        assert!(line.starts_with(' '));
+        assert!(
+            line.contains("keeps the current provider and model") && line.contains("(built-in)")
+        );
     }
 
     #[test]

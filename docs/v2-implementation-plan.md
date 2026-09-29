@@ -24,12 +24,13 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
 **Current focus:** release blockers that need the maintainer (see `docs/v2-status.md`): push + CI, OpenAI/Anthropic live runs, human TUI check, LICENSE, tag
-**Last updated:** 2026-09-29 · test count: 471 (+21 ignored live tests)
+**Last updated:** 2026-09-29 · test count: 476 (+21 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-29 — Switch profile (and model) during a session.** `Harness::profiles()` / `with_profile(name)` re-resolve the configuration for another profile from the same sources; a profile that sets its own provider/model overrides the provider-selecting env vars (`ARBE_PROVIDER`/`_MODEL`/`_BASE_URL`/`_API_KEY`). TUI: `Ctrl+P` / `/profile [name]` picker; switching reopens the same session under the new config (config errors fail before anything changes). **Fixed a latent bug** on the way: a resumed session kept sending its *original* model name to the *current* provider (`Settings.model` came from `meta.json`) — `mark_open` now records the current profile/provider/model. Verified live: one session continued grok-4.7 → llama3.2:3b (Ollama) → grok-4.7 with history intact. 471 → 476 tests.
 - **2026-09-29 — Release docs.** `v2-status.md`, README, CHANGELOG. What's left for v0.2.0 needs the maintainer: a push (CI on 3 OSes), OpenAI/Anthropic live runs, a human TUI check, LICENSE, tag.
 - **2026-09-29 — cargo-deny; rustls security update.** Supply-chain checks added; they caught RUSTSEC-2026-0285 in rustls (fixed). Manual live-test workflow added.
 - **2026-09-29 — P3.10 TUI thinking view + live tool arguments.** P3's tasks are complete; only the human terminal check remains.

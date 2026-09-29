@@ -42,6 +42,7 @@ use arbe_tools::ToolExecutor;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::config::ProfileInfo;
 use crate::{Agent, EventBus, RuntimeConfig};
 
 /// How many events a session buffers for a slow reader before the oldest
@@ -145,21 +146,16 @@ impl HarnessBuilder {
     }
 
     pub fn build(self) -> Result<Harness, ConfigError> {
-        let config = match self.config {
-            Some(config) => config,
+        let (config, source) = match self.config {
+            Some(config) => (config, None),
             None => {
-                let overrides = self.overrides;
-                let ignore_env = self.ignore_env;
-                let env = move |key: &str| {
-                    overrides.get(key).cloned().or_else(|| {
-                        if ignore_env {
-                            None
-                        } else {
-                            std::env::var(key).ok()
-                        }
-                    })
+                let source = ConfigSource {
+                    overrides: self.overrides,
+                    extra_files: self.extra_config_files,
+                    ignore_env: self.ignore_env,
                 };
-                RuntimeConfig::load_with(&env, &self.extra_config_files)?
+                let config = source.load(None)?;
+                (config, Some(Arc::new(source)))
             }
         };
         Ok(Harness {
@@ -169,7 +165,54 @@ impl HarnessBuilder {
                 .providers
                 .unwrap_or_else(ProviderRegistry::with_builtins),
             tools: self.tools,
+            source,
         })
+    }
+}
+
+/// Settings that choose the model service. A profile that sets its own
+/// provider or model is used as defined: these are then ignored, even if
+/// set in the environment or on the command line — picking that profile
+/// is the more specific choice.
+const PROVIDER_SETTINGS: [&str; 4] = [
+    "ARBE_PROVIDER",
+    "ARBE_MODEL",
+    "ARBE_BASE_URL",
+    "ARBE_API_KEY",
+];
+
+/// Where a harness's configuration came from, so it can be resolved again
+/// for another profile.
+struct ConfigSource {
+    overrides: HashMap<&'static str, String>,
+    extra_files: Vec<PathBuf>,
+    ignore_env: bool,
+}
+
+impl ConfigSource {
+    fn lookup(&self, key: &str) -> Option<String> {
+        self.overrides.get(key).cloned().or_else(|| {
+            if self.ignore_env {
+                None
+            } else {
+                std::env::var(key).ok()
+            }
+        })
+    }
+
+    /// The configuration, optionally for `profile` instead of the one the
+    /// settings select.
+    fn load(&self, profile: Option<&ProfileInfo>) -> Result<RuntimeConfig, ConfigError> {
+        let env = |key: &str| match profile {
+            Some(p) if key == "ARBE_PROFILE" => Some(p.name.clone()),
+            Some(p) if p.sets_provider() && PROVIDER_SETTINGS.contains(&key) => None,
+            _ => self.lookup(key),
+        };
+        RuntimeConfig::load_with(&env, &self.extra_files)
+    }
+
+    fn profiles(&self) -> Result<Vec<ProfileInfo>, ConfigError> {
+        RuntimeConfig::list_profiles_with(&|key: &str| self.lookup(key), &self.extra_files)
     }
 }
 
@@ -179,6 +222,9 @@ pub struct Harness {
     store: SessionStore,
     providers: ProviderRegistry,
     tools: Vec<(String, Arc<dyn ToolExecutor>)>,
+    /// `None` when built from an explicit [`RuntimeConfig`]: there's
+    /// nothing to re-resolve, so profiles can't be switched.
+    source: Option<Arc<ConfigSource>>,
 }
 
 impl Harness {
@@ -193,6 +239,45 @@ impl Harness {
 
     pub fn store(&self) -> &SessionStore {
         &self.store
+    }
+
+    /// Every profile this harness could switch to (see
+    /// [`with_profile`](Self::with_profile)), sorted by name.
+    pub fn profiles(&self) -> Result<Vec<ProfileInfo>, HarnessError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            HarnessError::Internal("this harness was built from a fixed configuration".into())
+        })?;
+        source
+            .profiles()
+            .map_err(|e| HarnessError::Internal(e.to_string()))
+    }
+
+    /// The same harness configured for another profile: same config files,
+    /// environment, registered providers and tools. If the profile sets its
+    /// own provider or model, that's what it gets, whatever the environment
+    /// or command line says; otherwise those still apply.
+    ///
+    /// To move a conversation, resume it on the returned harness: history
+    /// is provider-neutral, and the session records its new model.
+    pub fn with_profile(&self, name: &str) -> Result<Harness, HarnessError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            HarnessError::Internal("this harness was built from a fixed configuration".into())
+        })?;
+        let profiles = self.profiles()?;
+        let profile = profiles.iter().find(|p| p.name == name).ok_or_else(|| {
+            let known: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+            HarnessError::Internal(format!("no profile {name:?} (known: {})", known.join(", ")))
+        })?;
+        let config = source
+            .load(Some(profile))
+            .map_err(|e| HarnessError::Internal(e.to_string()))?;
+        Ok(Harness {
+            store: SessionStore::with_root(config.home.join("sessions")),
+            config,
+            providers: self.providers.clone(),
+            tools: self.tools.clone(),
+            source: self.source.clone(),
+        })
     }
 
     /// Starts a new session.
@@ -469,5 +554,89 @@ mod tests {
         session.close().unwrap();
         let resumed = harness.resume_session(session.id()).unwrap();
         assert_eq!(resumed.send("again").finish().await.unwrap(), "echo: again");
+    }
+
+    fn write_global_config(home: &std::path::Path, toml: &str) {
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::write(home.join("config").join("config.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn profiles_list_the_built_ins_and_the_configured_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_global_config(
+            home.path(),
+            "[profiles.fast]\nprovider = { name = \"echo\", model = \"small\" }\n\n[profiles.careful]\nprompt = \"general\"\n",
+        );
+        let profiles = harness(home.path(), project.path()).profiles().unwrap();
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["careful", "coding", "fast", "general"]);
+        let fast = profiles.iter().find(|p| p.name == "fast").unwrap();
+        assert_eq!(
+            (fast.provider.as_deref(), fast.model.as_deref()),
+            (Some("echo"), Some("small"))
+        );
+        assert!(fast.sets_provider() && !fast.builtin);
+        let careful = profiles.iter().find(|p| p.name == "careful").unwrap();
+        assert!(!careful.sets_provider());
+        assert!(
+            profiles
+                .iter()
+                .find(|p| p.name == "coding")
+                .unwrap()
+                .builtin
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_profile_moves_the_conversation_to_its_model() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_global_config(
+            home.path(),
+            "[profiles.big]\nprovider = { name = \"echo\", model = \"big-model\" }\n\n[profiles.plain]\nprompt = \"general\"\n",
+        );
+        // The builder's provider/model stand in for ARBE_PROVIDER/ARBE_MODEL.
+        let harness = harness(home.path(), project.path());
+        assert_eq!(harness.config().model, "any");
+        let session = harness.new_session().unwrap();
+        session.send("first").finish().await.unwrap();
+        session.close().unwrap();
+
+        // A profile with its own model wins over the environment's.
+        let big = harness.with_profile("big").unwrap();
+        assert_eq!(
+            (big.config().profile.as_str(), big.config().model.as_str()),
+            ("big", "big-model")
+        );
+        let moved = big.resume_session(session.id()).unwrap();
+        assert_eq!(moved.agent().model(), "big-model");
+        assert_eq!(moved.send("second").finish().await.unwrap(), "echo: second");
+        let meta = big.store().load_meta(session.id()).unwrap();
+        assert_eq!(
+            (meta.profile.as_str(), meta.model.as_str()),
+            ("big", "big-model")
+        );
+        assert_eq!(big.store().list_turns(session.id()).unwrap().len(), 2);
+
+        // One without keeps the environment's provider and model.
+        let plain = big.with_profile("plain").unwrap();
+        assert_eq!(plain.config().model, "any");
+        assert_eq!(plain.config().provider_name, "echo");
+
+        let err = harness.with_profile("nope").err().unwrap().to_string();
+        assert!(err.contains("known: big, coding, general, plain"), "{err}");
+    }
+
+    #[test]
+    fn a_harness_built_from_a_fixed_config_cannot_switch() {
+        let project = tempfile::tempdir().unwrap();
+        let harness = Harness::builder()
+            .config(RuntimeConfig::defaults(project.path().to_path_buf()))
+            .build()
+            .unwrap();
+        assert!(harness.profiles().is_err());
+        assert!(harness.with_profile("general").is_err());
     }
 }

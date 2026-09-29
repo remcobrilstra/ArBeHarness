@@ -186,15 +186,49 @@ impl RuntimeConfig {
         env: &dyn Fn(&str) -> Option<String>,
         extra_files: &[PathBuf],
     ) -> Result<Self, ConfigError> {
-        let project_dir = project_dir_from(env);
-        let home = env("ARBE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(arbe_storage::paths::arbe_home);
-        let global: Vec<PathBuf> = std::iter::once(home.join("config").join("config.toml"))
-            .chain(extra_files.iter().cloned())
-            .collect();
-        let project = [project_dir.join(".arbe").join("config.toml")];
+        let (global, project, project_dir) = source_files(env, extra_files);
         Self::load_from_sources(&global, &project, env, project_dir)
+    }
+
+    /// Every profile that can be selected with the same sources as
+    /// [`load_with`](Self::load_with): the built-in `coding` and `general`
+    /// plus each `[profiles.<name>]` in the config files, sorted by name,
+    /// with the provider settings each one sets itself (later files win).
+    pub fn list_profiles_with(
+        env: &dyn Fn(&str) -> Option<String>,
+        extra_files: &[PathBuf],
+    ) -> Result<Vec<ProfileInfo>, ConfigError> {
+        let (global, project, _) = source_files(env, extra_files);
+        let mut profiles: BTreeMap<String, ProfileInfo> = ["coding", "general"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    ProfileInfo {
+                        name: name.to_string(),
+                        builtin: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for path in global.iter().chain(project.iter()) {
+            let Some((_, layer)) = read_layer(path)? else {
+                continue;
+            };
+            for (name, profile) in &layer.profiles {
+                let info = profiles.entry(name.clone()).or_insert_with(|| ProfileInfo {
+                    name: name.clone(),
+                    ..Default::default()
+                });
+                if let Some(p) = &profile.provider {
+                    set(&mut info.provider, p.name.clone());
+                    set(&mut info.model, p.model.clone());
+                    set(&mut info.base_url, p.base_url.clone());
+                }
+            }
+        }
+        Ok(profiles.into_values().collect())
     }
 
     /// Defaults + environment only, no files. For tests and embedders
@@ -632,6 +666,44 @@ fn canonical(path: &Path) -> PathBuf {
             }
             _ => return path.to_path_buf(),
         }
+    }
+}
+
+/// The config files [`RuntimeConfig::load_with`] reads, and the project
+/// directory: `(global + extra files, project file, project dir)`.
+fn source_files(
+    env: &dyn Fn(&str) -> Option<String>,
+    extra_files: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf) {
+    let project_dir = project_dir_from(env);
+    let home = env("ARBE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(arbe_storage::paths::arbe_home);
+    let global = std::iter::once(home.join("config").join("config.toml"))
+        .chain(extra_files.iter().cloned())
+        .collect();
+    let project = vec![project_dir.join(".arbe").join("config.toml")];
+    (global, project, project_dir)
+}
+
+/// A selectable profile, as [`RuntimeConfig::list_profiles_with`] finds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub name: String,
+    /// `coding` or `general` (they exist without any config file).
+    pub builtin: bool,
+    /// Provider settings the profile sets itself; `None` means it uses
+    /// whatever the rest of the configuration (or the environment) says.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+}
+
+impl ProfileInfo {
+    /// Whether the profile chooses its own model service, rather than
+    /// inheriting one.
+    pub fn sets_provider(&self) -> bool {
+        self.provider.is_some() || self.model.is_some() || self.base_url.is_some()
     }
 }
 

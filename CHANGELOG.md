@@ -53,9 +53,11 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - `--resume <id>`, `--prompt`, `--name`, `--profile`, `--provider`, `--model`, `--config`, `--version`, `--help`; unknown options are errors.
 - A library API: `arbe_runtime::Harness::builder()` → `Session::send` → a stream of events and the answer.
 - `meta.json` records each session's `workdir`, git `branch`, live `activity` and `pid`, so other programs can track sessions.
+- Resuming a session runs it on the current profile's provider and model (previously the saved model name was sent to the current provider).
 
 ### Terminal UI
 
+- Switch the session to another profile — and so another provider/model — with `Ctrl+P` or `/profile [name]`; the conversation carries over.
 - The model's reasoning in a collapsible `[thinking]` entry (`Ctrl+T`); live preview of tool arguments while they stream; subagent activity nested under its `task` call.
 
 ### Development

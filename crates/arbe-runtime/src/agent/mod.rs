@@ -152,9 +152,15 @@ struct Parts {
     decisions: Arc<ToolDecisions>,
 }
 
-/// Records in `meta.json` where the session works and that this process
-/// has it open (idle), so other programs can find and track it.
+/// Records in `meta.json` where the session works, which profile, provider
+/// and model it now runs on (a resumed session takes the current
+/// configuration's — that's how a conversation moves to another model),
+/// and that this process has it open (idle), so other programs can find
+/// and track it.
 fn mark_open(meta: &mut SessionMeta, config: &RuntimeConfig, store: &SessionStore) {
+    meta.profile = config.profile.clone();
+    meta.provider = config.provider_name.clone();
+    meta.model = config.model.clone();
     let workdir =
         std::path::absolute(&config.project_dir).unwrap_or_else(|_| config.project_dir.clone());
     meta.branch = crate::git::current_branch(&workdir);

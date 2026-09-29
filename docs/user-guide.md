@@ -316,7 +316,7 @@ Two profiles are built in:
 | Profile | Tools | System prompt |
 |---|---|---|
 | `coding` (default) | all builtin tools | A software-engineering agent working in the workdir. |
-| `general` | only `todo_write` (no file access, no shell) | A general-purpose assistant. |
+| `general` | only `todo_write` and `remember` (no file access, no shell) | A general-purpose assistant. |
 
 Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine `coding` or `general` this way.
 
@@ -333,6 +333,28 @@ allow = ["read_file", "list_dir", "glob", "grep"]
 **Custom prompt templates** are Markdown files. Put `{global_instructions}` and `{project_instructions}` where your [instruction files](#instructions-and-skills) should be inserted; either can be left out. The file is re-read before every message. If it can't be read, the `coding` template is used instead.
 
 An unknown profile name stops the app at startup with a list of the known ones.
+
+### Switching models with profiles
+
+A profile can also pick the model: give it a `provider` table. With one profile per model you use, you can switch between them **during a session** — the conversation carries over, tool calls and all, even between providers:
+
+```toml
+# ~/.arbe/config/config.toml
+[profiles.grok]
+provider = { name = "openai_compatible", base_url = "https://api.x.ai/v1", model = "grok-4.7", api_key_env = "XAI_API_KEY" }
+
+[profiles.claude]
+provider = { name = "anthropic", model = "claude-sonnet-5" }
+
+[profiles.local]
+provider = { name = "ollama", model = "qwen2.5-coder:3b" }
+```
+
+- **In the chat screen:** `Ctrl+P` (or `/profile`) lists every profile, with the provider and model each one uses; pick one with `Enter`. `/profile grok` switches directly. The header and the session's `meta.json` show the new profile, provider and model. You can't switch while a turn is running (`Esc` first).
+- **At startup:** `--profile grok`, including with `--resume <id>` to continue an earlier conversation on another model.
+- **Environment variables and profiles:** normally `ARBE_PROVIDER`, `ARBE_MODEL`, `ARBE_BASE_URL` and `ARBE_API_KEY` override profiles. When you *switch* to a profile that sets its own provider or model, those four are ignored for it, since picking that profile is the more specific choice. So give such profiles their key with `api_key_env` rather than relying on `ARBE_API_KEY`. A profile without a `provider` table (like the built-in `coding` and `general`) keeps whatever provider and model were in effect.
+- **What carries over:** the whole history. One exception: Anthropic's signed thinking blocks can't be sent to another provider, so they're left out after a switch away from Anthropic.
+- If a profile's settings are broken (for example its `api_key_env` variable isn't set), the switch fails with an error and the session stays on the current model.
 
 ---
 
@@ -452,6 +474,7 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 | `Ctrl+L` | Clear the transcript view (nothing is deleted from disk) |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+R` | Open the session picker to resume an earlier session |
+| `Ctrl+P` | Open the profile picker to [switch this session to another profile](#switching-models-with-profiles) (and so, usually, another model) |
 | `Esc` | While a reply is in progress: cancel the turn |
 | `Ctrl+C` | Quit. A turn in progress is cancelled and saved first (if saving takes more than about 2 seconds, it's recovered the next time you resume the session) |
 
@@ -487,6 +510,8 @@ Anything you type is sent to the model, except lines starting with a recognized 
 
 | Command | Description |
 |---|---|
+| `/profile` | Open the profile picker (same as `Ctrl+P`). |
+| `/profile <name>` | Switch this session to profile `<name>` — see [Switching models with profiles](#switching-models-with-profiles). |
 | `/compact` | Have the model summarize everything but your latest exchange now, to free up context. Works with either memory strategy. |
 | `/tool <name> <json-args>` | Run one of the [builtin tools](#builtin-tools) yourself. It goes through exactly the same path as a call from the model: the same approval dialog, the same output limit, the same transcript lines. Handy for checking that a tool works. Invalid JSON is treated as `{}`. Not available while a turn is running. |
 

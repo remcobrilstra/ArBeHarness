@@ -29,7 +29,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::runtime::Handle;
 
-use app::{APPROVAL_TIMEOUT_TICKS, App, PendingApproval, ProposedToolCall, SessionPicker};
+use app::{
+    APPROVAL_TIMEOUT_TICKS, App, PendingApproval, ProfilePicker, ProposedToolCall, SessionPicker,
+};
 
 /// Result of a spawned agent call, delivered back to the render loop so it
 /// never has to block on the async work itself. Tool results and turn
@@ -51,7 +53,7 @@ enum AgentOutcome {
 /// sessions and resumes old ones on that same bus (TUI-FR-3).
 /// `initial_prompt`, if any, is sent as the first message.
 pub fn run(
-    harness: Harness,
+    mut harness: Harness,
     agent: Agent,
     handle: Handle,
     events: Arc<EventBus>,
@@ -88,7 +90,7 @@ pub fn run(
         &mut app,
         &mut agent,
         &handle,
-        &harness,
+        &mut harness,
         &events,
         &mut events_rx,
         &outcome_tx,
@@ -127,7 +129,7 @@ fn event_loop(
     app: &mut App,
     agent: &mut Arc<Agent>,
     handle: &Handle,
-    harness: &Harness,
+    harness: &mut Harness,
     events: &Arc<EventBus>,
     events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
     outcome_tx: &Sender<AgentOutcome>,
@@ -509,7 +511,7 @@ fn handle_key(
     app: &mut App,
     agent: &mut Arc<Agent>,
     handle: &Handle,
-    harness: &Harness,
+    harness: &mut Harness,
     events: &Arc<EventBus>,
     outcome_tx: &Sender<AgentOutcome>,
 ) {
@@ -530,6 +532,33 @@ fn handle_key(
         if let Some(decision) = decision {
             app.pending_approval = None;
             resolve_approval(app, agent, approval.id, decision);
+        }
+        return;
+    }
+
+    if app.profile_picker.is_some() {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = app.profile_picker.as_mut() {
+                    picker.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(picker) = app.profile_picker.as_mut() {
+                    picker.move_down();
+                }
+            }
+            KeyCode::Esc => app.profile_picker = None,
+            KeyCode::Enter => {
+                let selected = app
+                    .profile_picker
+                    .take()
+                    .and_then(|p| p.selected_name().map(str::to_string));
+                if let Some(name) = selected {
+                    switch_profile(app, agent, harness, events, &name);
+                }
+            }
+            _ => {}
         }
         return;
     }
@@ -578,6 +607,7 @@ fn handle_key(
         }
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, harness, events),
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app, harness),
+        (KeyModifiers::CONTROL, KeyCode::Char('p')) => open_profile_picker(app, agent, harness),
         (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
             app.scroll_up((app.last_viewport_height / 2).max(1))
         }
@@ -590,6 +620,14 @@ fn handle_key(
         (_, KeyCode::Down) => app.scroll_down(1),
         (KeyModifiers::ALT, KeyCode::Enter) | (KeyModifiers::SHIFT, KeyCode::Enter) => {
             app.input_insert_newline()
+        }
+        (_, KeyCode::Enter) if app.input.trim_start().starts_with("/profile") => {
+            let command = app.take_input();
+            match command.trim().strip_prefix("/profile").map(str::trim) {
+                Some("") => open_profile_picker(app, agent, harness),
+                Some(name) => switch_profile(app, agent, harness, events, name),
+                None => {}
+            }
         }
         (_, KeyCode::Enter) => submit_input(app, agent, handle, outcome_tx),
         (_, KeyCode::Backspace) => app.input_backspace(),
@@ -648,6 +686,72 @@ fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events:
             app.notice = Some("started a new session".to_string());
         }
         Err(err) => app.status_message = Some(format!("failed to start new session: {err}")),
+    }
+}
+
+/// Opens the profile picker (Ctrl+P, `/profile`). Not while a turn runs:
+/// switching reopens the session on another model.
+fn open_profile_picker(app: &mut App, agent: &Arc<Agent>, harness: &Harness) {
+    if agent.is_busy() {
+        app.notice =
+            Some("a turn is in progress — wait for it, or press Esc to cancel".to_string());
+        return;
+    }
+    match harness.profiles() {
+        Ok(profiles) => {
+            app.profile_picker = Some(ProfilePicker::new(profiles, &harness.config().profile))
+        }
+        Err(err) => app.status_message = Some(format!("can't list profiles: {err}")),
+    }
+}
+
+/// Moves the current conversation to profile `name`: resolves that
+/// profile's configuration (a broken one fails here, changing nothing),
+/// then reopens the same session under it. History is provider-neutral,
+/// so the conversation carries over; the transcript stays as it is.
+fn switch_profile(
+    app: &mut App,
+    agent: &mut Arc<Agent>,
+    harness: &mut Harness,
+    events: &Arc<EventBus>,
+    name: &str,
+) {
+    if agent.is_busy() {
+        app.notice =
+            Some("a turn is in progress — wait for it, or press Esc to cancel".to_string());
+        return;
+    }
+    let switched = match harness.with_profile(name) {
+        Ok(switched) => switched,
+        Err(err) => {
+            app.status_message = Some(format!("can't switch to profile {name}: {err}"));
+            return;
+        }
+    };
+    let session_id = agent.session_id();
+    // Close first: the reopened session must end up marked open.
+    let _ = agent.close();
+    match switched.resume_agent(session_id, events.clone()) {
+        Ok(new_agent) => {
+            app.profile = new_agent.profile().to_string();
+            app.provider_name = new_agent.provider_name().to_string();
+            app.model = new_agent.model().to_string();
+            app.status_message = None;
+            show_startup_warnings(app, &new_agent);
+            app.notice = Some(format!(
+                "switched to profile {} ({} / {})",
+                app.profile, app.provider_name, app.model
+            ));
+            *agent = Arc::new(new_agent);
+            *harness = switched;
+        }
+        Err(err) => {
+            app.status_message = Some(format!("can't switch to profile {name}: {err}"));
+            // Reopen it as it was.
+            if let Ok(previous) = harness.resume_agent(session_id, events.clone()) {
+                *agent = Arc::new(previous);
+            }
+        }
     }
 }
 

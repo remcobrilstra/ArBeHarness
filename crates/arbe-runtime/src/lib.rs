@@ -11,7 +11,7 @@ pub mod redact;
 pub mod system_prompt;
 
 pub use agent::Agent;
-pub use config::{HookCommand, PromptTemplate, RuntimeConfig, SkillsMode};
+pub use config::{HookCommand, ProfileInfo, PromptTemplate, RuntimeConfig, SkillsMode};
 pub use event_bus::EventBus;
 pub use harness::{Harness, HarnessBuilder, Session};
 
