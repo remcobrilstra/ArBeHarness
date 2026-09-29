@@ -267,6 +267,7 @@ fn redactor_for(config: &RuntimeConfig) -> Redactor {
             explicit.extend(bearer_token.clone());
         }
     }
+    explicit.extend(config.web_search.as_ref().and_then(|s| s.api_key.clone()));
     Redactor::from_process_env(explicit)
 }
 
@@ -384,6 +385,12 @@ impl Agent {
                 config.project_dir.clone(),
             )),
         );
+        if let Some(search) = &config.web_search {
+            registry.register(
+                "web_search",
+                Arc::new(arbe_tools::builtin::web::WebSearchTool::new(search.clone())),
+            );
+        }
         registry.register(
             ask::ASK_USER_TOOL,
             Arc::new(ask::AskUserTool::new(

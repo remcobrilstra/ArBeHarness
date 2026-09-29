@@ -219,6 +219,7 @@ A project's `.arbe/config.toml` arrives with whatever repository you open, so by
 - `provider.base_url`, `provider.api_key_env`, `provider.api_key_command`, `provider.headers` (where requests, and your key, are sent, and programs that fetch it)
 - everything under `[approval]`
 - `[mcp.servers.*]` and `[[hooks.commands]]` (programs the harness would start)
+- `[web]` (where search queries and a search API key would go)
 - the same keys inside `[profiles.*]`
 
 An `[error]` line when the session starts lists what was ignored. Everything else in a project config (model, limits, `tools`, `prompt`, skills mode, …) still applies.
@@ -303,6 +304,7 @@ context_window = 32768
 | `skills.mode` | `on_demand` | `on_demand` or `always`. See [Skills](#skills). |
 | `subagents.max_depth` | `1` | How deeply [subagents](#subagents) may nest: `1` lets the agent start subagents that can't start their own, `2` lets those start one more level, `0` removes the `task` tool. |
 | `subagents.max_concurrent` | `4` | Subagents running at once, across the whole session (at least 1). |
+| `[web.search]` | none | The service behind the `web_search` tool: `backend` (`brave`, `tavily` or `searxng`), `api_key_env` (the variable holding its key; required for Brave and Tavily), `base_url` (required for SearXNG). See [Web tools](#web-tools). |
 | `hooks.timeout_ms` | `500` | Default time limit for hooks that don't set their own. |
 | `[[hooks.commands]]` | none | Shell commands run at points in a turn. See [Hooks](#hooks). |
 | `[mcp.servers.<name>]` | none | An [MCP server](#mcp-servers) to connect. |
@@ -319,7 +321,7 @@ Two profiles are built in:
 | Profile | Tools | System prompt |
 |---|---|---|
 | `coding` (default) | all builtin tools | A software-engineering agent working in the workdir. |
-| `general` | only `todo_write`, `remember` and `ask_user` (no file access, no shell) | A general-purpose assistant. |
+| `general` | only `todo_write`, `remember`, `ask_user`, `web_fetch` and `web_search` (no file access, no shell) | A general-purpose assistant. |
 
 Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine `coding` or `general` this way.
 
@@ -559,6 +561,8 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `load_skill` | `name` | low | Reads a skill's full instructions (only present when [skills](#skills) load on demand). |
 | `task` | `description` (short label), `prompt`, optional `tools` (list) | low | Hands a self-contained job to a [subagent](#subagents) and returns its final answer. Not in the `general` profile. |
 | `ask_user` | `question`, optional `options` (up to 8), optional `allow_free_text` (default true) | low | Asks you a question and waits for the answer — for decisions only you can make. Never needs approval (it acts on nothing). See [Questions from the agent](#questions-from-the-agent). |
+| `web_fetch` | `url` (http/https), optional `max_chars` (default 20,000, max 100,000) | medium | Fetches a page and returns its text: HTML converted to readable text (with the page title), JSON and plain text as they are. Binary files are refused. Reads at most 3 MB. |
+| `web_search` | `query`, optional `count` (default 5, max 10) | medium | Searches the web and returns titles, URLs and snippets. Only present when [a search service is configured](#web-tools). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
 | `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
@@ -569,6 +573,22 @@ Every session gets these tools. When the model supports tool calling, it decides
 **Sandboxing.** Every file tool resolves its path inside the workdir and refuses anything outside it, including through `..`. `glob` and `grep` skip `.git`, `target`, `node_modules`, and `.venv`. `execute` is **not** sandboxed: a shell command can do anything your user account can. That is why it is marked high-risk and always asks you first.
 
 If a tool fails (bad arguments, file not found, unknown tool) or you deny it, that result goes back to the model so it can adjust or explain. The turn itself does not fail.
+
+### Web tools
+
+`web_fetch` works out of the box. `web_search` needs a search service; configure one in your **global** config (a project config can't, unless [trusted](#trusted-projects), since your queries and key go to that service):
+
+```toml
+[web.search]
+backend = "brave"               # or "tavily"
+api_key_env = "BRAVE_API_KEY"   # the key stays in the environment
+
+# or a SearXNG instance (with its JSON format enabled), no key needed:
+# backend = "searxng"
+# base_url = "https://searx.example.org"
+```
+
+Both tools send something off your machine (a URL, a query), so they're medium risk and ask for approval by default. Rules can allow them per site or topic, e.g. `allow = ["web_fetch(https://docs.rs/*)"]`. The search key is redacted from tool output like other secrets.
 
 ### Background processes
 

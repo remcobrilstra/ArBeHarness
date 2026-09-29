@@ -47,6 +47,7 @@ regex = "1"
 tempfile = "3"
 wiremock = "0.6"
 base64 = "0.22"
+html2text = "0.17"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
 
 [package]

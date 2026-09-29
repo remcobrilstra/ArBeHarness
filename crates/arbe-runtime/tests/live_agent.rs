@@ -714,3 +714,15 @@ async fn runs_a_server_in_the_background_and_stops_it() {
     // The port is free again.
     assert!(std::net::TcpListener::bind("127.0.0.1:8765").is_ok());
 }
+
+#[tokio::test]
+#[ignore = "needs a live model and internet access"]
+async fn reads_a_web_page() {
+    let bench = Bench::new(target_or_skip!(), "general");
+    let run = bench.start(Approve::All);
+    let (answer, trace) = run
+        .ask("Fetch https://example.com with web_fetch and tell me the page's main heading, exactly.")
+        .await;
+    assert!(trace.used("web_fetch"), "{trace:?}");
+    assert!(answer.contains("Example Domain"), "{answer}");
+}

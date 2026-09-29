@@ -26,6 +26,7 @@ pub struct Layer {
     pub mcp: Option<McpSection>,
     pub skills: Option<SkillsSection>,
     pub subagents: Option<SubagentsSection>,
+    pub web: Option<WebSection>,
     /// Tools the model may use, by name (a trailing `*` matches a prefix,
     /// e.g. `"github__*"`). Absent = every registered tool.
     pub tools: Option<Vec<String>>,
@@ -72,6 +73,10 @@ impl Layer {
         }
         if self.mcp.take().is_some() {
             removed.push("mcp servers");
+        }
+        // Where search queries (and a key) go.
+        if self.web.take().is_some() {
+            removed.push("web");
         }
         if let Some(hooks) = &mut self.hooks
             && hooks.commands.take().is_some()
@@ -142,6 +147,25 @@ pub struct ApprovalSection {
 pub struct SkillsSection {
     /// `"on_demand"` (default) or `"always"`.
     pub mode: Option<String>,
+}
+
+/// `[web]`: web tools.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSection {
+    pub search: Option<WebSearchSection>,
+}
+
+/// `[web.search]`: the service behind `web_search`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchSection {
+    /// `brave`, `tavily` or `searxng`.
+    pub backend: Option<String>,
+    /// Environment variable holding the service's API key.
+    pub api_key_env: Option<String>,
+    /// The service's address (required for `searxng`).
+    pub base_url: Option<String>,
 }
 
 /// `[subagents]`: the `task` tool.

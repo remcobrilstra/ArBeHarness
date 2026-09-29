@@ -94,6 +94,8 @@ pub struct RuntimeConfig {
     pub subagent_max_depth: u32,
     /// Subagents running at once across a session's whole tree.
     pub subagent_max_concurrent: usize,
+    /// The `web_search` service, if one is configured (`[web.search]`).
+    pub web_search: Option<arbe_tools::builtin::web::SearchSettings>,
     /// MCP servers to connect for each session (enabled ones only).
     pub mcp_servers: Vec<arbe_mcp::McpServerConfig>,
     /// Which system prompt template to render each turn.
@@ -118,7 +120,13 @@ const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
 
 /// Tools the built-in `general` profile allows: nothing that touches the
 /// file system or runs commands.
-const GENERAL_PROFILE_TOOLS: &[&str] = &["todo_write", "remember", "ask_user"];
+const GENERAL_PROFILE_TOOLS: &[&str] = &[
+    "todo_write",
+    "remember",
+    "ask_user",
+    "web_fetch",
+    "web_search",
+];
 
 /// Settings that are only decided once every layer has been applied,
 /// because their defaults depend on other settings (e.g. the provider).
@@ -130,6 +138,8 @@ struct Pending {
     api_key_command: Option<String>,
     /// Merged by name across layers; resolved once env is known.
     mcp_servers: BTreeMap<String, arbe_mcp::McpServerSettings>,
+    /// `[web.search]`, merged across layers; resolved once env is known.
+    web_search: file::WebSearchSection,
 }
 
 impl RuntimeConfig {
@@ -164,6 +174,7 @@ impl RuntimeConfig {
             skills_mode: SkillsMode::OnDemand,
             subagent_max_depth: 1,
             subagent_max_concurrent: 4,
+            web_search: None,
             prompt: PromptTemplate::Coding,
             project_dir,
             home: arbe_storage::paths::arbe_home(),
@@ -437,6 +448,14 @@ impl RuntimeConfig {
                 });
             }
         }
+        if let Some(search) = layer.web.as_ref().and_then(|w| w.search.as_ref()) {
+            set(&mut pending.web_search.backend, search.backend.clone());
+            set(
+                &mut pending.web_search.api_key_env,
+                search.api_key_env.clone(),
+            );
+            set(&mut pending.web_search.base_url, search.base_url.clone());
+        }
         if let Some(subagents) = &layer.subagents {
             if let Some(depth) = subagents.max_depth {
                 self.subagent_max_depth = depth;
@@ -556,6 +575,7 @@ impl RuntimeConfig {
         if let Some(home) = env("ARBE_HOME") {
             self.home = PathBuf::from(home);
         }
+        self.web_search = resolve_web_search(&pending.web_search, env)?;
         self.mcp_servers = pending
             .mcp_servers
             .iter()
@@ -670,6 +690,38 @@ fn canonical(path: &Path) -> PathBuf {
             _ => return path.to_path_buf(),
         }
     }
+}
+
+/// The `web_search` settings from `[web.search]`, with the key looked up.
+/// No backend means no `web_search` tool.
+fn resolve_web_search(
+    section: &file::WebSearchSection,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<arbe_tools::builtin::web::SearchSettings>, ConfigError> {
+    use arbe_tools::builtin::web::{SearchBackend, SearchSettings};
+    let Some(name) = &section.backend else {
+        return Ok(None);
+    };
+    let backend = SearchBackend::parse(name).ok_or_else(|| {
+        ConfigError::InvalidSchema(format!(
+            "web.search.backend {name:?} is not one of: brave, tavily, searxng"
+        ))
+    })?;
+    if backend == SearchBackend::Searxng && section.base_url.is_none() {
+        return Err(ConfigError::InvalidSchema(
+            "web.search.backend = \"searxng\" needs base_url".into(),
+        ));
+    }
+    if backend != SearchBackend::Searxng && section.api_key_env.is_none() {
+        return Err(ConfigError::InvalidSchema(format!(
+            "web.search.backend = {name:?} needs api_key_env (the variable holding its API key)"
+        )));
+    }
+    Ok(Some(SearchSettings {
+        backend,
+        api_key: section.api_key_env.as_deref().and_then(env),
+        base_url: section.base_url.clone(),
+    }))
 }
 
 /// The config files [`RuntimeConfig::load_with`] reads, and the project
@@ -970,11 +1022,17 @@ mod tests {
         assert_eq!(c.profile, "general");
         assert_eq!(
             c.tools,
-            Some(vec![
-                "todo_write".to_string(),
-                "remember".to_string(),
-                "ask_user".to_string()
-            ])
+            Some(
+                [
+                    "todo_write",
+                    "remember",
+                    "ask_user",
+                    "web_fetch",
+                    "web_search"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
         );
         assert_eq!(c.prompt, PromptTemplate::General);
         assert_eq!(c.model, "llama3.2:3b");
@@ -1111,6 +1169,29 @@ mod tests {
         assert!(tool_allowed(&allowed, "github__search"));
         assert!(!tool_allowed(&allowed, "read_files"));
         assert!(!tool_allowed(&allowed, "gitlab__search"));
+    }
+
+    #[test]
+    fn web_search_is_configured_with_its_key_from_the_environment() {
+        use arbe_tools::builtin::web::SearchBackend;
+        let dir = temp_dir();
+        assert!(load(&[], &no_env).unwrap().web_search.is_none());
+        let brave = write(
+            &dir,
+            "brave.toml",
+            "[web.search]\nbackend = \"brave\"\napi_key_env = \"MY_BRAVE\"\n",
+        );
+        let c = load(&[brave], &env_of(&[("MY_BRAVE", "k")])).unwrap();
+        let search = c.web_search.unwrap();
+        assert_eq!(search.backend, SearchBackend::Brave);
+        assert_eq!(search.api_key.as_deref(), Some("k"));
+        for (name, bad) in [
+            ("a.toml", "[web.search]\nbackend = \"bing\"\n"),
+            ("b.toml", "[web.search]\nbackend = \"searxng\"\n"),
+            ("c.toml", "[web.search]\nbackend = \"tavily\"\n"),
+        ] {
+            assert!(load(&[write(&dir, name, bad)], &no_env).is_err(), "{bad}");
+        }
     }
 
     #[test]

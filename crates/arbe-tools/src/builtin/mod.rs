@@ -18,6 +18,7 @@ pub mod path_guard;
 pub mod processes;
 pub mod read_file;
 pub mod todo_write;
+pub mod web;
 pub mod write_file;
 
 use std::path::Path;
@@ -40,6 +41,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "process_output",
     "process_kill",
     "todo_write",
+    "web_fetch",
 ];
 
 /// Registers every builtin tool, sandboxed to `root` (the agent's project
@@ -88,6 +90,7 @@ pub fn register_all(registry: &mut ToolRegistry, root: &Path) {
         Arc::new(processes::ProcessKillTool::new(processes)),
     );
     registry.register("todo_write", Arc::new(todo_write::TodoWriteTool::new()));
+    registry.register("web_fetch", Arc::new(web::WebFetchTool::new()));
 }
 
 #[cfg(test)]
