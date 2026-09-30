@@ -146,29 +146,25 @@ pub async fn infer(
     Ok(acc.finish().into())
 }
 
-/// Builds one of the builtin providers by id with just a key and base URL
-/// — shorthand for [`ProviderRegistry::with_builtins`] + `build`. Keeps
-/// swapping providers a config change, not a code change (overall design
-/// §7). Keys must come from env/config indirection, never a literal (NFR-4).
-pub fn build_provider(
-    provider_name: &str,
-    api_key: Option<String>,
-    base_url: Option<String>,
-) -> Result<Box<dyn ModelProvider>, ProviderError> {
-    ProviderRegistry::with_builtins().build(
-        provider_name,
-        ProviderSettings {
-            api_key,
-            base_url,
-            ..Default::default()
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arbe_core::{ContentBlock, Role};
+
+    fn build_provider(
+        provider_name: &str,
+        api_key: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<Box<dyn ModelProvider>, ProviderError> {
+        ProviderRegistry::with_builtins().build(
+            provider_name,
+            ProviderSettings {
+                api_key,
+                base_url,
+                ..Default::default()
+            },
+        )
+    }
 
     #[test]
     fn builds_openai_provider_with_api_key() {

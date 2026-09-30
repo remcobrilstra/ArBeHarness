@@ -67,8 +67,8 @@ impl HookPhase {
 #[async_trait]
 pub trait Hook: Send + Sync {
     fn phase(&self) -> HookPhase;
-    /// Read-only hooks return the payload unchanged; transforming hooks
-    /// must be explicitly permitted by policy (overall design §4.5).
+    /// Returns the payload, changed or not. What a change means depends on
+    /// the phase (see the runtime's hook payloads).
     async fn run(&self, payload: Value) -> Result<Value, HookError>;
 
     /// A name for failure reports.
@@ -79,6 +79,12 @@ pub trait Hook: Send + Sync {
     /// This hook's own time limit; `None` uses the registry's default.
     fn timeout(&self) -> Option<Duration> {
         None
+    }
+
+    /// Whether this hook's failure should block what it guards rather than
+    /// be skipped (see [`HookFailure::blocking`]).
+    fn blocks_on_failure(&self) -> bool {
+        false
     }
 }
 

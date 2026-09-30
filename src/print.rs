@@ -23,6 +23,11 @@ const EXIT_INCOMPLETE: i32 = 3;
 const EXIT_INTERRUPTED: i32 = 130;
 
 pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
+    run_with(harness, cli, prompt, &mut std::io::stdout().lock()).await
+}
+
+/// [`run`], writing what goes to stdout to `stdout`.
+async fn run_with(harness: &Harness, cli: &Cli, prompt: String, stdout: &mut impl Write) -> i32 {
     let session = match cli.resume {
         Some(id) => harness.resume_session(id),
         None => harness.new_session(),
@@ -53,7 +58,6 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
     // Each proposed call's risk, for deciding its approval request.
     let mut risks: HashMap<ToolCallId, RiskLevel> = HashMap::new();
     let mut interrupted = false;
-    let mut stdout = std::io::stdout().lock();
     loop {
         let event = tokio::select! {
             event = turn.next_event() => event,
@@ -162,4 +166,77 @@ pub async fn run(harness: &Harness, cli: &Cli, prompt: String) -> i32 {
         eprintln!("warning: failed to close the session: {err}");
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::scripted_harness;
+
+    fn cli(args: &[&str]) -> Cli {
+        crate::cli::parse(args.iter().map(|a| a.to_string())).unwrap()
+    }
+
+    async fn print(args: &[&str]) -> (i32, String) {
+        let (harness, _home, _project) = scripted_harness();
+        let cli = cli(args);
+        let crate::cli::Mode::Print { prompt } = cli.mode.clone() else {
+            panic!("not a --print command line");
+        };
+        let mut out = Vec::new();
+        let code = run_with(&harness, &cli, prompt, &mut out).await;
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reads_are_approved_with_approve_reads() {
+        let (code, out) = print(&["--print", "what's in a.txt?", "--approve", "reads"]).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out.trim(), "the file says hello");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_approved_by_default() {
+        let (code, out) = print(&["--print", "what's in a.txt?"]).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out.trim(), "the read failed");
+    }
+
+    #[tokio::test]
+    async fn json_output_is_every_event_then_the_result() {
+        let (code, out) = print(&[
+            "--print",
+            "what's in a.txt?",
+            "--approve",
+            "all",
+            "--output",
+            "json",
+        ])
+        .await;
+        assert_eq!(code, EXIT_OK);
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(lines.iter().any(|l| l["type"] == "tool_approval_requested"));
+        assert!(lines.iter().any(|l| l["type"] == "turn_completed"));
+        let result = lines.last().unwrap();
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["exit_code"], EXIT_OK);
+        assert_eq!(result["answer"], "the file says hello");
+        assert_eq!(result["stop_reason"]["kind"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn resuming_an_unknown_session_fails() {
+        let (code, out) = print(&[
+            "--print",
+            "hi",
+            "--resume",
+            "00000000-0000-0000-0000-000000000000",
+        ])
+        .await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(out.is_empty());
+    }
 }

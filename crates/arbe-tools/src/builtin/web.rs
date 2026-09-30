@@ -3,7 +3,10 @@
 //! Tavily, or a SearXNG instance). Both are medium risk: they send data
 //! (a URL, a query) off the machine, so they go through approval like any
 //! other call — and a rule can allow them per site, e.g.
-//! `web_fetch(https://docs.rs/*)`.
+//! `web_fetch(https://docs.rs/*)`. So that such a rule means what it says,
+//! `web_fetch` follows a redirect only within the same site (scheme, host
+//! and port); a redirect elsewhere is reported back, and fetching the new
+//! address is a new call that goes through approval again.
 
 use std::time::Duration;
 
@@ -22,13 +25,64 @@ const DEFAULT_MAX_CHARS: usize = 20_000;
 const MAX_CHARS: usize = 100_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESULTS: usize = 10;
+/// Same-site redirects followed before giving up.
+const MAX_REDIRECTS: usize = 5;
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("arbeharness/", env!("CARGO_PKG_VERSION")))
         .timeout(REQUEST_TIMEOUT)
+        // Redirects are followed by hand (see `fetch_following_same_site`).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default()
+}
+
+/// Whether two URLs are on the same site: scheme, host and port.
+fn same_site(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Where a fetch ended up.
+enum Fetched {
+    Response(reqwest::Response),
+    /// A redirect to another site, which isn't followed.
+    OffSite {
+        status: u16,
+        location: String,
+    },
+}
+
+/// GETs `url`, following redirects that stay on its site.
+async fn fetch_following_same_site(url: reqwest::Url) -> Result<Fetched, ToolError> {
+    let client = client();
+    let mut current = url;
+    for _ in 0..=MAX_REDIRECTS {
+        let response = client.get(current.clone()).send().await.map_err(failure)?;
+        if !response.status().is_redirection() {
+            return Ok(Fetched::Response(response));
+        }
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(Fetched::Response(response));
+        };
+        let next = current
+            .join(location)
+            .map_err(|e| failure(format!("bad redirect location {location:?}: {e}")))?;
+        if !same_site(&current, &next) {
+            return Ok(Fetched::OffSite {
+                status: response.status().as_u16(),
+                location: next.to_string(),
+            });
+        }
+        current = next;
+    }
+    Err(failure(format!("more than {MAX_REDIRECTS} redirects")))
 }
 
 fn failure(e: impl std::fmt::Display) -> ToolError {
@@ -92,7 +146,10 @@ impl ToolExecutor for WebFetchTool {
             .clamp(1, MAX_CHARS);
 
         let fetch = async {
-            let response = client().get(url).send().await.map_err(failure)?;
+            let response = match fetch_following_same_site(url).await? {
+                Fetched::Response(response) => response,
+                Fetched::OffSite { status, location } => return Ok(Err((status, location))),
+            };
             let status = response.status();
             let final_url = response.url().to_string();
             let content_type = response
@@ -102,11 +159,27 @@ impl ToolExecutor for WebFetchTool {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             let (body, cut) = read_capped(response).await?;
-            Ok::<_, ToolError>((status, final_url, content_type, body, cut))
+            Ok::<_, ToolError>(Ok((status, final_url, content_type, body, cut)))
         };
-        let (status, final_url, content_type, body, cut) = tokio::select! {
+        let fetched = tokio::select! {
             result = fetch => result?,
             _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+        };
+        let (status, final_url, content_type, body, cut) = match fetched {
+            Ok(page) => page,
+            Err((status, location)) => {
+                return Ok(ToolResult {
+                    id: invocation.id,
+                    output: json!({
+                        "url": args.url,
+                        "status": status,
+                        "redirected_to": location,
+                        "note": "the page moved to another site; fetch that address to follow it",
+                    }),
+                    is_error: false,
+                    attachments: Vec::new(),
+                });
+            }
         };
 
         let (title, text) = to_text(&content_type, &body)?;
@@ -446,6 +519,53 @@ mod tests {
         );
         assert!(!text.contains("var x"), "{text}");
         assert!(!r.is_error);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_only_within_the_same_site() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(301).insert_header("location", "/new"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("moved here", "text/plain"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/away"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://169.254.169.254/latest/meta-data/"),
+            )
+            .mount(&server)
+            .await;
+        let tool = WebFetchTool::new();
+
+        let same = tool
+            .execute_default(call(
+                "web_fetch",
+                json!({"url": format!("{}/old", server.uri())}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(same.output["text"], "moved here");
+        assert!(same.output["url"].as_str().unwrap().ends_with("/new"));
+
+        let away = tool
+            .execute_default(call(
+                "web_fetch",
+                json!({"url": format!("{}/away", server.uri())}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            away.output["redirected_to"],
+            "http://169.254.169.254/latest/meta-data/"
+        );
+        assert!(away.output.get("text").is_none());
     }
 
     #[tokio::test]

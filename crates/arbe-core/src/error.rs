@@ -15,6 +15,10 @@ pub trait UserFacing {
 pub enum ProviderError {
     #[error("authentication failed for provider: {0}")]
     Auth(String),
+    /// A signed-in account (`arbeharness login`) can't be used: not signed
+    /// in, session expired, not entitled, ... The message says what to do.
+    #[error("{0}")]
+    SignIn(String),
     #[error("rate limited by provider: {message}")]
     RateLimit {
         message: String,
@@ -73,12 +77,8 @@ impl UserFacing for ProviderError {
     fn likely_fix(&self) -> Option<String> {
         Some(
             match self {
-                Self::Auth(message)
-                    // Sign-in errors (arbe_providers::auth) carry their own fix.
-                    if message.contains("arbeharness login") || message.contains("isn't entitled") =>
-                {
-                    return None;
-                }
+                // The message already says what to do (log in again, ...).
+                Self::SignIn(_) => return None,
                 Self::Auth(_) => {
                     "check the provider's API key (e.g. OPENAI_API_KEY) is set and valid"
                 }
@@ -121,10 +121,6 @@ pub enum ToolError {
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
-    #[error("failed to parse memory content: {0}")]
-    ParseFailure(String),
-    #[error("context budget could not be satisfied: {0}")]
-    BudgetFailure(String),
     #[error("memory store unavailable: {0}")]
     StoreUnavailable(String),
 }
@@ -139,12 +135,10 @@ pub enum ConfigError {
     Conflict(String),
 }
 
+/// A hook's own failure. Timeouts and panics are caught by the hook
+/// registry around the hook, so a hook only ever reports this.
 #[derive(Debug, Error)]
 pub enum HookError {
-    #[error("hook timed out")]
-    Timeout,
-    #[error("hook panicked: {0}")]
-    Panic(String),
     #[error("hook violated its contract: {0}")]
     ContractViolation(String),
 }
@@ -167,6 +161,10 @@ pub enum HarnessError {
     /// one bad turn can't take down the process.
     #[error("internal harness error: {0}")]
     Internal(String),
+    /// Reading or writing the harness's own files failed (sessions under
+    /// the harness home): a disk or permission problem, not a harness bug.
+    #[error("storage error: {0}")]
+    Storage(String),
     /// The turn was cancelled (user interrupt or shutdown).
     #[error("cancelled")]
     Cancelled,
@@ -210,6 +208,10 @@ impl UserFacing for HarnessError {
             Self::Tool(e) => e.likely_fix(),
             Self::Config(e) => e.likely_fix(),
             Self::Internal(_) => Some("this is a harness bug; please report it".to_string()),
+            Self::Storage(_) => Some(
+                "check that the harness home (~/.arbe, or --dev-home) is readable and writable"
+                    .to_string(),
+            ),
             Self::Busy => Some("wait for the current turn to finish, or cancel it".to_string()),
             Self::Memory(_) | Self::Hook(_) | Self::Cancelled => None,
         }
@@ -237,5 +239,19 @@ mod tests {
         let err = HarnessError::Provider(ProviderError::Auth("401".into()));
         assert!(err.likely_fix().unwrap().contains("API key"));
         assert!(HarnessError::Cancelled.likely_fix().is_none());
+        // A sign-in error's message is its own fix; no API-key advice.
+        let signin = ProviderError::SignIn("not signed in. Run `arbeharness login grok`.".into());
+        assert_eq!(
+            signin.to_string(),
+            "not signed in. Run `arbeharness login grok`."
+        );
+        assert!(signin.likely_fix().is_none());
+        assert!(!signin.is_retryable());
+        assert!(
+            HarnessError::Storage("disk full".into())
+                .likely_fix()
+                .unwrap()
+                .contains("writable")
+        );
     }
 }

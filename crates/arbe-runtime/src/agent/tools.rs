@@ -45,8 +45,6 @@ pub(super) fn truncate_middle(text: String, max_chars: usize) -> String {
     )
 }
 
-/// A tool's JSON output as the text the model sees: strings as-is,
-/// anything else as compact JSON.
 /// What one executed call produced, before it's turned into a result block.
 #[derive(Clone)]
 struct Outcome {
@@ -56,6 +54,8 @@ struct Outcome {
     attachments: Vec<ContentBlock>,
 }
 
+/// A tool's JSON output as the text the model sees: strings as-is,
+/// anything else as compact JSON.
 fn output_text(output: &Value) -> String {
     match output {
         Value::String(s) => s.clone(),
@@ -201,7 +201,7 @@ pub(super) async fn run_round(
 
 /// Instruction files from subdirectories the call touched for the first
 /// time this session (see `nested`). Only tools whose subject is a path
-/// inside the project can have any.
+/// (`SubjectKind::Path`) can have any.
 fn nested_instructions(
     agent: &Agent,
     registry: &arbe_tools::ToolRegistry,
@@ -210,6 +210,7 @@ fn nested_instructions(
     let Some(subject) = registry
         .get(&call.name)
         .ok()
+        .filter(|executor| executor.subject_kind() == arbe_tools::SubjectKind::Path)
         .and_then(|executor| executor.subject(&call.arguments))
     else {
         return Vec::new();
@@ -246,7 +247,7 @@ async fn approve_call(
             agent.mode.refusal(&call.name),
         ));
     }
-    let hook_result = hooks::run(
+    let (hook_result, blocked) = hooks::run_guarded(
         agent,
         HookPhase::BeforeToolExecute,
         &ToolCallPayload {
@@ -266,6 +267,15 @@ async fn approve_call(
         rationale: None,
     };
     let id = invocation.id;
+    if let Some(reason) = blocked {
+        return Some(denied(
+            agent,
+            turn_id,
+            id,
+            &call.name,
+            format!("blocked: {reason} (a guard that can't run doesn't let calls through)"),
+        ));
+    }
     let arguments = match hooks::tool_call_verdict(&hook_result, &call.arguments) {
         ToolCallVerdict::Proceed(arguments) => arguments,
         ToolCallVerdict::Veto(reason) => {
@@ -301,7 +311,13 @@ async fn approve_call(
     };
     let (authorization, decided_by_human) = match gate(invocation, None) {
         Ok(Authorization::NeedsHuman(invocation)) => {
-            let rx = agent.decisions.register(id);
+            let rx = agent.decisions.register(super::PendingDecision {
+                tool_call_id: id,
+                turn_id,
+                tool_name: call.name.clone(),
+                arguments: invocation.arguments.clone(),
+                risk,
+            });
             agent.set_activity(SessionActivity::AwaitingApproval);
             agent.events.publish(RuntimeEvent::ToolApprovalRequested {
                 turn_id,

@@ -1,6 +1,8 @@
 mod cli;
 mod headless;
 mod print;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -284,13 +286,18 @@ async fn interactive(harness: Harness, cli: &Cli, prompt: Option<String>) -> i32
     let handle = tokio::runtime::Handle::current();
     let result =
         tokio::task::spawn_blocking(move || arbe_tui::run(harness, agent, handle, events, prompt))
-            .await
-            .expect("TUI task panicked");
+            .await;
     match result {
-        Ok(()) => 0,
-        Err(err) => {
+        Ok(Ok(())) => 0,
+        Ok(Err(err)) => {
             eprintln!("TUI exited with an error: {err}");
             1
+        }
+        // The panic message was already printed (after the terminal was
+        // restored, see `arbe_tui::run`).
+        Err(_) => {
+            eprintln!("the TUI stopped unexpectedly");
+            101
         }
     }
 }

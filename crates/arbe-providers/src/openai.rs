@@ -324,6 +324,54 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
+    /// Set instead of `choices` when the server fails mid-stream (OpenAI
+    /// and compatible servers send `{"error": {...}}` on overload, rate
+    /// limits, ...).
+    #[serde(default)]
+    error: Option<StreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamError {
+    #[serde(default)]
+    message: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+}
+
+/// A mid-stream error payload in the `ProviderError` taxonomy, so it's
+/// reported (and, before any output, retried) for what it is.
+fn map_stream_error(error: StreamError) -> ProviderError {
+    let code = match &error.code {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    let kind = error.kind.unwrap_or_default();
+    let message = if error.message.is_empty() {
+        format!("{kind} {code}").trim().to_string()
+    } else {
+        error.message
+    };
+    let label = format!("{kind} {code}").to_ascii_lowercase();
+    if label.contains("rate_limit") || code == "429" {
+        ProviderError::rate_limit(message)
+    } else if label.contains("context_length") {
+        ProviderError::ContextLengthExceeded(message)
+    } else if label.contains("overloaded")
+        || label.contains("server_error")
+        || ["500", "502", "503", "529"].contains(&code.as_str())
+    {
+        ProviderError::Overloaded(message)
+    } else if label.contains("invalid_request") {
+        ProviderError::InvalidRequest(message)
+    } else {
+        ProviderError::Internal(format!(
+            "the provider reported an error mid-stream: {message}"
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,6 +492,9 @@ fn translate_chunk(
     let chunk: StreamChunk = serde_json::from_str(payload).map_err(|e| {
         ProviderError::Internal(format!("failed to parse OpenAI stream chunk: {e}"))
     })?;
+    if let Some(error) = chunk.error {
+        return Err(map_stream_error(error));
+    }
     let mut events = Vec::new();
 
     for choice in chunk.choices {
@@ -836,6 +887,36 @@ mod tests {
         assert!(matches!(
             translate_chunk(&mut state, "{not json"),
             Err(ProviderError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn an_error_sent_mid_stream_is_reported_for_what_it_is() {
+        let mut state = StreamState::default();
+        let error =
+            |payload: &str| translate_chunk(&mut StreamState::default(), payload).unwrap_err();
+        assert!(matches!(
+            translate_chunk(
+                &mut state,
+                r#"{"error":{"message":"The server is overloaded","type":"server_error"}}"#
+            ),
+            Err(ProviderError::Overloaded(ref m)) if m == "The server is overloaded"
+        ));
+        assert!(
+            error(r#"{"error":{"message":"slow down","code":"rate_limit_exceeded"}}"#)
+                .is_retryable()
+        );
+        assert!(matches!(
+            error(r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#),
+            ProviderError::ContextLengthExceeded(_)
+        ));
+        assert!(matches!(
+            error(r#"{"error":{"message":"odd","code":500}}"#),
+            ProviderError::Overloaded(_)
+        ));
+        assert!(matches!(
+            error(r#"{"error":{"message":"what"}}"#),
+            ProviderError::Internal(ref m) if m.contains("what")
         ));
     }
 }

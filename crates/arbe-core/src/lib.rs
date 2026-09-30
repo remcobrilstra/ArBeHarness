@@ -9,6 +9,7 @@ pub mod ids;
 pub mod loop_state;
 pub mod message;
 pub mod session;
+pub mod shell;
 pub mod tool;
 pub mod turn;
 pub mod usage;
@@ -17,7 +18,7 @@ pub use context::{ContextBreakdown, ContextUsage, MessageTokens};
 pub use error::{
     ConfigError, HarnessError, HookError, MemoryError, ProviderError, ToolError, UserFacing,
 };
-pub use event::{EventEnvelope, RuntimeCommand, RuntimeEvent};
+pub use event::{EventEnvelope, RuntimeEvent};
 pub use ids::{SessionId, ToolCallId, TurnId};
 pub use loop_state::{IllegalTransition, LoopMachine, LoopPhase};
 pub use message::{ContentBlock, ImageSource, Message, Role};

@@ -269,3 +269,82 @@ async fn forward(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_tool(parent_tools: Option<Vec<&str>>) -> (TaskTool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("arbe-subagent-{}", uuid::Uuid::new_v4()));
+        let config = RuntimeConfig {
+            tools: parent_tools.map(|t| t.into_iter().map(str::to_string).collect()),
+            ..RuntimeConfig::defaults(dir.clone())
+        };
+        let tool = TaskTool::new(
+            &config,
+            &ProviderRegistry::with_builtins(),
+            SessionStore::with_root(dir.join("sessions")),
+            Arc::new(EventBus::default()),
+            &Lineage::root(&config),
+            SessionId::new(),
+        );
+        (tool, dir)
+    }
+
+    fn requested(names: &[&str]) -> Option<Vec<String>> {
+        Some(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    #[test]
+    fn a_subagent_never_gets_more_tools_than_its_parent() {
+        let (tool, dir) = task_tool(Some(vec!["read_file", "grep", "gh__*"]));
+        // Asking for more than the parent has: only the overlap is kept.
+        let child = tool.child_config(requested(&["read_file", "execute", "write_file"]));
+        assert_eq!(child.tools, requested(&["read_file"]));
+        // A pattern the parent's allow-set covers is kept; a wider one isn't.
+        let child = tool.child_config(requested(&["gh__issues", "gh__*", "g*", "*"]));
+        assert_eq!(child.tools, requested(&["gh__issues", "gh__*"]));
+        // Asking for nothing in particular: the parent's own set.
+        assert_eq!(
+            tool.child_config(None).tools,
+            requested(&["read_file", "grep", "gh__*"])
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_parent_with_every_tool_can_narrow_its_subagent() {
+        let (tool, dir) = task_tool(None);
+        let child = tool.child_config(requested(&["read_file", "glob"]));
+        assert_eq!(child.tools, requested(&["read_file", "glob"]));
+        assert_eq!(tool.child_config(None).tools, None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn subagents_start_without_the_parents_mcp_servers() {
+        let dir = std::env::temp_dir().join(format!("arbe-subagent-{}", uuid::Uuid::new_v4()));
+        let config = RuntimeConfig {
+            mcp_servers: vec![arbe_mcp::McpServerConfig {
+                name: "docs".into(),
+                transport: arbe_mcp::TransportConfig::Http {
+                    url: "http://localhost:1".into(),
+                    headers: Default::default(),
+                    bearer_token: None,
+                },
+                timeout: Duration::from_secs(1),
+            }],
+            ..RuntimeConfig::defaults(dir.clone())
+        };
+        let tool = TaskTool::new(
+            &config,
+            &ProviderRegistry::with_builtins(),
+            SessionStore::with_root(dir.join("sessions")),
+            Arc::new(EventBus::default()),
+            &Lineage::root(&config),
+            SessionId::new(),
+        );
+        assert!(tool.child_config(None).mcp_servers.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

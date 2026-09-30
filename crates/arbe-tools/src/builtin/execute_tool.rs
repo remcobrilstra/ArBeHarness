@@ -19,6 +19,66 @@ use crate::{ToolContext, ToolDescription, ToolExecutor};
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
+/// Most of each output stream kept in memory: its start and its end, with
+/// what's between counted and dropped. A command that prints without end
+/// (`yes`, `cat` of a huge file) can't exhaust memory before its timeout.
+/// The agent later shortens the result further for the model.
+const CAPTURE_HEAD_BYTES: usize = 512 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 512 * 1024;
+
+/// One output stream: its first and last bytes, and how many in between
+/// were dropped.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+}
+
+impl Capture {
+    fn push(&mut self, mut bytes: &[u8]) {
+        let room = CAPTURE_HEAD_BYTES - self.head.len();
+        if room > 0 {
+            let take = room.min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        self.tail.extend(bytes);
+        if self.tail.len() > CAPTURE_TAIL_BYTES {
+            let excess = self.tail.len() - CAPTURE_TAIL_BYTES;
+            self.tail.drain(..excess);
+            self.dropped += excess as u64;
+        }
+    }
+
+    fn into_text(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if self.dropped > 0 {
+            text.push_str(&format!("\n[... {} bytes omitted ...]\n", self.dropped));
+        }
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        text
+    }
+}
+
+/// Reads `stream` to its end into a [`Capture`].
+async fn capture(stream: Option<impl tokio::io::AsyncRead + Unpin>) -> Capture {
+    use tokio::io::AsyncReadExt;
+    let mut captured = Capture::default();
+    let Some(mut stream) = stream else {
+        return captured;
+    };
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => captured.push(&buf[..n]),
+        }
+    }
+    captured
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct Args {
     /// The command line to run (via `cmd /C` on Windows, `sh -c` elsewhere).
@@ -66,6 +126,10 @@ impl ToolExecutor for ExecuteTool {
             .get("command")
             .and_then(serde_json::Value::as_str)
             .map(|c| c.trim().to_string())
+    }
+
+    fn subject_kind(&self) -> crate::SubjectKind {
+        crate::SubjectKind::ShellCommand
     }
 
     fn description(&self) -> ToolDescription {
@@ -126,22 +190,28 @@ impl ToolExecutor for ExecuteTool {
         #[cfg(unix)]
         command.process_group(0);
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| ToolError::RuntimeFailure(format!("failed to spawn command: {e}")))?;
         let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
         // Pinned outside the `select!` so the child stays alive (and
-        // findable) until its tree is killed below; dropping `wait` first
+        // findable) until its tree is killed below; dropping `run` first
         // would kill only the shell and orphan its children.
-        let mut wait = Box::pin(tokio::time::timeout(
+        let mut run = Box::pin(tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
+            async {
+                let (out, err, status) =
+                    tokio::join!(capture(stdout), capture(stderr), child.wait());
+                status.map(|status| (out, err, status))
+            },
         ));
         let outcome = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => Err(ToolError::Cancelled),
-            output = &mut wait => match output {
+            output = &mut run => match output {
                 Err(_elapsed) => Err(ToolError::Timeout),
                 Ok(result) => result.map_err(|e| {
                     ToolError::RuntimeFailure(format!("command execution failed: {e}"))
@@ -153,17 +223,17 @@ impl ToolExecutor for ExecuteTool {
         {
             kill_process_tree(pid).await;
         }
-        drop(wait);
-        let output = outcome?;
+        drop(run);
+        let (stdout, stderr, status) = outcome?;
 
-        let exit_code = output.status.code();
+        let exit_code = status.code();
         let is_error = exit_code != Some(0);
 
         Ok(ToolResult {
             id: invocation.id,
             output: json!({
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr),
+                "stdout": stdout.into_text(),
+                "stderr": stderr.into_text(),
                 "exit_code": exit_code,
             }),
             is_error,
@@ -222,28 +292,10 @@ pub(super) fn kill_process_tree_blocking(pid: u32) {
         .status();
 }
 
-/// Wraps `command` in the platform shell, so callers can use pipes,
-/// redirection, and multiple statements the same way they would at a
-/// terminal, rather than being limited to a single argv-style program +
-/// args.
-///
-/// On Windows the command line is handed to `cmd` verbatim
-/// (`cmd /S /C "<command>"` via `raw_arg`): Rust's normal argument quoting
-/// escapes inner quotes with backslashes, which `cmd` doesn't understand,
-/// so anything like `git commit -m "fix bug"` would arrive mangled.
+/// `command` in the platform shell (see `arbe_core::shell::command`), so
+/// pipes, redirection and multiple statements work as at a terminal.
 pub fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd");
-        c.raw_arg(format!("/S /C \"{command}\""));
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    }
+    Command::from(arbe_core::shell::command(command))
 }
 
 #[cfg(test)]
@@ -262,6 +314,47 @@ mod tests {
             risk: RiskLevel::High,
             rationale: None,
         }
+    }
+
+    #[test]
+    fn captured_output_keeps_its_start_and_end_within_a_fixed_size() {
+        let mut capture = Capture::default();
+        capture.push(&vec![b'a'; CAPTURE_HEAD_BYTES]);
+        for _ in 0..10 {
+            capture.push(&vec![b'b'; CAPTURE_TAIL_BYTES]);
+        }
+        capture.push(b"THE END");
+        assert_eq!(capture.head.len(), CAPTURE_HEAD_BYTES);
+        assert_eq!(capture.tail.len(), CAPTURE_TAIL_BYTES);
+        assert_eq!(capture.dropped, 9 * CAPTURE_TAIL_BYTES as u64 + 7);
+        let text = capture.into_text();
+        assert!(text.starts_with("aaa"));
+        assert!(text.ends_with("bbbTHE END"));
+        assert!(text.contains(&format!(
+            "[... {} bytes omitted ...]",
+            9 * CAPTURE_TAIL_BYTES + 7
+        )));
+
+        let mut small = Capture::default();
+        small.push(b"hello");
+        assert_eq!(small.into_text(), "hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_prints_without_end_is_captured_within_bounds() {
+        let dir = tempdir().unwrap();
+        let tool = ExecuteTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute_default(invocation(
+                json!({ "command": "head -c 5000000 /dev/zero | tr '\\0' x; echo done" }),
+            ))
+            .await
+            .unwrap();
+        let stdout = result.output["stdout"].as_str().unwrap();
+        assert!(stdout.len() < CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES + 100);
+        assert!(stdout.contains("bytes omitted"));
+        assert!(stdout.trim_end().ends_with("done"));
     }
 
     #[tokio::test]

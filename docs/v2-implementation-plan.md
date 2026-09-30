@@ -24,12 +24,13 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 | P7 | Verification, hardening & release | In progress | 6 / 8 | P7.1, P7.3–P7.7 done (CI green on all three OSes). Open: P7.2 OpenAI/Anthropic live runs (no keys), P7.8 tag + binaries |
 
 **Current focus:** everything open is listed under **Pending work** in `docs/v2-status.md`: OpenAI/Anthropic live runs (keys), `v0.2.0` tag + binaries, desktop control (awaiting review)
-**Last updated:** 2026-09-30 · test count: 495 on Windows, 497 on Linux (+24 ignored live tests)
+**Last updated:** 2026-09-30 · test count: 565 on Windows (+24 ignored live tests)
 
 ### Progress log
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-30 — Full code review, all findings fixed** (branch `review-fixes`; report and per-finding status in `reports/Code review 2026-09-30.md`). Security: project `prompt` files trust-stripped, provider switch drops the old provider's endpoint/key settings (built-in profiles are now a data table), `*` in command allow rules never spans shell operators (`SubjectKind`), `web_fetch` same-site redirects only, failing guard hooks block. Durability: torn JSONL tails cut before appending, fsync, permissions kept. Plus TUI per-session bus and missed-dialog recovery (`Agent::pending_approvals`, headless `session/pending`), capped `execute` output, compaction measured against history's room, Ollama 16k context, MCP name collisions, `ProviderError::SignIn`, `HarnessError::Storage`, `arbe_core::shell`, and a dead-code sweep. Checked and not a bug: Ollama's `prompt_eval_count` with a cached prompt. 537 → 565 tests; line coverage 86.3% → 87.2%.
 - **2026-09-30 — Grok subscription sign-in.** `grok_subscription` provider and built-in `grok-subscription` profile: device-code login to `auth.x.ai`, credential under `<home>/auth/grok.json`, Chat Completions on `cli-chat-proxy.grok.com` only. Sign-in is provider-neutral (`arbe_providers::auth`: `AuthScheme` + `Account`, `login [account]`); Grok is the first registered scheme. The `XAI_API_KEY` / `api.x.ai` path is unchanged. Not a live-verified subscription call in this session.
 - **2026-09-30 — P6.6 plan mode, on a general session-mode mechanism.** `default` and `plan` modes; the model leaves plan mode through `exit_plan_mode`, which the user approves. P6 complete.
 - **2026-09-30 — P5.7 context accounting.** Per-request context breakdown by source (event, `/context`, header %, `session/context`); tool definitions now counted against the budget; calibration learns from every round and adopts its first observation. Groundwork for further context-management work.

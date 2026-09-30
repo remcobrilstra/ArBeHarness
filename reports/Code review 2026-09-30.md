@@ -154,3 +154,37 @@ Gaps worth closing, most valuable first:
 2. **Correctness:** M2, M4, M5, M6, M10, M11, M12, L1, L2.
 3. **Small models / context:** M7, M8 (verify first), M9, together with the fixes from the `dea99a75` session review (tool calls written as text with a wrong tool name).
 4. **Cleanup:** the dead code, the shared shell helper, the `likely_fix` variant, the doc comments, CLAUDE.md, and the low-severity list.
+
+## Status after the fixes (branch `review-fixes`)
+
+Every finding was worked through. How each one ended:
+
+| Finding | Outcome |
+|---|---|
+| H1 project `prompt` file | **Fixed.** Stripped from untrusted project config (built-in `coding`/`general` still allowed); test. |
+| H2 provider switch | **Fixed.** `switch_provider` drops model, endpoint, headers and key settings from lower layers; built-in profiles became data (`BUILTIN_PROFILES`), which removed the Grok special case; tests. |
+| H3 chained commands | **Fixed.** `ToolRule::chains_beyond` + `SubjectKind::ShellCommand`: `*` never stretches over shell operators; guide says command deny rules are best-effort; tests. |
+| H4 torn JSONL lines | **Fixed.** `append_line` cuts a torn tail before appending and fsyncs; `write_atomic` fsyncs, cleans up its temp file, keeps permissions; tests. |
+| M1 hook deadlock / fail-open | **Fixed.** stdin written while stdout is read; `on_failure = "block" \| "skip"` (default `block` for `before_tool_execute`); tests. |
+| M2 unbounded `execute` output | **Fixed.** Head + tail capture, 512 KB each per stream; tests. |
+| M3 `web_fetch` redirects | **Fixed.** Same-site redirects only; others are reported as `redirected_to`; test. |
+| M4 orphaned sessions | **Fixed.** The provider is built before a session is created or reopened; test. |
+| M5 TUI bus | **Fixed.** A bus per session; capacity 4,096; missed dialogs recovered via `Agent::pending_approvals`/`pending_questions` (also `session/pending` in `--headless`); tests. |
+| M6 panic hook | **Fixed.** `arbe_tui::run` restores the terminal before the panic message. |
+| M7 compaction trigger | **Fixed.** Measured against the history's room (budget − fixed costs), also for the reported threshold; tests. |
+| M8 Ollama calibration | **Not an issue.** Checked live on Ollama 0.34.4: `prompt_eval_count` reports the full prompt even when it's cached (3017, 3017, 3033). No change. |
+| M9 Ollama budget | **Fixed.** Default `num_ctx` 16,384 (≈12k budget instead of ≈4k). |
+| M10 MCP name collisions | **Fixed.** Ownership recorded per server; taken names get `_2`, `_3`, …; tests. |
+| M11 file permissions | **Fixed** (with H4). |
+| M12 mid-stream errors | **Fixed.** Mapped to rate limit / overload / context length / invalid request; test. |
+| L1–L14 | **Fixed**, each with a test where it has behavior (L14 was a doc fix). Also fixed from the `dea99a75` session review: a text tool call naming an unknown tool now reaches the gate, whose error lists the real tool names. |
+| Dead code | **Removed** (see CHANGELOG). The spec's session-local skill scope is listed as not built in `docs/v2-status.md`. |
+| Provider-specific config, `likely_fix` | **Fixed.** Built-in profile table; `ProviderError::SignIn` carries its own fix. |
+| Shell duplication | **Fixed.** `arbe_core::shell::{command, join}`. |
+| Misplaced doc comments | **Fixed** (all four). |
+| Repeated token estimation | **Improved.** JSON inputs are counted while serializing, without building strings. Caching costs per history entry was not done: pruning rewrites messages in place, so a cache would need invalidation for little gain now. |
+| Two "compaction" mechanisms | **Fixed.** The placeholder strategy is now `TruncateWithNoticeStrategy`, with its role documented. |
+| Nested instructions keyed on `subject` | **Fixed.** Only `SubjectKind::Path` subjects count. |
+| Long functions | **Partly.** `RuntimeConfig::apply` and the TUI's `handle_key` were split. `model_loop`, `approve_call`, `drain_runtime_events`, `load_from_sources` and `Agent::assemble` stay as they are: each is one ordered sequence that reads better whole than spread over helpers. |
+| CLAUDE.md drift | **Fixed.** |
+| Coverage gaps 1–7 | **Covered**: subagent tool narrowing, torn/failed storage writes, config trust, chained-command rules, `--print` (4 in-process tests on a scripted provider), TUI session swap/timeouts/commands, `path_guard` error branches. |

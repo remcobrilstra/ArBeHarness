@@ -298,7 +298,10 @@ fn draw_approval_modal(frame: &mut Frame, area: Rect, approval: &crate::app::Pen
 
     frame.render_widget(Clear, popup);
 
-    let seconds_left = approval.ticks_remaining * 80 / 1000;
+    let seconds_left = approval
+        .deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
     let text = vec![
         Line::from(Span::styled(
             format!("Tool call: {}", approval.tool_name),
@@ -353,7 +356,11 @@ fn draw_plan_approval(frame: &mut Frame, area: Rect, approval: &crate::app::Pend
         height,
     };
     frame.render_widget(Clear, popup);
-    let minutes_left = (approval.ticks_remaining * 80 / 1000).div_ceil(60);
+    let minutes_left = approval
+        .deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs()
+        .div_ceil(60);
     let text = vec![
         Line::from(Span::styled(
             "Approve this plan? It's shown above (\u{2191}/\u{2193}/PgUp/PgDn to scroll).",

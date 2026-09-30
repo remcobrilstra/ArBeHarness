@@ -5,8 +5,13 @@
 //! - nothing: the payload passes through unchanged;
 //! - a JSON object: it replaces the payload (e.g. `before_tool_execute`
 //!   can change `arguments` or add `"veto": "reason"`);
-//! - anything else, or a non-zero exit status: the hook failed and is
-//!   skipped (its stderr is included in the failure report).
+//! - anything else, or a non-zero exit status: the hook failed (its stderr
+//!   is included in the failure report). A failed hook is skipped, unless
+//!   it was set to block on failure ([`CommandHook::blocking_on_failure`]).
+//!
+//! The payload is written to stdin while stdout is being read, so a hook
+//! that echoes as it reads can't deadlock on a payload bigger than the
+//! pipe buffer.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -28,6 +33,7 @@ pub struct CommandHook {
     command: String,
     cwd: Option<PathBuf>,
     timeout: Duration,
+    block_on_failure: bool,
 }
 
 impl CommandHook {
@@ -37,7 +43,16 @@ impl CommandHook {
             command: command.into(),
             cwd: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
+            block_on_failure: false,
         }
+    }
+
+    /// Whether a failure of this hook (error, bad output, timeout) should
+    /// block what it guards instead of being skipped — for a
+    /// `before_tool_execute` guard, a failure then refuses the call.
+    pub fn blocking_on_failure(mut self, block: bool) -> Self {
+        self.block_on_failure = block;
+        self
     }
 
     /// Runs the command in `cwd` (the project directory, usually).
@@ -52,23 +67,10 @@ impl CommandHook {
     }
 }
 
-/// The platform shell running `command` as one command line. On Windows
-/// the line goes to `cmd` verbatim (`raw_arg`), since Rust's argument
-/// quoting escapes inner quotes in a way `cmd` doesn't understand (same
-/// approach as `arbe_tools::builtin::execute_tool::shell_command`).
+/// The platform shell running `command` as one command line (see
+/// `arbe_core::shell::command`).
 fn shell(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd");
-        c.raw_arg(format!("/S /C \"{command}\""));
-        c
-    }
-    #[cfg(not(windows))]
-    {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    }
+    Command::from(arbe_core::shell::command(command))
 }
 
 #[async_trait]
@@ -83,6 +85,10 @@ impl Hook for CommandHook {
 
     fn timeout(&self) -> Option<Duration> {
         Some(self.timeout)
+    }
+
+    fn blocks_on_failure(&self) -> bool {
+        self.block_on_failure
     }
 
     async fn run(&self, payload: Value) -> Result<Value, HookError> {
@@ -105,15 +111,20 @@ impl Hook for CommandHook {
         let mut child = command
             .spawn()
             .map_err(|e| HookError::ContractViolation(format!("could not start: {e}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // A command that doesn't read its input may close stdin early;
-            // that's fine.
-            let _ = stdin.write_all(input.to_string().as_bytes()).await;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| HookError::ContractViolation(e.to_string()))?;
+        let stdin = child.stdin.take();
+        let text = input.to_string();
+        // Written while the output is read: a hook that prints as it reads
+        // would otherwise fill its stdout pipe and stop reading stdin
+        // while we're still writing to it.
+        let feed = async move {
+            if let Some(mut stdin) = stdin {
+                // A command that doesn't read its input may close stdin
+                // early; that's fine. Dropping `stdin` closes it.
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }
+        };
+        let (_, output) = tokio::join!(feed, child.wait_with_output());
+        let output = output.map_err(|e| HookError::ContractViolation(e.to_string()))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -187,6 +198,37 @@ mod tests {
         let hook = CommandHook::new(HookPhase::AfterModelCall, echo);
         let result = hook.run(json!({"turn_id": "t1"})).await.unwrap();
         assert_eq!(result, json!({"turn_id": "t1"}));
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_echoes_a_large_payload_does_not_deadlock() {
+        // Far bigger than any pipe buffer: the hook starts printing before
+        // it has read everything, so stdin must be fed while stdout drains.
+        let echo = if cfg!(windows) { "more" } else { "cat" };
+        let big = "x".repeat(512 * 1024);
+        let hook = CommandHook::new(HookPhase::BeforeToolExecute, echo);
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            hook.run(json!({"arguments": {"content": big}})),
+        )
+        .await
+        .expect("the hook deadlocked");
+        // `cat` echoes verbatim; Windows' `more` reflows long lines, so
+        // there only finishing counts.
+        if cfg!(unix) {
+            let result = result.unwrap();
+            assert_eq!(
+                result["arguments"]["content"].as_str().unwrap().len(),
+                big.len()
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_on_failure_is_opt_in() {
+        let hook = CommandHook::new(HookPhase::BeforeToolExecute, "exit 1");
+        assert!(!hook.blocks_on_failure());
+        assert!(hook.blocking_on_failure(true).blocks_on_failure());
     }
 
     #[tokio::test]

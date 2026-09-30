@@ -31,13 +31,14 @@ impl Drop for StdioTransport {
 }
 
 /// On Windows, `npx`, `uvx` and friends are `.cmd` scripts that
-/// `CreateProcess` won't find by bare name; running through `cmd /C`
-/// resolves them the way a terminal would.
+/// `CreateProcess` won't find by bare name; running them through the shell
+/// resolves them the way a terminal would (with the arguments quoted for
+/// it, see `arbe_core::shell::join`).
 fn command_for(program: &str, args: &[String], via_shell: bool) -> Command {
     if via_shell {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(program).args(args);
-        c
+        Command::from(arbe_core::shell::command(&arbe_core::shell::join(
+            program, args,
+        )))
     } else {
         let mut c = Command::new(program);
         c.args(args);

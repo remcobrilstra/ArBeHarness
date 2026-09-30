@@ -18,7 +18,7 @@ pub mod manager;
 pub mod protocol;
 mod stdio;
 
-pub use bridge::{McpToolExecutor, qualified_tool_name, server_prefix};
+pub use bridge::{McpToolExecutor, qualified_tool_name, unique_tool_name};
 pub use client::{CallOutcome, McpClient, McpToolInfo};
 pub use config::{McpServerConfig, McpServerSettings, TransportConfig};
 pub use manager::{McpManager, McpServer, ServerStatus, ToolSink};

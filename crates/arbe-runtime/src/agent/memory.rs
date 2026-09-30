@@ -94,6 +94,26 @@ struct Args {
     scope: Option<Scope>,
 }
 
+/// Appends `- note` as a line of its own. An append, not a rewrite of the
+/// whole file: two sessions saving a note at the same moment both keep
+/// theirs. A last line without a newline (hand-edited) is left intact.
+fn append_note(path: &Path, note: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let needs_newline = std::fs::read(path)
+        .map(|bytes| bytes.last().is_some_and(|b| *b != b'\n'))
+        .unwrap_or(false);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = format!("{}- {note}\n", if needs_newline { "\n" } else { "" });
+    file.write_all(line.as_bytes())?;
+    file.sync_data()
+}
+
 /// Appends a note to a memory file. Medium risk: it writes something that
 /// shapes every future session, so it goes through approval like any
 /// other write.
@@ -123,13 +143,8 @@ impl ToolExecutor for RememberTool {
         }
         let scope = args.scope.unwrap_or(Scope::Project);
         let path = memory_file(&self.home, scope, &self.project_dir);
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("- {note}\n"));
-        arbe_storage::atomic::write_atomic(&path, text.as_bytes())
-            .map_err(|e| ToolError::RuntimeFailure(e.to_string()))?;
+        append_note(&path, &note)
+            .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
         Ok(ToolResult {
             id: invocation.id,
             output: Value::String(format!(
@@ -183,6 +198,19 @@ mod tests {
         assert_eq!(project_id(a), project_id(a));
         assert_ne!(project_id(a), project_id(b));
         assert!(project_id(a).starts_with("app-"));
+    }
+
+    #[test]
+    fn notes_are_appended_after_a_hand_edited_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory").join("memory.md");
+        append_note(&path, "first").unwrap();
+        std::fs::write(&path, "- first\nedited without newline").unwrap();
+        append_note(&path, "second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- first\nedited without newline\n- second\n"
+        );
     }
 
     #[tokio::test]

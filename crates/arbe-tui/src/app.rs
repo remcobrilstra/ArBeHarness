@@ -21,11 +21,10 @@ pub struct PendingApproval {
     pub arguments_pretty: String,
     pub risk: RiskLevel,
     pub source_turn: TurnId,
-    /// Wall-clock deadline (ticks remaining, decremented once per render
-    /// loop iteration) after which the approval auto-resolves to deny per
-    /// TUI spec §9 ("if approval prompt times out: default action from
-    /// policy, recommended deny").
-    pub ticks_remaining: u32,
+    /// When the approval auto-resolves to deny per TUI spec §9 ("if
+    /// approval prompt times out: default action from policy, recommended
+    /// deny").
+    pub deadline: std::time::Instant,
     /// The call asks to approve a plan and leave plan mode
     /// (`exit_plan_mode`): the plan itself is in the transcript.
     pub is_plan: bool,
@@ -143,12 +142,11 @@ impl ProfilePicker {
     }
 }
 
-/// How many render-loop ticks (`event::poll` iterations, ~80ms each — see
-/// `lib.rs::event_loop`) a pending approval waits before auto-denying.
-pub const APPROVAL_TIMEOUT_TICKS: u32 = (30_000 / 80) as u32;
+/// How long a pending approval waits before auto-denying.
+pub const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A plan takes longer to read than a tool call: 10 minutes.
-pub const PLAN_APPROVAL_TIMEOUT_TICKS: u32 = (600_000 / 80) as u32;
+pub const PLAN_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// All UI-local state. This is presentation state only (current input
 /// text, scroll position, whether a request is in flight) — it holds no

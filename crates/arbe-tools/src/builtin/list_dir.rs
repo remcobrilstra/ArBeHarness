@@ -46,6 +46,10 @@ impl ToolExecutor for ListDirTool {
         true
     }
 
+    fn subject_kind(&self) -> crate::SubjectKind {
+        crate::SubjectKind::Path
+    }
+
     /// Rule subject: the path (see `ToolExecutor::subject`).
     fn subject(&self, arguments: &serde_json::Value) -> Option<String> {
         crate::path_subject(arguments, Some("."))

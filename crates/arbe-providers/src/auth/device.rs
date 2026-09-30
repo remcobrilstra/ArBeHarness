@@ -102,7 +102,7 @@ async fn request_device_code(
     )
     .await?;
     if let Some(code) = value.get("error").and_then(|v| v.as_str()) {
-        return Err(ProviderError::Auth(format!(
+        return Err(ProviderError::SignIn(format!(
             "{what} failed ({code}). {}",
             scheme.login_hint()
         )));
@@ -130,7 +130,7 @@ fn interpret_poll(scheme: &AuthScheme, value: &Value) -> Result<Poll, ProviderEr
     match error {
         "authorization_pending" => Ok(Poll::Pending),
         "slow_down" => Ok(Poll::SlowDown),
-        "access_denied" | "authorization_denied" => Err(ProviderError::Auth(format!(
+        "access_denied" | "authorization_denied" => Err(ProviderError::SignIn(format!(
             "the {} sign-in was declined. {}",
             scheme.display_name,
             scheme.login_hint()
@@ -140,7 +140,7 @@ fn interpret_poll(scheme: &AuthScheme, value: &Value) -> Result<Poll, ProviderEr
             Err(scheme.entitlement_error(Some(error)))
         }
         "invalid_grant" => Err(session_expired(scheme)),
-        other => Err(ProviderError::Auth(format!(
+        other => Err(ProviderError::SignIn(format!(
             "the {} sign-in failed ({other}). {}",
             scheme.display_name,
             scheme.login_hint()
@@ -161,14 +161,14 @@ fn issued_from(scheme: &AuthScheme, value: &Value) -> Result<Issued, ProviderErr
 }
 
 fn code_expired(scheme: &AuthScheme) -> ProviderError {
-    ProviderError::Auth(format!(
+    ProviderError::SignIn(format!(
         "the sign-in code expired before it was confirmed. {}",
         scheme.login_hint()
     ))
 }
 
 fn session_expired(scheme: &AuthScheme) -> ProviderError {
-    ProviderError::Auth(format!(
+    ProviderError::SignIn(format!(
         "the {} session expired. {}",
         scheme.display_name,
         scheme.login_hint()
@@ -187,7 +187,7 @@ fn required_str(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| {
-            ProviderError::Auth(format!(
+            ProviderError::SignIn(format!(
                 "{what} failed: the response had no {field}. {}",
                 scheme.login_hint()
             ))
@@ -227,7 +227,7 @@ async fn post_form(
         return Ok(value);
     }
     if status.is_success() {
-        return Err(ProviderError::Auth(format!(
+        return Err(ProviderError::SignIn(format!(
             "the {} sign-in service returned a response the harness could not read. {}",
             scheme.display_name,
             scheme.login_hint()
@@ -236,7 +236,7 @@ async fn post_form(
     if status.as_u16() == 403 || scheme.is_entitlement_refusal(&text) {
         return Err(scheme.entitlement_error(None));
     }
-    Err(ProviderError::Auth(format!(
+    Err(ProviderError::SignIn(format!(
         "the {} sign-in service returned HTTP {status}. {}",
         scheme.display_name,
         scheme.login_hint()

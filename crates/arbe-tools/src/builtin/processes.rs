@@ -267,6 +267,16 @@ struct OutputArgs {
     wait_secs: Option<u64>,
 }
 
+/// Whether waiting on `handle` can bring anything new: it's still running.
+/// (An exited process's output is complete.)
+fn output_or_exit_pending(table: &ProcessTable, handle: &str) -> bool {
+    table
+        .lock()
+        .processes
+        .get(handle)
+        .is_some_and(Process::running)
+}
+
 /// Reads a background process's new output. Only reads what an approved
 /// `execute` started, so it needs no approval of its own.
 pub struct ProcessOutputTool {
@@ -324,8 +334,13 @@ impl ToolExecutor for ProcessOutputTool {
             let out = output.lock().unwrap_or_else(|p| p.into_inner());
             out.end() > out.read
         };
-        if !wait.is_zero() && !has_new() {
-            let notified = changed.notified();
+        // Registered for notification *before* checking for output: output
+        // arriving between the check and the wait would otherwise go
+        // unnoticed until the wait ran out.
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !wait.is_zero() && !has_new() && output_or_exit_pending(&self.table, &handle) {
             tokio::select! {
                 _ = notified => {}
                 _ = tokio::time::sleep(wait) => {}
@@ -438,8 +453,15 @@ impl ToolExecutor for ProcessKillTool {
         )
     }
 
+    /// Medium, not low: stopping a program changes things (a server goes
+    /// down), so it isn't approved along with reads (`--approve reads`).
     fn default_risk(&self) -> RiskLevel {
-        RiskLevel::Low
+        RiskLevel::Medium
+    }
+
+    /// Not parallel-safe: it changes which processes are running.
+    fn parallel_safe(&self) -> bool {
+        false
     }
 }
 

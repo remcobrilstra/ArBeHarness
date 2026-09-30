@@ -126,7 +126,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut prompt = None;
     let mut print = None;
     let mut headless = false;
-    // `login` / `logout`, and the account named after it.
+    // `login` / `logout` and the account named after it.
     let mut command: Option<(String, Option<String>)> = None;
     let mut approve = None;
     let mut output = None;
@@ -158,11 +158,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                     command = Some((flag, None));
                     continue;
                 }
-                Some(_) if matches!(flag.as_str(), "login" | "logout") => {
-                    return Err("login and logout can't be combined".into());
+                Some((name, _)) if matches!(flag.as_str(), "login" | "logout") => {
+                    return Err(format!("{name} and {flag} can't be combined"));
                 }
-                Some((_, account @ None)) => {
-                    *account = Some(flag);
+                Some((_, value @ None)) => {
+                    *value = Some(flag);
                     continue;
                 }
                 _ => {}
@@ -226,7 +226,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         seen.push(flag);
     }
 
-    if let Some((command, account)) = command {
+    if let Some((command, value)) = command {
         if headless
             || prompt.is_some()
             || print.is_some()
@@ -242,20 +242,23 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             || output.is_some()
         {
             return Err(format!(
-                "{command} only accepts an account name and --dev-home (it does not start a session)"
+                "{command} only accepts an account name and --dev-home \
+                 (it does not start a session)"
             ));
         }
-        cli.mode = if command == "login" {
-            Mode::Login { account }
-        } else {
-            Mode::Logout { account }
+        cli.mode = match command.as_str() {
+            "login" => Mode::Login { account: value },
+            _ => Mode::Logout { account: value },
         };
         return Ok(cli);
     }
     if headless {
         if prompt.is_some() || print.is_some() || cli.resume.is_some() || cli.name.is_some() {
-            return Err("--headless can't be combined with --prompt, --print, --resume or --name                  (sessions are opened through the protocol)"
-                .into());
+            return Err(
+                "--headless can't be combined with --prompt, --print, --resume or --name \
+                 (sessions are opened through the protocol)"
+                    .into(),
+            );
         }
         if approve.is_some() || output.is_some() {
             return Err("--approve and --output only apply with --print".into());
@@ -416,6 +419,7 @@ mod tests {
             (&["login", "logout"][..], "can't be combined"),
             (&["login", "grok", "extra"][..], "unexpected argument"),
             (&["grok"][..], "unexpected argument"),
+            (&["review"][..], "unexpected argument"),
         ] {
             let err = parse_str(args).unwrap_err();
             assert!(err.contains(expected), "{args:?}: {err}");

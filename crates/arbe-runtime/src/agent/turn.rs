@@ -188,7 +188,13 @@ pub(super) async fn run_turn(
             Ok(answer)
         }
         Err(HarnessError::Cancelled) => {
-            runner.commit(StopReason::Cancelled)?;
+            // Cancelled before the question was even recorded (e.g. during
+            // automatic compaction): there's no turn to keep.
+            if runner.trace.is_empty() {
+                runner.discard();
+            } else {
+                runner.commit(StopReason::Cancelled)?;
+            }
             agent.events.publish(RuntimeEvent::TurnCancelled {
                 session_id: agent.session_id(),
                 turn_id,
@@ -467,13 +473,20 @@ impl TurnRunner<'_> {
         let settings = &agent.settings;
         let usage = {
             let mut state = agent.state();
+            let scaled = breakdown.scaled(state.calibration.factor());
+            // Compaction measures history against what's left of the budget
+            // after the fixed costs; report its threshold the same way.
+            let threshold = settings.auto_compact.then(|| {
+                let room = settings
+                    .budget_tokens
+                    .saturating_sub(compaction::fixed_tokens(&scaled));
+                (room as f64 * compaction::TRIGGER_RATIO) as u64
+            });
             let usage = ContextUsage::new(
-                breakdown.scaled(state.calibration.factor()),
+                scaled,
                 settings.budget_tokens,
                 settings.context_window,
-                settings
-                    .auto_compact
-                    .then_some((settings.budget_tokens as f64 * compaction::TRIGGER_RATIO) as u64),
+                threshold,
             );
             state.last_context = Some(usage.clone());
             usage

@@ -100,7 +100,8 @@ Everything not done yet, in one place. Nothing here blocks using the harness tod
 | Custom modes | Modes are data (`agent/modes.rs`), but only the built-in `default` and `plan` exist; `[modes.<name>]` in config isn't read yet. |
 | Desktop control | Designed only (see above). |
 | OpenTelemetry export (P6.8) | Deferred; the daily log file covers local debugging. |
-| `events.jsonl` | Not written; events are available live (TUI, `--print --output json`, `--headless`). |
+| `events.jsonl` | Not written (the unused storage API for it was removed in the 2026-09-30 review); events are available live (TUI, `--print --output json`, `--headless`). |
+| Session-local skills (spec FR-6) | Not built: skills come from the global and project folders only. The never-used `SkillScope::SessionLocal` and its merge parameter were removed in the 2026-09-30 review. |
 | Subagent gaps | Subagents use the parent's configuration (no per-call profile), don't connect MCP servers, and their tokens and cost aren't added to the parent's totals. |
 | Smaller ideas | [`todo.md`](todo.md): nested project instruction files, MCP schema lookup before use, output-formatting conventions. A punch list, not a commitment. |
 

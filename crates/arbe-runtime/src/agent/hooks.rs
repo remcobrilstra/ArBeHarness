@@ -72,21 +72,35 @@ pub(super) struct ErrorPayload {
 /// fails; each hook that was skipped is published as `HookFailed` so a
 /// broken hook doesn't fail silently.
 pub(super) async fn run(agent: &Agent, phase: HookPhase, payload: &impl Serialize) -> Value {
+    run_guarded(agent, phase, payload).await.0
+}
+
+/// [`run`], also returning why the phase is blocked, if a hook that blocks
+/// on failure failed (see `CommandHook::blocking_on_failure`).
+pub(super) async fn run_guarded(
+    agent: &Agent,
+    phase: HookPhase,
+    payload: &impl Serialize,
+) -> (Value, Option<String>) {
     let value = with_session_id(
         serde_json::to_value(payload).unwrap_or(Value::Null),
         agent.session_id(),
     );
     if agent.hooks.is_empty() {
-        return value;
+        return (value, None);
     }
     let (result, failures) = agent.hooks.run_phase_reporting(phase, value).await;
+    let mut blocked = None;
     for failure in failures {
+        if failure.blocking && blocked.is_none() {
+            blocked = Some(format!("{} failed: {}", failure.hook, failure.reason));
+        }
         agent.events.publish(RuntimeEvent::HookFailed {
             hook: failure.hook,
             reason: failure.reason,
         });
     }
-    result
+    (result, blocked)
 }
 
 fn with_session_id(mut value: Value, session_id: arbe_core::SessionId) -> Value {

@@ -20,7 +20,6 @@ use arbe_runtime::arbe_core::{
     ApprovalDecision, EventEnvelope, Role, RuntimeEvent, SessionId, StopReason, ToolCallId,
     ToolResult,
 };
-use arbe_runtime::arbe_tools::ToolExecutor;
 use arbe_runtime::{Agent, EventBus, Harness};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -32,9 +31,31 @@ use ratatui::backend::CrosstermBackend;
 use tokio::runtime::Handle;
 
 use app::{
-    APPROVAL_TIMEOUT_TICKS, App, PLAN_APPROVAL_TIMEOUT_TICKS, PendingApproval, PendingQuestion,
-    ProfilePicker, ProposedToolCall, SessionPicker,
+    APPROVAL_TIMEOUT, App, PLAN_APPROVAL_TIMEOUT, PendingApproval, PendingQuestion, ProfilePicker,
+    ProposedToolCall, SessionPicker,
 };
+
+/// The event bus the current session publishes to, and the TUI's
+/// subscription to it. Every session gets its own: a replaced session's
+/// cancelled turn may still publish for a moment, and those events must
+/// not land in the new session's transcript.
+struct Bus {
+    events: Arc<EventBus>,
+    rx: tokio::sync::broadcast::Receiver<EventEnvelope>,
+}
+
+impl Bus {
+    fn new() -> Self {
+        Self::from(Arc::new(EventBus::default()))
+    }
+}
+
+impl From<Arc<EventBus>> for Bus {
+    fn from(events: Arc<EventBus>) -> Self {
+        let rx = events.subscribe();
+        Self { events, rx }
+    }
+}
 
 /// Result of a spawned agent call, delivered back to the render loop so it
 /// never has to block on the async work itself. Tool results and turn
@@ -62,7 +83,10 @@ pub fn run(
     events: Arc<EventBus>,
     initial_prompt: Option<String>,
 ) -> io::Result<()> {
-    let mut events_rx = agent.subscribe_events();
+    let mut bus = Bus {
+        rx: agent.subscribe_events(),
+        events,
+    };
     let mut app = App::new(
         agent.session_id(),
         agent.profile().to_string(),
@@ -74,6 +98,15 @@ pub fn run(
     show_startup_warnings(&mut app, &agent);
     show_history(&mut app, &harness, agent.session_id());
     let mut agent = Arc::new(agent);
+
+    // A panic anywhere while the TUI owns the terminal must give it back
+    // (raw mode off, main screen) before the panic message is printed.
+    let previous_hook: Arc<PanicHook> = Arc::new(std::panic::take_hook());
+    let chained = previous_hook.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        chained(info);
+    }));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -95,8 +128,7 @@ pub fn run(
         &mut agent,
         &handle,
         &mut harness,
-        &events,
-        &mut events_rx,
+        &mut bus,
         &outcome_tx,
         &outcome_rx,
     );
@@ -104,11 +136,29 @@ pub fn run(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| previous_hook(info)));
 
-    // Stop any in-flight turn and give it a moment to persist what it has
-    // before the process exits (TUI-FR-3: "exit safely with state flush").
-    // If it doesn't finish in time, the in-flight log still lets the next
-    // resume recover it.
+    // TUI-FR-3: "exit safely with state flush".
+    stop_and_close(&agent);
+
+    result
+}
+
+type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync;
+
+/// Leaves raw mode and the alternate screen, ignoring errors — for the
+/// panic hook, where there's nothing better to do.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+}
+
+/// Cancels the agent's turn, gives it a moment to persist what it has, and
+/// closes its session. Waiting matters: a turn still committing after
+/// `close` would mark the session active again. If it doesn't finish in
+/// time, the in-flight log still lets the next resume recover it.
+fn stop_and_close(agent: &Agent) {
     if agent.cancel_turn() {
         for _ in 0..40 {
             if !agent.is_busy() {
@@ -118,13 +168,6 @@ pub fn run(
         }
     }
     let _ = agent.close();
-
-    result
-}
-
-/// Registers a local tool so the `/tool` command has something to run.
-pub fn register_demo_tool(agent: &Agent, name: impl Into<String>, executor: Arc<dyn ToolExecutor>) {
-    agent.register_tool(name, executor);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,13 +177,14 @@ fn event_loop(
     agent: &mut Arc<Agent>,
     handle: &Handle,
     harness: &mut Harness,
-    events: &Arc<EventBus>,
-    events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    bus: &mut Bus,
     outcome_tx: &Sender<AgentOutcome>,
     outcome_rx: &Receiver<AgentOutcome>,
 ) -> io::Result<()> {
     loop {
-        drain_runtime_events(app, events_rx);
+        if drain_runtime_events(app, &mut bus.rx) {
+            recover_prompts(app, agent);
+        }
         drain_outcomes(app, outcome_rx);
         tick_approval_timeout(app, agent);
 
@@ -154,7 +198,7 @@ fn event_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            handle_key(key, app, agent, handle, harness, events, outcome_tx);
+            handle_key(key, app, agent, handle, harness, bus, outcome_tx);
         }
     }
 }
@@ -178,10 +222,14 @@ fn stop_notice(reason: &StopReason) -> Option<String> {
     )
 }
 
+/// Applies every queued event. Returns whether any were missed (the
+/// receiver fell behind), in which case open prompts should be recovered
+/// from the agent (see [`recover_prompts`]).
 fn drain_runtime_events(
     app: &mut App,
     events_rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
-) {
+) -> bool {
+    let mut lagged = false;
     loop {
         match events_rx.try_recv().map(|envelope| envelope.event) {
             Ok(RuntimeEvent::ContextBuilt {
@@ -351,9 +399,45 @@ fn drain_runtime_events(
                     "warning: missed {skipped} runtime event(s) (fell behind); \
                      transcript may be incomplete"
                 ));
+                lagged = true;
                 continue;
             }
         }
+    }
+    lagged
+}
+
+/// After missing events: reopens the approval or question dialog for a
+/// call the agent is still waiting on, since the event that would have
+/// opened it may have been among those missed. Without this the turn would
+/// wait for an answer nobody is asked for.
+fn recover_prompts(app: &mut App, agent: &Agent) {
+    if app.pending_approval.is_none()
+        && let Some(call) = agent.pending_approvals().into_iter().next()
+    {
+        let arguments_pretty = serde_json::to_string(&call.arguments).unwrap_or_default();
+        app.proposed_tool_calls.insert(
+            call.tool_call_id,
+            ProposedToolCall {
+                tool_name: call.tool_name,
+                arguments_pretty,
+                risk: call.risk,
+                source_turn: call.turn_id,
+            },
+        );
+        request_approval(app, call.tool_call_id);
+    }
+    if app.pending_question.is_none()
+        && let Some(question) = agent.pending_questions().into_iter().next()
+    {
+        app.activity = Some("waiting for your answer…".to_string());
+        app.pending_question = Some(PendingQuestion {
+            id: question.question_id,
+            question: question.question,
+            options: question.options,
+            allow_free_text: question.allow_free_text,
+            selected: 0,
+        });
     }
 }
 
@@ -392,11 +476,12 @@ fn request_approval(app: &mut App, tool_call_id: ToolCallId) {
             arguments_pretty: meta.arguments_pretty,
             risk: meta.risk,
             source_turn: meta.source_turn,
-            ticks_remaining: if is_plan {
-                PLAN_APPROVAL_TIMEOUT_TICKS
-            } else {
-                APPROVAL_TIMEOUT_TICKS
-            },
+            deadline: std::time::Instant::now()
+                + if is_plan {
+                    PLAN_APPROVAL_TIMEOUT
+                } else {
+                    APPROVAL_TIMEOUT
+                },
             is_plan,
         });
         if is_plan {
@@ -499,6 +584,20 @@ fn apply_subagent_event(app: &mut App, event: &RuntimeEvent) {
     }
 }
 
+/// The argument of chat command `command` in `input` (`""` when there is
+/// none), or `None` if `input` is a different command or not one at all —
+/// `/profiles` isn't `/profile` with argument `s`.
+fn command_arg<'a>(input: &'a str, command: &str) -> Option<&'a str> {
+    let rest = input.trim().strip_prefix(command)?;
+    if rest.is_empty() {
+        Some("")
+    } else if rest.starts_with(char::is_whitespace) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
 /// How much of a streaming tool call's arguments the activity line shows.
 const ARGS_PREVIEW_CHARS: usize = 60;
 
@@ -576,17 +675,14 @@ fn resolve_approval(app: &mut App, agent: &Agent, id: ToolCallId, decision: Appr
     }
 }
 
-/// Decrements the pending approval's countdown once per render-loop tick
-/// (~80ms — see `event_loop`'s `event::poll` timeout) and auto-denies it
-/// on expiry, per TUI spec §9 ("if approval prompt times out: default
-/// action from policy, recommended deny... show user what action was
-/// applied").
+/// Auto-denies the pending approval once its deadline passes, per TUI spec
+/// §9 ("if approval prompt times out: default action from policy,
+/// recommended deny... show user what action was applied").
 fn tick_approval_timeout(app: &mut App, agent: &Agent) {
-    let Some(approval) = app.pending_approval.as_mut() else {
+    let Some(approval) = app.pending_approval.as_ref() else {
         return;
     };
-    if approval.ticks_remaining > 0 {
-        approval.ticks_remaining -= 1;
+    if std::time::Instant::now() < approval.deadline {
         return;
     }
     let id = approval.id;
@@ -598,6 +694,151 @@ fn tick_approval_timeout(app: &mut App, agent: &Agent) {
     agent.supply_tool_decision(id, ApprovalDecision::DeniedOnce);
 }
 
+/// A key while the approval dialog is open: `y`/`n` (and `a`/`d` for
+/// the session), scrolling a plan, or Esc to cancel the whole turn.
+fn approval_key(key: crossterm::event::KeyEvent, app: &mut App, agent: &Agent) {
+    let Some(approval) = app.pending_approval.clone() else {
+        return;
+    };
+    let decision = match key.code {
+        KeyCode::Char('y') => Some(ApprovalDecision::ApprovedOnce),
+        KeyCode::Char('n') => Some(ApprovalDecision::DeniedOnce),
+        // A plan is approved or not, each time.
+        KeyCode::Char('a') if !approval.is_plan => Some(ApprovalDecision::ApprovedForSession),
+        KeyCode::Char('d') if !approval.is_plan => Some(ApprovalDecision::AlwaysDeniedForSession),
+        // The plan is in the transcript: let it be scrolled.
+        KeyCode::Up if approval.is_plan => {
+            app.scroll_up(1);
+            None
+        }
+        KeyCode::Down if approval.is_plan => {
+            app.scroll_down(1);
+            None
+        }
+        KeyCode::PageUp if approval.is_plan => {
+            app.scroll_up(app.last_viewport_height.max(1));
+            None
+        }
+        KeyCode::PageDown if approval.is_plan => {
+            app.scroll_down(app.last_viewport_height.max(1));
+            None
+        }
+        KeyCode::Esc => {
+            // Esc on the prompt cancels the whole turn, not just the call.
+            app.pending_approval = None;
+            agent.cancel_turn();
+            return;
+        }
+        _ => None,
+    };
+    if let Some(decision) = decision {
+        app.pending_approval = None;
+        resolve_approval(app, agent, approval.id, decision);
+    }
+}
+
+/// A key while a question is open. Returns whether the key was used;
+/// anything else edits the input bar (a free-text answer).
+fn question_key(key: crossterm::event::KeyEvent, app: &mut App, agent: &Agent) -> bool {
+    let Some(question) = app.pending_question.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Up if !question.options.is_empty() => question.move_up(),
+        KeyCode::Down if !question.options.is_empty() => question.move_down(),
+        KeyCode::Esc => {
+            app.pending_question = None;
+            if agent.cancel_turn() {
+                app.activity = Some("cancelling…".to_string());
+            }
+        }
+        KeyCode::Enter
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            if let Some(answer) = question.answer(&app.input) {
+                let id = question.id;
+                app.pending_question = None;
+                app.take_input();
+                app.push_line(Role::User, answer.clone());
+                app.activity = Some("continuing…".to_string());
+                agent.answer_question(id, answer);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// A key while the profile picker is open.
+fn profile_picker_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    agent: &mut Arc<Agent>,
+    harness: &mut Harness,
+    bus: &mut Bus,
+) {
+    match key.code {
+        KeyCode::Up => {
+            if let Some(picker) = app.profile_picker.as_mut() {
+                picker.move_up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(picker) = app.profile_picker.as_mut() {
+                picker.move_down();
+            }
+        }
+        KeyCode::Esc => app.profile_picker = None,
+        KeyCode::Enter => {
+            let selected = app
+                .profile_picker
+                .take()
+                .and_then(|p| p.selected_name().map(str::to_string));
+            if let Some(name) = selected {
+                switch_profile(app, agent, harness, bus, &name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A key while the session picker is open.
+fn session_picker_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    agent: &mut Arc<Agent>,
+    harness: &Harness,
+    bus: &mut Bus,
+) {
+    match key.code {
+        KeyCode::Up => {
+            if let Some(picker) = app.session_picker.as_mut() {
+                picker.move_up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(picker) = app.session_picker.as_mut() {
+                picker.move_down();
+            }
+        }
+        KeyCode::Esc => app.session_picker = None,
+        KeyCode::Enter => {
+            let selected = app
+                .session_picker
+                .as_ref()
+                .and_then(|p| p.selected_session());
+            if let Some(session_id) = selected {
+                resume_session(app, agent, harness, bus, session_id);
+            } else {
+                app.session_picker = None;
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: crossterm::event::KeyEvent,
@@ -605,141 +846,21 @@ fn handle_key(
     agent: &mut Arc<Agent>,
     handle: &Handle,
     harness: &mut Harness,
-    events: &Arc<EventBus>,
+    bus: &mut Bus,
     outcome_tx: &Sender<AgentOutcome>,
 ) {
-    if let Some(approval) = app.pending_approval.clone() {
-        let decision = match key.code {
-            KeyCode::Char('y') => Some(ApprovalDecision::ApprovedOnce),
-            KeyCode::Char('n') => Some(ApprovalDecision::DeniedOnce),
-            // A plan is approved or not, each time.
-            KeyCode::Char('a') if !approval.is_plan => Some(ApprovalDecision::ApprovedForSession),
-            KeyCode::Char('d') if !approval.is_plan => {
-                Some(ApprovalDecision::AlwaysDeniedForSession)
-            }
-            // The plan is in the transcript: let it be scrolled.
-            KeyCode::Up if approval.is_plan => {
-                app.scroll_up(1);
-                None
-            }
-            KeyCode::Down if approval.is_plan => {
-                app.scroll_down(1);
-                None
-            }
-            KeyCode::PageUp if approval.is_plan => {
-                app.scroll_up(app.last_viewport_height.max(1));
-                None
-            }
-            KeyCode::PageDown if approval.is_plan => {
-                app.scroll_down(app.last_viewport_height.max(1));
-                None
-            }
-            KeyCode::Esc => {
-                // Esc on the prompt cancels the whole turn, not just the call.
-                app.pending_approval = None;
-                agent.cancel_turn();
-                return;
-            }
-            _ => None,
-        };
-        if let Some(decision) = decision {
-            app.pending_approval = None;
-            resolve_approval(app, agent, approval.id, decision);
-        }
+    // An open dialog takes the key first.
+    if app.pending_approval.is_some() {
+        return approval_key(key, app, agent);
+    }
+    if app.pending_question.is_some() && question_key(key, app, agent) {
         return;
     }
-
-    if let Some(question) = app.pending_question.as_mut() {
-        match key.code {
-            KeyCode::Up if !question.options.is_empty() => {
-                question.move_up();
-                return;
-            }
-            KeyCode::Down if !question.options.is_empty() => {
-                question.move_down();
-                return;
-            }
-            KeyCode::Esc => {
-                app.pending_question = None;
-                if agent.cancel_turn() {
-                    app.activity = Some("cancelling…".to_string());
-                }
-                return;
-            }
-            KeyCode::Enter
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                if let Some(answer) = question.answer(&app.input) {
-                    let id = question.id;
-                    app.pending_question = None;
-                    app.take_input();
-                    app.push_line(Role::User, answer.clone());
-                    app.activity = Some("continuing…".to_string());
-                    agent.answer_question(id, answer);
-                }
-                return;
-            }
-            // Anything else edits the input bar (a free-text answer).
-            _ => {}
-        }
-    }
-
     if app.profile_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                if let Some(picker) = app.profile_picker.as_mut() {
-                    picker.move_up();
-                }
-            }
-            KeyCode::Down => {
-                if let Some(picker) = app.profile_picker.as_mut() {
-                    picker.move_down();
-                }
-            }
-            KeyCode::Esc => app.profile_picker = None,
-            KeyCode::Enter => {
-                let selected = app
-                    .profile_picker
-                    .take()
-                    .and_then(|p| p.selected_name().map(str::to_string));
-                if let Some(name) = selected {
-                    switch_profile(app, agent, harness, events, &name);
-                }
-            }
-            _ => {}
-        }
-        return;
+        return profile_picker_key(key, app, agent, harness, bus);
     }
-
     if app.session_picker.is_some() {
-        match key.code {
-            KeyCode::Up => {
-                if let Some(picker) = app.session_picker.as_mut() {
-                    picker.move_up();
-                }
-            }
-            KeyCode::Down => {
-                if let Some(picker) = app.session_picker.as_mut() {
-                    picker.move_down();
-                }
-            }
-            KeyCode::Esc => app.session_picker = None,
-            KeyCode::Enter => {
-                let selected = app
-                    .session_picker
-                    .as_ref()
-                    .and_then(|p| p.selected_session());
-                if let Some(session_id) = selected {
-                    resume_session(app, agent, harness, events, session_id);
-                } else {
-                    app.session_picker = None;
-                }
-            }
-            _ => {}
-        }
-        return;
+        return session_picker_key(key, app, agent, harness, bus);
     }
 
     match (key.modifiers, key.code) {
@@ -755,7 +876,7 @@ fn handle_key(
             app.scroll = 0;
             app.follow_tail = true;
         }
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, harness, events),
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => new_session(app, agent, harness, bus),
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => open_session_picker(app, harness),
         (KeyModifiers::CONTROL, KeyCode::Char('p')) => open_profile_picker(app, agent, harness),
         (_, KeyCode::BackTab) => cycle_mode(app, agent),
@@ -772,16 +893,19 @@ fn handle_key(
         (KeyModifiers::ALT, KeyCode::Enter) | (KeyModifiers::SHIFT, KeyCode::Enter) => {
             app.input_insert_newline()
         }
-        (_, KeyCode::Enter) if app.input.trim_start().starts_with("/profile") => {
+        (_, KeyCode::Enter) if command_arg(&app.input, "/profile").is_some() => {
             let command = app.take_input();
-            match command.trim().strip_prefix("/profile").map(str::trim) {
+            match command_arg(&command, "/profile") {
                 Some("") => open_profile_picker(app, agent, harness),
-                Some(name) => switch_profile(app, agent, harness, events, name),
+                Some(name) => {
+                    let name = name.to_string();
+                    switch_profile(app, agent, harness, bus, &name)
+                }
                 None => {}
             }
         }
         (_, KeyCode::Enter) if app.input.trim() == "/clear" => {
-            clear_session(app, agent, harness, events);
+            clear_session(app, agent, harness, bus);
         }
         (_, KeyCode::Enter) => submit_input(app, agent, handle, outcome_tx),
         (_, KeyCode::Backspace) => app.input_backspace(),
@@ -797,11 +921,18 @@ fn handle_key(
 
 /// Replaces the running agent (new session / resume) and resets the view.
 /// The old agent's turn, if any, is cancelled (it persists what it has) and
-/// its session closed. The new agent shares the same `EventBus`, so the
-/// existing event subscription keeps working.
-fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
-    agent.cancel_turn();
-    let _ = agent.close();
+/// its session closed. The new agent comes with its own bus (`fresh`),
+/// which replaces the old one, so nothing the old session still publishes
+/// reaches the new transcript.
+fn swap_in_agent(
+    app: &mut App,
+    agent: &mut Arc<Agent>,
+    bus: &mut Bus,
+    fresh: Bus,
+    new_agent: Agent,
+) {
+    stop_and_close(agent);
+    *bus = fresh;
     app.session_id = new_agent.session_id();
     app.profile = new_agent.profile().to_string();
     app.provider_name = new_agent.provider_name().to_string();
@@ -813,6 +944,8 @@ fn swap_in_agent(app: &mut App, agent: &mut Arc<Agent>, new_agent: Agent) {
     app.last_estimated_tokens = new_agent.last_estimated_tokens();
     app.clear_transcript();
     app.pending_approval = None;
+    app.pending_question = None;
+    app.streaming_tool_args.clear();
     app.proposed_tool_calls.clear();
     app.status_message = None;
     app.notice = None;
@@ -837,8 +970,8 @@ fn show_startup_warnings(app: &mut App, agent: &Agent) {
     }
 }
 
-fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events: &Arc<EventBus>) {
-    if start_fresh_session(app, agent, harness, events) {
+fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, bus: &mut Bus) {
+    if start_fresh_session(app, agent, harness, bus) {
         app.notice = Some("started a new session".to_string());
     }
 }
@@ -847,29 +980,30 @@ fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events:
 /// disk and can be resumed) plus an empty transcript. Refused while a
 /// turn is running, like the other chat commands — the typed command
 /// stays in the input box.
-fn clear_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events: &Arc<EventBus>) {
+fn clear_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, bus: &mut Bus) {
     if agent.is_busy() {
         app.notice =
             Some("a turn is in progress — wait for it, or press Esc to cancel".to_string());
         return;
     }
     let _ = app.take_input();
-    if start_fresh_session(app, agent, harness, events) {
+    if start_fresh_session(app, agent, harness, bus) {
         app.notice = Some("cleared the conversation and started a fresh session".to_string());
     }
 }
 
-/// Closes the current session and opens a new one on the same event bus.
+/// Closes the current session and opens a new one on a new event bus.
 /// Returns whether that succeeded. The caller sets the notice.
 fn start_fresh_session(
     app: &mut App,
     agent: &mut Arc<Agent>,
     harness: &Harness,
-    events: &Arc<EventBus>,
+    bus: &mut Bus,
 ) -> bool {
-    match harness.create_agent(events.clone()) {
+    let fresh = Bus::new();
+    match harness.create_agent(fresh.events.clone()) {
         Ok(new_agent) => {
-            swap_in_agent(app, agent, new_agent);
+            swap_in_agent(app, agent, bus, fresh, new_agent);
             true
         }
         Err(err) => {
@@ -903,7 +1037,7 @@ fn switch_profile(
     app: &mut App,
     agent: &mut Arc<Agent>,
     harness: &mut Harness,
-    events: &Arc<EventBus>,
+    bus: &mut Bus,
     name: &str,
 ) {
     if agent.is_busy() {
@@ -921,8 +1055,10 @@ fn switch_profile(
     let session_id = agent.session_id();
     // Close first: the reopened session must end up marked open.
     let _ = agent.close();
-    match switched.resume_agent(session_id, events.clone()) {
+    let fresh = Bus::new();
+    match switched.resume_agent(session_id, fresh.events.clone()) {
         Ok(new_agent) => {
+            *bus = fresh;
             app.profile = new_agent.profile().to_string();
             app.provider_name = new_agent.provider_name().to_string();
             app.model = new_agent.model().to_string();
@@ -938,8 +1074,17 @@ fn switch_profile(
         Err(err) => {
             app.status_message = Some(format!("can't switch to profile {name}: {err}"));
             // Reopen it as it was.
-            if let Ok(previous) = harness.resume_agent(session_id, events.clone()) {
-                *agent = Arc::new(previous);
+            let fresh = Bus::new();
+            match harness.resume_agent(session_id, fresh.events.clone()) {
+                Ok(previous) => {
+                    *bus = fresh;
+                    *agent = Arc::new(previous);
+                }
+                Err(err) => {
+                    app.status_message = Some(format!(
+                        "can't switch to profile {name}, and reopening the session failed too: {err}"
+                    ));
+                }
             }
         }
     }
@@ -956,12 +1101,13 @@ fn resume_session(
     app: &mut App,
     agent: &mut Arc<Agent>,
     harness: &Harness,
-    events: &Arc<EventBus>,
+    bus: &mut Bus,
     session_id: SessionId,
 ) {
-    match harness.resume_agent(session_id, events.clone()) {
+    let fresh = Bus::new();
+    match harness.resume_agent(session_id, fresh.events.clone()) {
         Ok(new_agent) => {
-            swap_in_agent(app, agent, new_agent);
+            swap_in_agent(app, agent, bus, fresh, new_agent);
             show_history(app, harness, session_id);
             app.notice = Some(format!("resumed session {session_id}"));
         }
@@ -1071,8 +1217,13 @@ fn submit_input(
             return;
         };
         let name = name.to_string();
-        let arguments: serde_json::Value =
-            serde_json::from_str(args_text).unwrap_or(serde_json::json!({}));
+        let arguments: serde_json::Value = match serde_json::from_str(args_text) {
+            Ok(arguments) => arguments,
+            Err(err) => {
+                app.status_message = Some(format!("/tool: the arguments aren't valid JSON: {err}"));
+                return;
+            }
+        };
         let agent = agent.clone();
         let tx = outcome_tx.clone();
         // Same gated path as a model-initiated call: its approval prompt
@@ -1147,7 +1298,10 @@ mod tests {
         assert!(last.content.ends_with("1. do the thing"));
         let approval = app.pending_approval.as_ref().unwrap();
         assert!(approval.is_plan);
-        assert_eq!(approval.ticks_remaining, PLAN_APPROVAL_TIMEOUT_TICKS);
+        let left = approval
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(left > APPROVAL_TIMEOUT && left <= PLAN_APPROVAL_TIMEOUT);
         assert_eq!(app.mode, "default");
         assert!(app.notice.as_deref().unwrap().starts_with("default mode"));
     }
@@ -1177,7 +1331,7 @@ mod tests {
             arguments_pretty: "{}".into(),
             risk: arbe_runtime::arbe_core::RiskLevel::High,
             source_turn: TurnId::new(),
-            ticks_remaining: 10,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
             is_plan: false,
         });
         tx.send(EventEnvelope {
@@ -1248,6 +1402,47 @@ mod tests {
     }
 
     #[test]
+    fn chat_commands_match_whole_words_only() {
+        assert_eq!(command_arg("/profile", "/profile"), Some(""));
+        assert_eq!(command_arg("  /profile  grok ", "/profile"), Some("grok"));
+        assert_eq!(command_arg("/profiles", "/profile"), None);
+        assert_eq!(command_arg("hello /profile", "/profile"), None);
+    }
+
+    #[test]
+    fn an_expired_approval_is_denied_on_time_not_on_keypresses() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = arbe_runtime::RuntimeConfig::defaults(project.path().to_path_buf());
+        config.home = home.path().to_path_buf();
+        let harness = arbe_runtime::Harness::builder()
+            .config(config)
+            .build()
+            .unwrap();
+        let agent = harness.create_agent(Arc::new(EventBus::new(16))).unwrap();
+        let mut app = test_app();
+        let approval = |deadline| PendingApproval {
+            id: ToolCallId::new(),
+            tool_name: "execute".into(),
+            arguments_pretty: "{}".into(),
+            risk: arbe_runtime::arbe_core::RiskLevel::High,
+            source_turn: TurnId::new(),
+            deadline,
+            is_plan: false,
+        };
+        let now = std::time::Instant::now();
+        app.pending_approval = Some(approval(now + std::time::Duration::from_secs(60)));
+        for _ in 0..1_000 {
+            tick_approval_timeout(&mut app, &agent);
+        }
+        assert!(app.pending_approval.is_some(), "still within its time");
+        app.pending_approval = Some(approval(now));
+        tick_approval_timeout(&mut app, &agent);
+        assert!(app.pending_approval.is_none());
+        assert!(app.status_message.unwrap().contains("auto-denied"));
+    }
+
+    #[test]
     fn clear_starts_a_fresh_session_and_keeps_the_previous_one() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -1257,8 +1452,9 @@ mod tests {
             .config(config)
             .build()
             .unwrap();
-        let events = Arc::new(EventBus::new(16));
-        let created = harness.create_agent(events.clone()).unwrap();
+        let mut bus = Bus::new();
+        let created = harness.create_agent(bus.events.clone()).unwrap();
+        let old_events = bus.events.clone();
         let previous = created.session_id();
         let mut agent = Arc::new(created);
         let mut app = App::new(
@@ -1273,9 +1469,18 @@ mod tests {
         app.input_cursor = app.input.len();
         app.session_tokens = 42;
 
-        clear_session(&mut app, &mut agent, &harness, &events);
+        clear_session(&mut app, &mut agent, &harness, &mut bus);
 
         assert_ne!(agent.session_id(), previous);
+        // The new session has its own bus: whatever the old one still
+        // publishes never reaches the new transcript.
+        assert!(!Arc::ptr_eq(&old_events, &bus.events));
+        old_events.publish(RuntimeEvent::ModelStreamChunk {
+            turn_id: TurnId::new(),
+            delta: "late text from the old session".into(),
+        });
+        drain_runtime_events(&mut app, &mut bus.rx);
+        assert!(app.transcript.is_empty());
         assert_eq!(app.session_id, agent.session_id());
         assert!(app.transcript.is_empty());
         assert!(app.input.is_empty());

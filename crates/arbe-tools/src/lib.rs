@@ -75,9 +75,32 @@ pub trait ApprovalPolicy: Send + Sync {
     fn decide(
         &self,
         invocation: &ToolInvocation,
-        subject: Option<&str>,
+        subject: Option<Subject<'_>>,
         ctx: &ApprovalContext,
     ) -> PolicyOutcome;
+}
+
+/// What kind of thing a tool's [`subject`](ToolExecutor::subject) is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubjectKind {
+    /// A path inside the project (file tools). Nested instruction files
+    /// for the directories it touches are shown with the result.
+    Path,
+    /// A shell command line (`execute`). An allow rule's `*` never
+    /// auto-approves a command that chains, pipes or redirects beyond what
+    /// the rule spells out (see `ToolRule::chains_beyond`).
+    ShellCommand,
+    /// Anything else: a URL, a query, a handle.
+    #[default]
+    Other,
+}
+
+/// What a call acts on, as permission rules see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subject<'a> {
+    /// A path, a command line, a URL, ... (see `ToolExecutor::subject`).
+    pub text: &'a str,
+    pub kind: SubjectKind,
 }
 
 /// What the model is told about a tool: a description and a JSON Schema
@@ -285,6 +308,12 @@ pub trait ToolExecutor: Send + Sync {
     /// default) means rules can only match this tool by name.
     fn subject(&self, _arguments: &Value) -> Option<String> {
         None
+    }
+
+    /// What kind of thing [`subject`](Self::subject) returns (see
+    /// [`SubjectKind`]).
+    fn subject_kind(&self) -> SubjectKind {
+        SubjectKind::Other
     }
 }
 

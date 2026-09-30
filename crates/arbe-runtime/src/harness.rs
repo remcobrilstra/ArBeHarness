@@ -47,7 +47,7 @@ use crate::{Agent, EventBus, RuntimeConfig};
 
 /// How many events a session buffers for a slow reader before the oldest
 /// are dropped (the reader then skips ahead; the turn itself never waits).
-const EVENT_BUFFER: usize = 4_096;
+const EVENT_BUFFER: usize = crate::event_bus::DEFAULT_CAPACITY;
 
 /// Configures a [`Harness`]. By default configuration is loaded the same
 /// way the `arbeharness` binary loads it: built-in defaults, the global
@@ -216,6 +216,14 @@ impl ConfigSource {
     }
 }
 
+/// Switching profiles needs the configuration's sources, which a harness
+/// built from a finished `RuntimeConfig` doesn't have.
+fn fixed_configuration() -> HarnessError {
+    HarnessError::Config(ConfigError::Conflict(
+        "this harness was built from a fixed configuration, so it can't switch profiles".into(),
+    ))
+}
+
 /// A configured harness: opens, resumes and lists sessions.
 pub struct Harness {
     config: RuntimeConfig,
@@ -244,12 +252,8 @@ impl Harness {
     /// Every profile this harness could switch to (see
     /// [`with_profile`](Self::with_profile)), sorted by name.
     pub fn profiles(&self) -> Result<Vec<ProfileInfo>, HarnessError> {
-        let source = self.source.as_ref().ok_or_else(|| {
-            HarnessError::Internal("this harness was built from a fixed configuration".into())
-        })?;
-        source
-            .profiles()
-            .map_err(|e| HarnessError::Internal(e.to_string()))
+        let source = self.source.as_ref().ok_or_else(fixed_configuration)?;
+        source.profiles().map_err(HarnessError::Config)
     }
 
     /// The same harness configured for another profile: same config files,
@@ -260,17 +264,16 @@ impl Harness {
     /// To move a conversation, resume it on the returned harness: history
     /// is provider-neutral, and the session records its new model.
     pub fn with_profile(&self, name: &str) -> Result<Harness, HarnessError> {
-        let source = self.source.as_ref().ok_or_else(|| {
-            HarnessError::Internal("this harness was built from a fixed configuration".into())
-        })?;
+        let source = self.source.as_ref().ok_or_else(fixed_configuration)?;
         let profiles = self.profiles()?;
         let profile = profiles.iter().find(|p| p.name == name).ok_or_else(|| {
             let known: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-            HarnessError::Internal(format!("no profile {name:?} (known: {})", known.join(", ")))
+            HarnessError::Config(ConfigError::MissingValue(format!(
+                "no profile {name:?} (known: {})",
+                known.join(", ")
+            )))
         })?;
-        let config = source
-            .load(Some(profile))
-            .map_err(|e| HarnessError::Internal(e.to_string()))?;
+        let config = source.load(Some(profile)).map_err(HarnessError::Config)?;
         Ok(Harness {
             store: SessionStore::with_root(config.home.join("sessions")),
             config,
@@ -331,7 +334,7 @@ impl Harness {
         let mut sessions = self
             .store
             .list_sessions()
-            .map_err(|e| HarnessError::Internal(e.to_string()))?;
+            .map_err(|e| HarnessError::Storage(e.to_string()))?;
         sessions.retain(|s| s.parent.is_none());
         sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         Ok(sessions)
@@ -429,14 +432,14 @@ impl Session {
     pub fn set_title(&self, title: impl Into<String>) -> Result<(), HarnessError> {
         self.agent
             .set_title(title)
-            .map_err(|e| HarnessError::Internal(e.to_string()))
+            .map_err(|e| HarnessError::Storage(e.to_string()))
     }
 
     /// Marks the session closed on disk.
     pub fn close(&self) -> Result<(), HarnessError> {
         self.agent
             .close()
-            .map_err(|e| HarnessError::Internal(e.to_string()))
+            .map_err(|e| HarnessError::Storage(e.to_string()))
     }
 }
 

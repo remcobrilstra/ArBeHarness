@@ -32,7 +32,7 @@ pub(super) fn load_session_skills(
         .chain(&project.problems)
         .map(|p| format!("skill skipped — {p}"))
         .collect();
-    let merged = arbe_skills::merge_skills(Vec::new(), project.skills, global.skills);
+    let merged = arbe_skills::merge_skills(project.skills, global.skills);
     (SkillSet::new(merged), problems)
 }
 

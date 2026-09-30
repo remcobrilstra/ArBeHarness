@@ -163,12 +163,12 @@ fn api_block(block: &ContentBlock) -> Option<Value> {
 /// content). Tool messages become user messages; consecutive same-role
 /// messages are merged, since roles must alternate; tool results are moved
 /// to the front of their user message, as the API requires. Cache
-/// breakpoints go on the last system block (caching tools + system), on
-/// any message flagged `cache_breakpoint`, and on the final message (so the
-/// next request in a tool loop reads the whole conversation from cache).
+/// breakpoints go on the last system block (caching tools + system) and on
+/// the final message (so the next request in a tool loop reads the whole
+/// conversation from cache).
 fn split_conversation(messages: &[Message]) -> (Vec<Value>, Vec<ApiMessage>) {
     let mut system = Vec::new();
-    let mut out: Vec<(ApiMessage, bool)> = Vec::new();
+    let mut out: Vec<ApiMessage> = Vec::new();
 
     for message in messages {
         if message.role == Role::System {
@@ -184,53 +184,35 @@ fn split_conversation(messages: &[Message]) -> (Vec<Value>, Vec<ApiMessage>) {
             continue;
         }
         match out.last_mut() {
-            Some((last, breakpoint)) if last.role == role => {
-                last.content.extend(blocks);
-                *breakpoint |= message.cache_breakpoint;
-            }
-            _ => out.push((
-                ApiMessage {
-                    role,
-                    content: blocks,
-                },
-                message.cache_breakpoint,
-            )),
+            Some(last) if last.role == role => last.content.extend(blocks),
+            _ => out.push(ApiMessage {
+                role,
+                content: blocks,
+            }),
         }
     }
 
     // The conversation must open with a user turn; history trimming can
     // leave an assistant message first.
-    if out.first().is_some_and(|(m, _)| m.role == "assistant") {
+    if out.first().is_some_and(|m| m.role == "assistant") {
         out.insert(
             0,
-            (
-                ApiMessage {
-                    role: "user",
-                    content: vec![
-                        json!({ "type": "text", "text": "[earlier conversation omitted]" }),
-                    ],
-                },
-                false,
-            ),
+            ApiMessage {
+                role: "user",
+                content: vec![json!({ "type": "text", "text": "[earlier conversation omitted]" })],
+            },
         );
     }
 
-    let last_index = out.len().saturating_sub(1);
-    let messages = out
-        .into_iter()
-        .enumerate()
-        .map(|(i, (mut message, breakpoint))| {
-            if message.role == "user" {
-                message.content.sort_by_key(|b| b["type"] != "tool_result");
-            }
-            if (breakpoint || i == last_index)
-                && let Some(last) = message.content.last_mut()
-            {
-                last["cache_control"] = cache_control();
-            }
-            message
-        })
-        .collect();
+    for message in &mut out {
+        if message.role == "user" {
+            message.content.sort_by_key(|b| b["type"] != "tool_result");
+        }
+    }
+    if let Some(last) = out.last_mut().and_then(|m| m.content.last_mut()) {
+        last["cache_control"] = cache_control();
+    }
+    let messages = out;
 
     if let Some(last) = system.last_mut() {
         last["cache_control"] = cache_control();

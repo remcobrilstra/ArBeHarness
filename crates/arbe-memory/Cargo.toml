@@ -8,10 +8,10 @@ publish.workspace = true
 [dependencies]
 arbe-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-serde_json = { workspace = true }
 
 [[bench]]
 name = "context"

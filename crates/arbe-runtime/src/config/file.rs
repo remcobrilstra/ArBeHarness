@@ -53,9 +53,19 @@ impl Layer {
     ///   `provider.api_key_env`, `provider.headers`;
     /// - how tool calls are approved: `[approval]`;
     /// - programs started automatically: `[mcp]`;
+    /// - files read into every request: a `prompt` template file (it could
+    ///   name any file on the machine; the built-in templates stay allowed);
     /// - trust itself: `trusted_projects`.
     pub fn strip_sensitive(&mut self) -> Vec<&'static str> {
         let mut removed = Vec::new();
+        if self
+            .prompt
+            .as_deref()
+            .is_some_and(|p| !matches!(p, "coding" | "general"))
+        {
+            self.prompt = None;
+            removed.push("prompt (a template file)");
+        }
         if let Some(provider) = &mut self.provider {
             if provider.base_url.take().is_some() {
                 removed.push("provider.base_url");
@@ -204,6 +214,10 @@ pub struct CommandHookEntry {
     pub phase: String,
     pub command: String,
     pub timeout_ms: Option<u64>,
+    /// `"block"` or `"skip"`: what a failure of this hook does. Default:
+    /// `"block"` for `before_tool_execute` (a guard that can't run doesn't
+    /// let the call through), `"skip"` for the others.
+    pub on_failure: Option<String>,
 }
 
 /// `[[models]]`: corrects the built-in model catalog for one model.

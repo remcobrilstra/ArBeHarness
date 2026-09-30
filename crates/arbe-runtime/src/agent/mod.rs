@@ -27,6 +27,9 @@ mod turn;
 #[cfg(test)]
 mod tests;
 
+pub use approvals::PendingDecision;
+pub use ask::PendingQuestion;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
@@ -38,7 +41,7 @@ use arbe_core::{
 };
 use arbe_hooks::HookRegistry;
 use arbe_memory::{
-    CompactWithSummaryStrategy, ContextPipeline, ContextStrategy, HistoryEntry, TokenCalibration,
+    ContextPipeline, ContextStrategy, HistoryEntry, TokenCalibration, TruncateWithNoticeStrategy,
     TruncationStrategy,
 };
 use arbe_providers::{
@@ -125,6 +128,8 @@ pub struct Agent {
     allowed_tools: Option<Vec<String>>,
     /// This session's MCP servers, if any are configured.
     mcp: Option<Arc<McpManager>>,
+    /// Which registry names belong to which MCP server (see `RegistrySink`).
+    mcp_tools: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
     /// Shared by a whole tree of subagents: answering here answers any of
     /// them.
     decisions: Arc<ToolDecisions>,
@@ -217,17 +222,11 @@ fn title_from(message: &str) -> Option<String> {
 
 fn build_strategy(name: &str) -> Box<dyn ContextStrategy> {
     match name {
-        "compact_summary" => Box::new(CompactWithSummaryStrategy),
+        "compact_summary" => Box::new(TruncateWithNoticeStrategy),
         _ => Box::new(TruncationStrategy),
     }
 }
 
-/// Reads `<arbe_home>/instructions/agent.md` and
-/// `<project_dir>/agent.md`/`CLAUDE.md`, then renders them into the system
-/// prompt template (`crate::system_prompt`). Re-read on every turn rather
-/// than cached, so edits take effect on the next turn without restarting.
-/// A read error degrades to an absent section — instructions are additive,
-/// not load-bearing, so a transient error can't take down a turn.
 /// A rendered system prompt, and how many (estimated) tokens of it are
 /// instruction files rather than the template's own text.
 struct SystemPrompt {
@@ -247,6 +246,12 @@ impl SystemPrompt {
     }
 }
 
+/// Reads `<arbe_home>/instructions/agent.md` and
+/// `<project_dir>/agent.md`/`CLAUDE.md`, then renders them into the system
+/// prompt template (`crate::system_prompt`). Re-read on every turn rather
+/// than cached, so edits take effect on the next turn without restarting.
+/// A read error degrades to an absent section — instructions are additive,
+/// not load-bearing, so a transient error can't take down a turn.
 fn build_system_prompt(template: &PromptTemplate, project_dir: &Path, home: &Path) -> SystemPrompt {
     let global =
         arbe_storage::instructions::read_global_instructions_at(home).unwrap_or_else(|err| {
@@ -383,6 +388,7 @@ impl Agent {
             registry: Arc::new(RwLock::new(Arc::new(parts.registry))),
             allowed_tools: parts.allowed_tools,
             mcp: None,
+            mcp_tools: Arc::default(),
             startup_warnings: parts.startup_warnings,
             redactor: parts.redactor,
             decisions: parts.decisions,
@@ -408,19 +414,14 @@ impl Agent {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn assemble(
+    /// The configured provider. Built before a session is created or
+    /// reopened, so a provider that can't start (no key, not signed in,
+    /// bad address) leaves no half-open session behind.
+    fn build_provider(
         config: &RuntimeConfig,
         providers: &ProviderRegistry,
-        store: SessionStore,
-        meta: SessionMeta,
-        events: Arc<EventBus>,
-        history: Vec<HistoryEntry>,
-        next_turn_index: u64,
-        summary: Option<Compaction>,
-        lineage: subagent::Lineage,
-    ) -> Result<Self, ProviderError> {
-        let provider = providers.build(
+    ) -> Result<Box<dyn ModelProvider>, ProviderError> {
+        providers.build(
             &config.provider_name,
             ProviderSettings {
                 api_key: config.api_key.clone(),
@@ -429,7 +430,22 @@ impl Agent {
                 catalog: config.catalog.clone(),
                 auth_dir: Some(arbe_providers::auth::auth_dir(&config.home)),
             },
-        )?;
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        config: &RuntimeConfig,
+        providers: &ProviderRegistry,
+        provider: Box<dyn ModelProvider>,
+        store: SessionStore,
+        meta: SessionMeta,
+        events: Arc<EventBus>,
+        history: Vec<HistoryEntry>,
+        next_turn_index: u64,
+        summary: Option<Compaction>,
+        lineage: subagent::Lineage,
+    ) -> Result<Self, ProviderError> {
         let mut registry = ToolRegistry::new();
         arbe_tools::builtin::register_all(&mut registry, &config.project_dir);
         registry.register(
@@ -553,7 +569,8 @@ impl Agent {
                     hooks.register(Arc::new(
                         arbe_hooks::CommandHook::new(h.phase, h.command.clone())
                             .in_dir(config.project_dir.clone())
-                            .with_timeout(h.timeout),
+                            .with_timeout(h.timeout)
+                            .blocking_on_failure(h.block_on_failure),
                     ));
                 }
                 hooks
@@ -617,6 +634,7 @@ impl Agent {
         RegistrySink {
             registry: self.registry.clone(),
             allowed: self.allowed_tools.clone(),
+            owned: self.mcp_tools.clone(),
         }
     }
 
@@ -644,6 +662,7 @@ impl Agent {
         events: Arc<EventBus>,
         providers: &ProviderRegistry,
     ) -> Result<Self, ProviderError> {
+        let provider = Self::build_provider(config, providers)?;
         let mut meta = store
             .create_session(
                 config.profile.clone(),
@@ -660,6 +679,7 @@ impl Agent {
         Self::assemble(
             config,
             providers,
+            provider,
             store,
             meta,
             events,
@@ -679,6 +699,7 @@ impl Agent {
         providers: &ProviderRegistry,
         lineage: subagent::Lineage,
     ) -> Result<Self, ProviderError> {
+        let provider = Self::build_provider(config, providers)?;
         let mut meta = store
             .create_session(
                 config.profile.clone(),
@@ -694,6 +715,7 @@ impl Agent {
         Self::assemble(
             config,
             providers,
+            provider,
             store,
             meta,
             events,
@@ -730,6 +752,7 @@ impl Agent {
         events: Arc<EventBus>,
         providers: &ProviderRegistry,
     ) -> Result<Self, ProviderError> {
+        let provider = Self::build_provider(config, providers)?;
         let mut meta = store
             .resume_session(session_id)
             .map_err(|e| ProviderError::Internal(format!("failed to resume session: {e}")))?;
@@ -762,6 +785,7 @@ impl Agent {
         Self::assemble(
             config,
             providers,
+            provider,
             store,
             meta,
             events,
@@ -980,6 +1004,19 @@ impl Agent {
         self.questions.answer(id, answer.into())
     }
 
+    /// Tool calls waiting for a decision right now — this agent's and its
+    /// subagents'. For a UI that missed `ToolApprovalRequested` (it fell
+    /// behind, or attached late).
+    pub fn pending_approvals(&self) -> Vec<PendingDecision> {
+        self.decisions.pending()
+    }
+
+    /// Questions (`ask_user`) waiting for an answer right now, this
+    /// agent's and its subagents'.
+    pub fn pending_questions(&self) -> Vec<PendingQuestion> {
+        self.questions.pending()
+    }
+
     /// Answers a `ToolApprovalRequested` prompt. Returns `false` if nothing
     /// is waiting on `id` (already answered, timed out, or cancelled).
     pub fn supply_tool_decision(&self, id: ToolCallId, decision: ApprovalDecision) -> bool {
@@ -1058,23 +1095,34 @@ impl Agent {
 struct RegistrySink {
     registry: Arc<RwLock<Arc<ToolRegistry>>>,
     allowed: Option<Vec<String>>,
+    /// The registry names each server's tools were given, so a refresh
+    /// replaces exactly those — not everything sharing a name prefix, which
+    /// could belong to another server.
+    owned: Arc<Mutex<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 impl ToolSink for RegistrySink {
     fn replace_server_tools(&self, server: &str, tools: Vec<(String, Arc<dyn ToolExecutor>)>) {
-        let prefix = arbe_mcp::server_prefix(server);
+        let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         let mut guard = self.registry.write().unwrap_or_else(|p| p.into_inner());
         let registry = Arc::make_mut(&mut guard);
-        registry.retain(|name| !name.starts_with(&prefix));
+        let previous = owned.remove(server).unwrap_or_default();
+        registry.retain(|name| !previous.iter().any(|p| p == name));
+        let mut names = Vec::new();
         for (name, executor) in tools {
             if self
                 .allowed
                 .as_ref()
                 .is_none_or(|allowed| tool_allowed(allowed, &name))
             {
-                registry.register(name, executor);
+                // Never over another tool (builtin, another server's, or a
+                // sibling whose name sanitized to the same thing).
+                let name = arbe_mcp::unique_tool_name(&name, |n| registry.contains(n));
+                registry.register(name.clone(), executor);
+                names.push(name);
             }
         }
+        owned.insert(server.to_string(), names);
     }
 }
 

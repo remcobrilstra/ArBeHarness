@@ -86,10 +86,6 @@ pub struct Message {
     #[serde(deserialize_with = "content_compat")]
     pub content: Vec<ContentBlock>,
     pub timestamp: DateTime<Utc>,
-    /// Prompt-caching hint: the provider may cache the prompt prefix up to
-    /// and including this message. Providers without caching ignore it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub cache_breakpoint: bool,
 }
 
 impl Message {
@@ -109,7 +105,6 @@ impl Message {
             role,
             content,
             timestamp: Utc::now(),
-            cache_breakpoint: false,
         }
     }
 
@@ -261,8 +256,6 @@ mod tests {
         assert_eq!(v["content"][0]["type"], "tool_result");
         assert_eq!(v["content"][0]["tool_use_id"], "c1");
         assert_eq!(v["content"][0]["content"][0]["text"], "ok");
-        // Default cache flag is omitted from the wire/persisted form.
-        assert!(v.get("cache_breakpoint").is_none());
     }
 
     #[test]

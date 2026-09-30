@@ -119,7 +119,7 @@ impl Inner {
             let mut body = response.bytes_stream();
             while let Some(chunk) = body.next().await {
                 let chunk = chunk.map_err(|e| McpError::Transport(e.to_string()))?;
-                for data in decoder.push(&String::from_utf8_lossy(&chunk)) {
+                for data in decoder.push(&chunk) {
                     self.receive(&data);
                 }
             }
@@ -201,16 +201,30 @@ impl Transport for HttpTransport {
 
 /// Minimal server-sent-events decoder: returns each event's `data`
 /// (multi-line data joined with `\n`), buffering partial lines across
-/// chunks.
+/// chunks — and partial UTF-8 characters: a network chunk can end in the
+/// middle of one, and decoding each chunk on its own would turn it into
+/// `�`.
 #[derive(Default)]
 struct SseDecoder {
+    /// Bytes of a character whose remaining bytes haven't arrived yet.
+    pending: Vec<u8>,
     buffer: String,
     data: Vec<String>,
 }
 
 impl SseDecoder {
-    fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.buffer.push_str(chunk);
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(chunk);
+        let complete = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            // An incomplete sequence at the end: keep it for the next chunk.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            // Invalid bytes: decode lossily, don't hold them forever.
+            Err(_) => self.pending.len(),
+        };
+        let text = String::from_utf8_lossy(&self.pending[..complete]).into_owned();
+        self.pending.drain(..complete);
+        self.buffer.push_str(&text);
         let mut events = Vec::new();
         while let Some(pos) = self.buffer.find('\n') {
             let line = self.buffer[..pos].trim_end_matches('\r').to_string();
@@ -236,11 +250,27 @@ mod tests {
     #[test]
     fn sse_events_are_split_on_blank_lines_across_chunks() {
         let mut decoder = SseDecoder::default();
-        assert!(decoder.push("event: message\ndata: {\"a\"").is_empty());
-        assert_eq!(decoder.push(":1}\r\n\r\n"), vec![r#"{"a":1}"#.to_string()]);
+        assert!(decoder.push(b"event: message\ndata: {\"a\"").is_empty());
+        assert_eq!(decoder.push(b":1}\r\n\r\n"), vec![r#"{"a":1}"#.to_string()]);
         assert_eq!(
-            decoder.push("data: line1\ndata: line2\n\n: comment\n\n"),
+            decoder.push(b"data: line1\ndata: line2\n\n: comment\n\n"),
             vec!["line1\nline2".to_string()]
         );
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_survives() {
+        let mut decoder = SseDecoder::default();
+        let event = "data: {\"text\":\"café 🎉\"}\n\n".as_bytes();
+        // Cut inside the emoji (and after the é's first byte, separately).
+        let cut_emoji = event.len() - 6;
+        let mut out = decoder.push(&event[..cut_emoji]);
+        out.extend(decoder.push(&event[cut_emoji..]));
+        assert_eq!(out, vec![r#"{"text":"café 🎉"}"#.to_string()]);
+
+        let e_acute = event.iter().position(|b| *b == 0xC3).unwrap();
+        let mut out = decoder.push(&event[..=e_acute]);
+        out.extend(decoder.push(&event[e_acute + 1..]));
+        assert_eq!(out, vec![r#"{"text":"café 🎉"}"#.to_string()]);
     }
 }

@@ -119,8 +119,10 @@ pub struct ContextUsage {
     pub budget_tokens: u64,
     /// The model's context window.
     pub context_window: u64,
-    /// History share of the budget at which automatic compaction starts,
-    /// if it's on (`memory_strategy = "compact_summary"`).
+    /// How big history may grow before automatic compaction starts, if
+    /// it's on (`memory_strategy = "compact_summary"`): a share of the
+    /// budget left after the fixed costs (instructions, skills, memory,
+    /// tool definitions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_threshold_tokens: Option<u64>,
 }

@@ -1,8 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use arbe_core::{ApprovalDecision, ToolCallId};
+use arbe_core::{ApprovalDecision, RiskLevel, ToolCallId, TurnId};
+use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::oneshot;
+
+/// A tool call waiting for a human decision — what the
+/// `ToolCallProposed`/`ToolApprovalRequested` events said about it, kept so
+/// a UI that missed them (fell behind, reconnected) can still ask.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingDecision {
+    pub tool_call_id: ToolCallId,
+    pub turn_id: TurnId,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub risk: RiskLevel,
+}
 
 /// Mailbox for human decisions on tool calls that are paused awaiting
 /// approval mid-turn. The waiting turn registers a call and awaits the
@@ -10,13 +24,19 @@ use tokio::sync::oneshot;
 /// since `Agent`'s methods take `&self`) delivers the decision.
 #[derive(Default)]
 pub(super) struct ToolDecisions {
-    waiting: Mutex<HashMap<ToolCallId, oneshot::Sender<ApprovalDecision>>>,
+    waiting: Mutex<HashMap<ToolCallId, Waiting>>,
+}
+
+struct Waiting {
+    reply: oneshot::Sender<ApprovalDecision>,
+    call: PendingDecision,
 }
 
 impl ToolDecisions {
-    pub(super) fn register(&self, id: ToolCallId) -> oneshot::Receiver<ApprovalDecision> {
-        let (tx, rx) = oneshot::channel();
-        self.lock().insert(id, tx);
+    pub(super) fn register(&self, call: PendingDecision) -> oneshot::Receiver<ApprovalDecision> {
+        let (reply, rx) = oneshot::channel();
+        self.lock()
+            .insert(call.tool_call_id, Waiting { reply, call });
         rx
     }
 
@@ -24,7 +44,7 @@ impl ToolDecisions {
     /// is (still) waiting on it — already decided, timed out, or cancelled.
     pub(super) fn supply(&self, id: ToolCallId, decision: ApprovalDecision) -> bool {
         match self.lock().remove(&id) {
-            Some(tx) => tx.send(decision).is_ok(),
+            Some(waiting) => waiting.reply.send(decision).is_ok(),
             None => false,
         }
     }
@@ -34,34 +54,12 @@ impl ToolDecisions {
         self.lock().remove(&id);
     }
 
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ToolCallId, oneshot::Sender<ApprovalDecision>>> {
+    /// Every call waiting for a decision.
+    pub(super) fn pending(&self) -> Vec<PendingDecision> {
+        self.lock().values().map(|w| w.call.clone()).collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ToolCallId, Waiting>> {
         self.waiting.lock().unwrap_or_else(|p| p.into_inner())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn a_supplied_decision_reaches_the_waiter_exactly_once() {
-        let decisions = ToolDecisions::default();
-        let id = ToolCallId::new();
-        let rx = decisions.register(id);
-        assert!(decisions.supply(id, ApprovalDecision::ApprovedOnce));
-        assert_eq!(rx.await.unwrap(), ApprovalDecision::ApprovedOnce);
-        assert!(!decisions.supply(id, ApprovalDecision::DeniedOnce));
-    }
-
-    #[test]
-    fn withdrawn_or_unknown_ids_are_not_deliverable() {
-        let decisions = ToolDecisions::default();
-        let id = ToolCallId::new();
-        let _rx = decisions.register(id);
-        decisions.withdraw(id);
-        assert!(!decisions.supply(id, ApprovalDecision::ApprovedOnce));
-        assert!(!decisions.supply(ToolCallId::new(), ApprovalDecision::ApprovedOnce));
     }
 }

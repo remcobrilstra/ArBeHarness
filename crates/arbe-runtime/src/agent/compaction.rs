@@ -12,7 +12,8 @@ use futures_util::StreamExt;
 use super::Agent;
 use super::tools::truncate_middle;
 
-/// Compact once history passes this share of the budget...
+/// Compact once history passes this share of the room it has (the budget
+/// minus what every request carries anyway — see [`history_room`])...
 pub(super) const TRIGGER_RATIO: f64 = 0.8;
 /// ...down to about this share, so it doesn't happen again next turn.
 const TARGET_RATIO: f64 = 0.4;
@@ -31,6 +32,26 @@ Write a concise summary that preserves:
 - anything still pending or promised.
 
 Omit pleasantries, dead ends and anything superseded. Use short bullet points. Do not address the user.";
+
+/// Tokens every request spends before any history: the system prompt,
+/// instruction files, skills, memory notes and tool definitions (the
+/// summary isn't counted: compaction replaces it).
+pub(super) fn fixed_tokens(breakdown: &arbe_core::ContextBreakdown) -> u64 {
+    breakdown.system_prompt
+        + breakdown.instructions
+        + breakdown.skills
+        + breakdown.memory
+        + breakdown.tools
+}
+
+/// The part of `budget_tokens` history can use, given the latest request's
+/// fixed costs (none known before the first request). With a small
+/// context most of the budget is fixed cost, so measuring history against
+/// the whole budget would never trigger compaction before trimming.
+pub(super) fn history_room(budget_tokens: u64, last: Option<&arbe_core::ContextUsage>) -> u64 {
+    let fixed = last.map_or(0, |usage| fixed_tokens(&usage.breakdown));
+    budget_tokens.saturating_sub(fixed)
+}
 
 /// Which turns to compact: whole turns from the oldest, keeping the newest
 /// turns that fit in the target share (always at least the newest one).
@@ -122,9 +143,10 @@ pub(super) async fn compact(
 ) -> Result<Option<Compaction>, HarnessError> {
     let (through, entries, previous) = {
         let state = agent.state();
-        let budget = state
-            .calibration
-            .budget_in_estimate_units(agent.settings.budget_tokens);
+        let budget = state.calibration.budget_in_estimate_units(history_room(
+            agent.settings.budget_tokens,
+            state.last_context.as_ref(),
+        ));
         let Some(through) = plan(&state.history, budget, force) else {
             return Ok(None);
         };
@@ -251,6 +273,34 @@ mod tests {
         // Target 1800: keep only the newest turn (the second-newest would
         // make it ~2000).
         assert_eq!(plan(&history, 4_500, false), Some(2));
+    }
+
+    #[test]
+    fn history_is_measured_against_the_room_left_after_fixed_costs() {
+        // A small context: 4096 budget, 3000 of it spent on the prompt,
+        // tools and memory before any history.
+        let usage = arbe_core::ContextUsage::new(
+            arbe_core::ContextBreakdown {
+                system_prompt: 1_000,
+                instructions: 200,
+                skills: 100,
+                memory: 200,
+                tools: 1_500,
+                summary: 400,
+                ..Default::default()
+            },
+            4_096,
+            8_192,
+            None,
+        );
+        assert_eq!(history_room(4_096, Some(&usage)), 1_096);
+        assert_eq!(history_room(4_096, None), 4_096);
+        assert_eq!(history_room(1_000, Some(&usage)), 0);
+        // ~2000 tokens of history: under 80% of the whole budget, but far
+        // over the room history actually has.
+        let history: Vec<_> = (0..4).flat_map(|i| turn(i, 2_000)).collect();
+        assert_eq!(plan(&history, 4_096, false), None);
+        assert!(plan(&history, history_room(4_096, Some(&usage)), false).is_some());
     }
 
     #[test]

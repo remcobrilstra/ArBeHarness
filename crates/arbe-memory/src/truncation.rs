@@ -27,7 +27,7 @@ use crate::{ContextInput, ContextOutput, ContextStrategy};
 ///
 /// Returns per-index `keep` flags (chronological order) and the estimated
 /// token cost of everything dropped. Shared by [`TruncationStrategy`] and
-/// [`crate::CompactWithSummaryStrategy`] so both select identically.
+/// [`crate::TruncateWithNoticeStrategy`] so both select identically.
 pub(crate) fn select_kept(
     history: &[HistoryEntry],
     budget_tokens: u64,
@@ -173,7 +173,7 @@ fn condensed_entries(history: &[HistoryEntry], turn: &TurnSpan) -> Vec<usize> {
 
 /// Drops the oldest unpinned messages once the budget is exceeded, keeping
 /// the most recent ones plus anything pinned. No summary is inserted for
-/// what was dropped (see `CompactWithSummaryStrategy` for that).
+/// what was dropped (see `TruncateWithNoticeStrategy` for that).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TruncationStrategy;
 

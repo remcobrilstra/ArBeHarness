@@ -1,16 +1,15 @@
 use crate::SkillManifest;
 
-/// Merges skills from all three scopes, keeping session-local over
-/// project-local over global when names collide (harness spec FR-6
-/// resolution order). Order of the output otherwise follows first
-/// appearance (session, then project, then global).
+/// Merges the project's skills with the global ones, keeping the project's
+/// when names collide (harness spec FR-6 resolution order; the spec's third,
+/// session-local scope isn't implemented). Order of the output otherwise
+/// follows first appearance (project, then global).
 pub fn merge_skills(
-    session_local: Vec<SkillManifest>,
     project_local: Vec<SkillManifest>,
     global: Vec<SkillManifest>,
 ) -> Vec<SkillManifest> {
     let mut merged: Vec<SkillManifest> = Vec::new();
-    for manifest in session_local.into_iter().chain(project_local).chain(global) {
+    for manifest in project_local.into_iter().chain(global) {
         if merged.iter().any(|m| m.name == manifest.name) {
             continue;
         }
@@ -35,23 +34,21 @@ mod tests {
     }
 
     #[test]
-    fn session_local_wins_over_project_and_global_on_name_collision() {
-        let session = vec![skill("shared", SkillScope::SessionLocal, "session version")];
+    fn project_wins_over_global_on_name_collision() {
         let project = vec![skill("shared", SkillScope::ProjectLocal, "project version")];
         let global = vec![skill("shared", SkillScope::Global, "global version")];
 
-        let merged = merge_skills(session, project, global);
+        let merged = merge_skills(project, global);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].instructions, "session version");
+        assert_eq!(merged[0].instructions, "project version");
     }
 
     #[test]
-    fn non_colliding_skills_from_every_scope_are_all_kept() {
-        let session = vec![skill("s", SkillScope::SessionLocal, "s")];
+    fn non_colliding_skills_from_both_scopes_are_all_kept() {
         let project = vec![skill("p", SkillScope::ProjectLocal, "p")];
         let global = vec![skill("g", SkillScope::Global, "g")];
 
-        let merged = merge_skills(session, project, global);
-        assert_eq!(merged.len(), 3);
+        let merged = merge_skills(project, global);
+        assert_eq!(merged.len(), 2);
     }
 }

@@ -127,7 +127,7 @@ The answer goes to stdout. Tool activity goes to stderr, as `[tool] name {argume
 | `--approve` | Tool calls that need approval are |
 |---|---|
 | `none` (default) | denied. The model is told, and answers without them. |
-| `reads` | approved if low risk (`read_file`, `list_dir`, `glob`, `grep`, `todo_write`), denied otherwise. |
+| `reads` | approved if low risk (`read_file`, `list_dir`, `glob`, `grep`, `todo_write`, `load_skill`, `task`), denied otherwise. A `task` subagent's own calls are decided the same way. |
 | `all` | approved. Only use this where the agent can't do harm, since it includes running commands. |
 
 Calls your [approval settings](#approvals) already allow or deny are unaffected: `--approve` only answers what would otherwise be asked.
@@ -157,6 +157,7 @@ Requests are handled concurrently: while a `turn/send` is waiting for its turn t
 | `session/set_title` | `session_id`, `title` | `{}` |
 | `session/close` | `session_id` | `{}` (stops a running turn first) |
 | `session/set_mode` | `session_id`, `mode` | `{"mode"}` — switches the session's [mode](#modes-and-plan-mode) (`-32602` for an unknown mode); a `mode_changed` event follows. The model leaving plan mode sends `mode_changed` too |
+| `session/pending` | `session_id` | `{"approvals": [{"tool_call_id", "turn_id", "tool_name", "arguments", "risk"}], "questions": [{"question_id", "question", "options", "allow_free_text"}]}` — what the session is waiting on you for right now, including its subagents'. For a client that missed events (a gap in `seq`) or attached late |
 | `session/context` | `session_id` | `{"usage": {"breakdown", "total_tokens", "budget_tokens", "context_window", "compaction_threshold_tokens"}}` — the latest model call's context by source (`null` before the first call); also sent before every call as a `context_updated` event |
 | `turn/send` | `session_id`, `message` | `{"answer", "stop_reason"}` once the turn ends |
 | `turn/cancel` | `session_id` | `{"cancelled": true/false}` (whether a turn was running) |
@@ -232,9 +233,10 @@ A project's `.arbe/config.toml` arrives with whatever repository you open, so by
 - everything under `[approval]`
 - `[mcp.servers.*]` and `[[hooks.commands]]` (programs the harness would start)
 - `[web]` (where search queries and a search API key would go)
+- `prompt` when it names a template file (it could name any file on your machine, which would then be sent to the model); `prompt = "coding"` or `"general"` still applies
 - the same keys inside `[profiles.*]`
 
-An `[error]` line when the session starts lists what was ignored. Everything else in a project config (model, limits, `tools`, `prompt`, skills mode, …) still applies.
+An `[error]` line when the session starts lists what was ignored. Everything else in a project config (model, limits, `tools`, the built-in prompt templates, skills mode, …) still applies.
 
 To trust a project, list it in your **global** config (a project can't trust itself):
 
@@ -295,7 +297,7 @@ context_window = 32768
 | `tools` | all tools | Tools the model may use, by name. An entry ending in `*` matches by prefix, e.g. `"github__*"` for every tool of the `github` [MCP server](#mcp-servers). Tools not listed are not available at all (not even through `/tool`). |
 | `prompt` | per profile | System prompt template: `coding`, `general`, or a path to your own Markdown file (relative paths are relative to the config file). See [Profiles](#profiles). |
 | `mode` | `"default"` | The [mode](#modes-and-plan-mode) new sessions start in: `"default"` or `"plan"`. Top level or in a profile (e.g. a `planner` profile that always starts in plan mode). |
-| `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. |
+| `provider.name` | `ollama` | Same as `ARBE_PROVIDER`. Choosing a **different** provider than a lower layer did (an earlier file, a profile, or `ARBE_PROVIDER`/`--provider`) drops that layer's `model`, `base_url`, `api_key_env`, `api_key_command` and `headers`: they belong to the provider they were set for, and your key for one provider is never sent to another's address. Set them again alongside the new name if you need them. |
 | `provider.model` | per provider | Same as `ARBE_MODEL`. |
 | `provider.base_url` | provider's endpoint | Same as `ARBE_BASE_URL`. |
 | `provider.api_key_command` | none | A command that prints the API key, run once at startup — for keys kept in a password manager, e.g. `"op read op://Private/OpenAI/key"` (1Password), `"security find-generic-password -s openai -w"` (macOS Keychain), `"pass show openai"`. Takes precedence over the environment. If it fails, the app stops with its error output. |
@@ -337,7 +339,7 @@ Three profiles are built in:
 | `general` | only `todo_write`, `remember`, `ask_user`, `web_fetch` and `web_search` (no file access, no shell) | A general-purpose assistant. |
 | `grok-subscription` | all builtin tools | The same software-engineering prompt as `coding`. Provider `grok_subscription`, model `grok-4.7`. See [Grok subscription](#grok-subscription). |
 
-Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine a built-in profile this way: a `[profiles.grok-subscription]` section replaces the built-in one, including its provider and model.
+Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings — a built-in one's too — override the file's top-level settings (e.g. `general`'s tool list wins over a top-level `tools`). You can also redefine a built-in profile this way: a `[profiles.grok-subscription]` section replaces the built-in one, including its provider and model.
 
 ```toml
 [profiles.review]                  # a read-only code reviewer
@@ -434,7 +436,7 @@ The maximum response length is fixed at 4096 output tokens.
 
 | `ARBE_PROVIDER` | Needs key | Default endpoint | Notes |
 |---|---|---|---|
-| `ollama` | no | `http://localhost:11434` | Runs with an 8,192-token context window. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. Some models (such as `qwen2.5-coder`) write a tool call as plain JSON text instead of using Ollama's tool-call format; when a reply consists only of such calls to offered tools, the harness treats them as real tool calls. A reply that could be one is shown once it's complete rather than word by word. |
+| `ollama` | no | `http://localhost:11434` | Runs with a 16,384-token context window (unless `[[models]]` sets another), of which 4,096 are kept for the reply. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. Some models (such as `qwen2.5-coder`) write a tool call as plain JSON text instead of using Ollama's tool-call format; when a reply consists only of such calls, the harness treats them as real tool calls. A call naming a tool that doesn't exist is answered with an error listing the real tool names, so the model can correct itself. A reply that could be one is shown once it's complete rather than word by word. |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | Chat Completions API. |
 | `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | Messages API. Supports extended thinking (`ARBE_THINKING_BUDGET`). |
 | `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (xAI's developer API, vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. Reasoning that the server streams as `reasoning_content` (xAI, DeepSeek, vLLM) is shown as thinking. |
@@ -488,7 +490,7 @@ The credential file is `~/.arbe/auth/grok.json`, or the same path under `--dev-h
 | `o1*`, `o3*`, `o4*` | 200,000 |
 | `claude-*` | 200,000 |
 | other OpenAI / compatible models, and `grok_subscription` | 128,000 |
-| Ollama models | 8,192 |
+| Ollama models | 16,384 (requested from Ollama as `num_ctx`; most current models support 32k or more — set a larger `context_window` per model under `[[models]]`) |
 
 If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to avoid "context length exceeded" errors.
 
@@ -634,7 +636,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 
 | Tool | Arguments | Risk | What it does |
 |---|---|---|---|
-| `read_file` | `path`, optional `start_line`, `end_line` (1-indexed, inclusive) | low | Reads a UTF-8 text file. A PNG, JPEG, GIF or WebP file (up to 3.75 MB) comes back as an image the model can look at — if the model supports images; otherwise it's told the image can't be shown. |
+| `read_file` | `path`, optional `start_line`, `end_line` (1-indexed, inclusive; either alone reads from that line to the end, or from the start to that line) | low | Reads a UTF-8 text file. A PNG, JPEG, GIF or WebP file (up to 3.75 MB) comes back as an image the model can look at — if the model supports images; otherwise it's told the image can't be shown. |
 | `list_dir` | optional `path` (defaults to workdir root) | low | Lists a directory (max 1,000 entries). |
 | `glob` | `pattern` (e.g. `**/*.rs`), optional `path` | low | Finds files by pattern (max 2,000 matches). |
 | `grep` | `pattern` (regex), optional `path`, `case_insensitive` | low | Searches file contents (max 500 matches). |
@@ -643,14 +645,14 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `task` | `description` (short label), `prompt`, optional `tools` (list) | low | Hands a self-contained job to a [subagent](#subagents) and returns its final answer. Not in the `general` profile. |
 | `ask_user` | `question`, optional `options` (up to 8), optional `allow_free_text` (default true) | low | Asks you a question and waits for the answer — for decisions only you can make. Never needs approval (it acts on nothing). See [Questions from the agent](#questions-from-the-agent). |
 | `exit_plan_mode` | `plan` (Markdown) | high | Only offered in [plan mode](#modes-and-plan-mode): presents the plan and asks you to approve it. Approving ends plan mode. Always asks, whatever your approval settings, except with `--print --approve all`. |
-| `web_fetch` | `url` (http/https), optional `max_chars` (default 20,000, max 100,000) | medium | Fetches a page and returns its text: HTML converted to readable text (with the page title), JSON and plain text as they are. Binary files are refused. Reads at most 3 MB. |
+| `web_fetch` | `url` (http/https), optional `max_chars` (default 20,000, max 100,000) | medium | Fetches a page and returns its text: HTML converted to readable text (with the page title), JSON and plain text as they are. Binary files are refused. Reads at most 3 MB. Follows redirects only within the same site (scheme, host and port); a redirect elsewhere comes back as `redirected_to`, and fetching that address is a new call that asks for approval again — so a per-site rule can't be stretched to another host. |
 | `web_search` | `query`, optional `count` (default 5, max 10) | medium | Searches the web and returns titles, URLs and snippets. Only present when [a search service is configured](#web-tools). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
-| `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic. |
-| `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. |
-| `execute` | `command`, optional `timeout_secs` (default 30, max 300), optional `background` | **high** | Runs a shell command (`cmd /C` on Windows, `sh -c` elsewhere) in the workdir. On timeout, the whole process tree is killed. With `background: true` it keeps running and returns a handle (`bg-1`, …) instead of waiting — see [Background processes](#background-processes). |
+| `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic, and an overwritten file keeps its permissions (e.g. a script stays executable). |
+| `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, or matches more than once without `replace_all: true`. The file keeps its permissions. |
+| `execute` | `command`, optional `timeout_secs` (default 30, max 300), optional `background` | **high** | Runs a shell command (`cmd /C` on Windows, `sh -c` elsewhere) in the workdir. On timeout, the whole process tree is killed. Of each output stream, the first and last 512 KB are kept (the rest is replaced by a `[... N bytes omitted ...]` marker), so a command that prints without end can't exhaust memory. With `background: true` it keeps running and returns a handle (`bg-1`, …) instead of waiting — see [Background processes](#background-processes). |
 | `process_output` | optional `handle`, optional `wait_secs` (0–30) | low | Reads what a background process printed since the last read (up to 32 KB per call), and whether it's still running (with its exit code once it has exited). Without a handle, lists all background processes. Never needs approval (it only reads). |
-| `process_kill` | `handle` | low | Stops a background process and everything it started. |
+| `process_kill` | `handle` | medium | Stops a background process and everything it started. |
 
 **Sandboxing.** Every file tool resolves its path inside the workdir and refuses anything outside it, including through `..`. `glob` and `grep` skip `.git`, `target`, `node_modules`, and `.venv`. `execute` is **not** sandboxed: a shell command can do anything your user account can. That is why it is marked high-risk and always asks you first.
 
@@ -724,7 +726,7 @@ headers = { "X-Team" = "platform" }
 - Servers defined in a project's `.arbe/config.toml` only start if the project is [trusted](#trusted-projects); servers in your global config always start.
 - A stdio server inherits your environment, so secrets such as `GITHUB_PERSONAL_ACCESS_TOKEN` can stay in your shell instead of the config file. On Windows, commands like `npx` and `uvx` work as-is.
 - Servers are connected when a session starts, in the background. The chat is usable immediately, and an `[info]` line reports `MCP server github connected (N tools)`, or an `[error]` line says why a server is unavailable. A failed server doesn't stop the others or the session.
-- Its tools appear to the model as `<server>__<tool>`, e.g. `github__search_issues`, with the descriptions and argument schemas the server provides. You can call them with [`/tool`](#chat-commands) too.
+- Its tools appear to the model as `<server>__<tool>`, e.g. `github__search_issues`, with the descriptions and argument schemas the server provides. You can call them with [`/tool`](#chat-commands) too. Characters other than letters, digits, `_` and `-` become `_`, and names are cut to 64 characters (what model APIs accept). If that makes two tools' names equal — within one server, or across servers (server `a` with tool `b__c` and server `a__b` with tool `c`) — the later one gets a `_2`, `_3`, … suffix; no tool silently replaces another.
 - They go through the same [approvals](#approvals) as builtin tools. Their risk level comes from the server's own hints: read-only tools are low risk, destructive ones high, everything else medium. Only read-only tools run in parallel with other calls.
 - If a server announces that its tool list changed, the new list is picked up at the start of your next message.
 - If a stdio server crashes, it's restarted automatically the next time one of its tools is called. Cancelling a turn (`Esc`) also cancels the MCP call in progress.
@@ -780,6 +782,8 @@ A rule is a tool name, optionally with a pattern for what the call acts on:
 `*` matches any run of characters, including `/`. What the pattern is matched against depends on the tool: the `path` argument for `read_file`, `write_file`, `edit_file`, `list_dir`, `glob` and `grep` (with forward slashes, relative to the workdir as the model wrote it, `.` when omitted), and the command line for `execute`. MCP tools and `todo_write` can only be matched by name. A malformed rule (e.g. a missing `)`) stops the app at startup.
 
 **High-risk tools** (`execute`, and MCP tools their server marks destructive) never run without asking just because of the mode or a bare tool name. Only a rule with a pattern can let them through — `execute(cargo test*)` in `allow` does, `execute` alone doesn't. Only `dry_run_only` refuses them outright.
+
+**Command rules don't stretch over shell operators.** An allow rule's `*` never auto-approves a command that goes on to do something else: `execute(cargo test*)` approves `cargo test -p parser`, but `cargo test && rm -rf ~`, `cargo test; curl … | sh`, `cargo test > file`, `` cargo test `…` `` and `cargo test $(…)` still ask. The operators checked are `;`, `&`, `|`, `` ` ``, `$(`, `>`, `<` and line breaks; one that appears in the rule itself is allowed (`execute(git log | head*)` approves `git log | head -5`). Deny rules for commands, like `execute(git push*)`, still match what they say, but a command can always be written another way (`cd . && git push`, `git  push`), so treat them as a safeguard against accidents, not as a security boundary.
 
 In the approval dialog you can:
 
@@ -847,7 +851,7 @@ Memory is notes that carry over between sessions — your preferences, a project
 | `~/.arbe/memory/global/memory.md` | Every project. |
 | `~/.arbe/memory/projects/<id>/memory.md` | One project. `<id>` is the workdir's folder name plus a short code derived from its full path, e.g. `my-app-3f9a12c0`. |
 
-The model adds to them with the `remember` tool (one `- note` line per call), which asks for approval like any other write — memory shapes every future session, so it's worth a look. You can also edit the files yourself; changes apply from the next message. Each file is capped at 8,000 characters in the request.
+The model adds to them with the `remember` tool (one `- note` line per call, appended — two sessions saving at once both keep their note, and a last line you typed without a newline stays as it was), which asks for approval like any other write — memory shapes every future session, so it's worth a look. You can also edit the files yourself; changes apply from the next message. Each file is capped at 8,000 characters in the request.
 
 ---
 
@@ -862,6 +866,7 @@ A hook is a shell command the harness runs at a fixed point in every turn — to
 phase = "before_tool_execute"
 command = "python C:/tools/guard.py"   # run with cmd /C (Windows) or sh -c
 timeout_ms = 5000                        # optional; default 10 s
+on_failure = "block"                     # optional; see "When a hook fails"
 
 [[hooks.commands]]
 phase = "on_turn_complete"
@@ -890,7 +895,14 @@ Hooks from the global and the project config both run (global first). Project ho
 
 Printing nothing leaves the call as it was. A hook runs *before* the approval dialog, so it can't be used to skip approvals.
 
-**When a hook fails** — non-zero exit, output that isn't a JSON object, or running past its time limit — it's skipped, the turn carries on, and an `[error]` line says which hook failed and why (including what it printed to stderr).
+**When a hook fails** — non-zero exit, output that isn't a JSON object, or running past its time limit — an `[error]` line says which hook failed and why (including what it printed to stderr). What happens next is set per hook with `on_failure`:
+
+| `on_failure` | Default for | Effect |
+|---|---|---|
+| `"block"` | `before_tool_execute` | The tool call is refused, and the model is told `blocked: <hook> failed: <reason>`. A guard that can't run doesn't let calls through. |
+| `"skip"` | every other phase | The hook is skipped and the turn carries on as if it weren't there. |
+
+The payload is written to the hook's stdin while its output is being read, so a hook that prints as it reads works with payloads of any size.
 
 Example guard (Python) that refuses `git push`:
 
@@ -944,8 +956,7 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 │       ├── meta.json          session info (active)
 │       ├── turns.jsonl        conversation history (active)
 │       ├── in_flight.jsonl    the turn in progress (active; see below)
-│       ├── compactions.jsonl  summaries of older turns (active)
-│       └── events.jsonl       event log (reserved)
+│       └── compactions.jsonl  summaries of older turns (active)
 ├── instructions/
 │   └── agent.md               your global instructions (active)
 ├── skills/
@@ -1139,9 +1150,6 @@ Common problems:
 
 ## Not yet active
 
-These have code in the repository but **can't be used yet**. They're listed so you don't spend time setting them up. This section shrinks as each one is connected.
+Features with code in the repository that can't be used yet are listed here, so you don't spend time setting them up. There are none at the moment.
 
-| Feature | Status |
-|---|---|
-| Session-only skills | Skills come from the global and project folders; there's no way to add one for just the current session. |
-| `events.jsonl` | Storage support exists, but the current runtime doesn't write it. |
+Not built at all (so not listed above): skills for just the current session (skills come from the global and project folders), and a saved event log per session (events are only streamed live, to the chat screen, `--print --output json` and `--headless`).

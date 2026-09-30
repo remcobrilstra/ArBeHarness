@@ -3,8 +3,8 @@ use std::sync::Arc;
 use arbe_core::{ApprovalDecision, ToolError, ToolInvocation, ToolResult};
 
 use crate::{
-    ApprovalContext, ApprovalPolicy, PolicyOutcome, ToolContext, ToolExecutor, ToolRegistry,
-    ToolRun,
+    ApprovalContext, ApprovalPolicy, PolicyOutcome, Subject, ToolContext, ToolExecutor,
+    ToolRegistry, ToolRun,
 };
 
 /// What happened to a gated invocation. Deliberately distinct from
@@ -75,9 +75,13 @@ pub fn authorize(
 ) -> Result<Authorization, ToolError> {
     let executor = registry.get(&invocation.tool_name)?.clone();
     let subject = executor.subject(&invocation.arguments);
+    let rule_subject = subject.as_deref().map(|text| Subject {
+        text,
+        kind: executor.subject_kind(),
+    });
 
     let approved = match (
-        policy.decide(&invocation, subject.as_deref(), ctx),
+        policy.decide(&invocation, rule_subject, ctx),
         human_decision,
     ) {
         (PolicyOutcome::AutoApprove, _) => true,

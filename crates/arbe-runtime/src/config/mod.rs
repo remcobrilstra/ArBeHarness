@@ -5,11 +5,15 @@
 //! | Layer (lowest first) | Where |
 //! |---|---|
 //! | defaults | [`RuntimeConfig::defaults`] |
-//! | built-in profile | `coding` (default) or `general` |
 //! | global file | `~/.arbe/config/config.toml` |
 //! | project file | `<project>/.arbe/config.toml` (see "Trust" below) |
-//! | selected profile | `[profiles.<name>]` in the global, then the project file |
+//! | selected profile | a built-in one (`coding`, `general`, `grok-subscription`), or `[profiles.<name>]` in the global, then the project file (which replaces a built-in of that name) |
 //! | environment | `ARBE_*` variables (CLI flags set these) |
+//!
+//! **Provider settings go together.** Selecting a different provider in any
+//! layer drops the endpoint, headers, key variable/command and model set by
+//! lower layers (see `switch_provider`), so a key never goes to another
+//! provider's address.
 //!
 //! **Trust.** A project config comes with whatever repository is opened,
 //! so unless the project is listed in the global config's
@@ -34,6 +38,8 @@ pub struct HookCommand {
     pub phase: arbe_hooks::HookPhase,
     pub command: String,
     pub timeout: std::time::Duration,
+    /// A failure blocks what the hook guards instead of being skipped.
+    pub block_on_failure: bool,
 }
 
 /// How skills reach the model.
@@ -123,15 +129,83 @@ pub struct RuntimeConfig {
 const DEFAULT_MAX_TOOL_ROUNDS: u32 = 50;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 50_000;
 
-/// Tools the built-in `general` profile allows: nothing that touches the
-/// file system or runs commands.
-const GENERAL_PROFILE_TOOLS: &[&str] = &[
-    "todo_write",
-    "remember",
-    "ask_user",
-    "web_fetch",
-    "web_search",
+/// A profile that exists without any config file. Applied like a
+/// `[profiles.<name>]` section (after the files' top-level settings), and
+/// only when no config file defines a profile of the same name.
+struct BuiltinProfile {
+    name: &'static str,
+    /// The provider it uses; `None` keeps whatever the configuration says.
+    provider: Option<&'static str>,
+    model: Option<&'static str>,
+    /// `"coding"` or `"general"`; `None` keeps the configured template.
+    prompt: Option<&'static str>,
+    /// The tool allow-set; `None` allows every tool.
+    tools: Option<&'static [&'static str]>,
+}
+
+const BUILTIN_PROFILES: &[BuiltinProfile] = &[
+    BuiltinProfile {
+        name: "coding",
+        provider: None,
+        model: None,
+        prompt: None,
+        tools: None,
+    },
+    // Nothing that touches the file system or runs commands.
+    BuiltinProfile {
+        name: "general",
+        provider: None,
+        model: None,
+        prompt: Some("general"),
+        tools: Some(&[
+            "todo_write",
+            "remember",
+            "ask_user",
+            "web_fetch",
+            "web_search",
+        ]),
+    },
+    // Signs in with a Grok subscription (`arbeharness login grok`).
+    BuiltinProfile {
+        name: "grok-subscription",
+        provider: Some("grok_subscription"),
+        model: Some("grok-4.7"),
+        prompt: None,
+        tools: None,
+    },
 ];
+
+impl BuiltinProfile {
+    fn find(name: &str) -> Option<&'static BuiltinProfile> {
+        BUILTIN_PROFILES.iter().find(|p| p.name == name)
+    }
+
+    /// The profile as a config layer.
+    fn layer(&self) -> Layer {
+        Layer {
+            provider: self.provider.map(|name| file::ProviderSection {
+                name: Some(name.to_string()),
+                model: self.model.map(str::to_string),
+                ..Default::default()
+            }),
+            prompt: self.prompt.map(str::to_string),
+            tools: self
+                .tools
+                .map(|tools| tools.iter().map(|t| t.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn info(&self) -> ProfileInfo {
+        ProfileInfo {
+            name: self.name.to_string(),
+            builtin: true,
+            provider: self.provider.map(str::to_string),
+            model: self.model.map(str::to_string),
+            base_url: None,
+        }
+    }
+}
 
 /// Settings that are only decided once every layer has been applied,
 /// because their defaults depend on other settings (e.g. the provider).
@@ -219,19 +293,7 @@ impl RuntimeConfig {
         extra_files: &[PathBuf],
     ) -> Result<Vec<ProfileInfo>, ConfigError> {
         let (global, project, _) = source_files(env, extra_files);
-        let mut profiles: BTreeMap<String, ProfileInfo> = ["coding", "general"]
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_string(),
-                    ProfileInfo {
-                        name: name.to_string(),
-                        builtin: true,
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
+        let mut profiles: BTreeMap<String, ProfileInfo> = BTreeMap::new();
         for path in global.iter().chain(project.iter()) {
             let Some((_, layer)) = read_layer(path)? else {
                 continue;
@@ -248,11 +310,13 @@ impl RuntimeConfig {
                 }
             }
         }
-        if !profiles.contains_key(GROK_SUBSCRIPTION_PROFILE) {
-            profiles.insert(
-                GROK_SUBSCRIPTION_PROFILE.to_string(),
-                grok_subscription_profile(),
-            );
+        // A file's `[profiles.<name>]` replaces a built-in profile of that
+        // name, but it's still one the harness ships.
+        for builtin in BUILTIN_PROFILES {
+            profiles
+                .entry(builtin.name.to_string())
+                .and_modify(|info| info.builtin = true)
+                .or_insert_with(|| builtin.info());
         }
         Ok(profiles.into_values().collect())
     }
@@ -324,7 +388,10 @@ impl RuntimeConfig {
                     path.display(),
                     removed.join(", "),
                     project_dir.display().to_string(),
-                    arbe_storage::paths::config_dir().join("config.toml").display(),
+                    global_files.first().map_or_else(
+                        || "your global config".to_string(),
+                        |global| global.display().to_string()
+                    ),
                 ));
             }
             layers.push((path, layer));
@@ -336,11 +403,12 @@ impl RuntimeConfig {
         let defined_in_files = layers
             .iter()
             .any(|(_, l)| l.profiles.contains_key(&profile));
-        if !is_builtin_profile(&profile) && !defined_in_files {
+        let builtin = BuiltinProfile::find(&profile);
+        if builtin.is_none() && !defined_in_files {
             let mut known: Vec<String> = layers
                 .iter()
                 .flat_map(|(_, l)| l.profiles.keys().cloned())
-                .chain(builtin_profile_names().map(str::to_string))
+                .chain(BUILTIN_PROFILES.iter().map(|p| p.name.to_string()))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -354,18 +422,12 @@ impl RuntimeConfig {
         let mut config = Self::defaults(project_dir);
         config.profile = profile.clone();
         let mut pending = Pending::default();
-        if profile == "general" {
-            config.tools = Some(
-                GENERAL_PROFILE_TOOLS
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect(),
-            );
-            config.prompt = PromptTemplate::General;
-        }
 
         for (path, layer) in &layers {
             config.apply(layer, path, &mut pending)?;
+        }
+        if let Some(builtin) = builtin.filter(|_| !defined_in_files) {
+            config.apply(&builtin.layer(), Path::new(""), &mut pending)?;
         }
         for (path, layer) in &layers {
             if let Some(profile_layer) = layer.profiles.get(&profile) {
@@ -374,13 +436,6 @@ impl RuntimeConfig {
             }
             config.add_models(layer, path, &mut pending)?;
         }
-        if profile == GROK_SUBSCRIPTION_PROFILE && !defined_in_files {
-            config.provider_name = "grok_subscription".to_string();
-            pending.model = Some("grok-4.7".to_string());
-            // A top-level endpoint belongs to whatever provider was
-            // configured above. This profile has its own, fixed one.
-            config.base_url = None;
-        }
         config.apply_env(env, &mut pending)?;
         config.finish(pending, env)?;
         config.project_trusted = project_trusted;
@@ -388,28 +443,15 @@ impl RuntimeConfig {
         Ok(config)
     }
 
-    /// Applies one layer's settings.
+    /// Applies one layer's settings, section by section.
     fn apply(
         &mut self,
         layer: &Layer,
         path: &Path,
         pending: &mut Pending,
     ) -> Result<(), ConfigError> {
-        let config_dir = path.parent();
-        if let Some(p) = &layer.provider {
-            if let Some(name) = &p.name {
-                self.provider_name = name.clone();
-            }
-            set(&mut pending.model, p.model.clone());
-            set(&mut self.base_url, p.base_url.clone());
-            set(&mut pending.api_key_env, p.api_key_env.clone());
-            set(&mut pending.api_key_command, p.api_key_command.clone());
-            if let Some(headers) = &p.headers {
-                self.extra_headers = headers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-            }
+        if let Some(provider) = &layer.provider {
+            self.apply_provider(provider, pending);
         }
         if let Some(g) = &layer.generation {
             set(&mut pending.temperature, g.temperature);
@@ -428,46 +470,15 @@ impl RuntimeConfig {
             assign(&mut self.max_tool_output_chars, l.max_tool_output_chars);
             assign(&mut self.retry.max_retries, l.max_retries);
         }
-        if let Some(a) = &layer.approval {
-            assign(&mut self.policy_mode, a.mode);
-            for rule in a.allow.iter().chain(&a.deny).flatten() {
-                arbe_tools::ToolRule::parse(rule)
-                    .map_err(|e| invalid(path, &format!("approval: {e}")))?;
-            }
-            assign(&mut self.allowlist, a.allow.clone());
-            assign(&mut self.denylist, a.deny.clone());
-            assign(
-                &mut self.session_approval_covers_high_risk,
-                a.session_approval_covers_high_risk,
-            );
+        if let Some(approval) = &layer.approval {
+            self.apply_approval(approval, path)?;
         }
-        if let Some(h) = &layer.hooks {
-            assign(&mut self.hook_timeout_ms, h.timeout_ms);
+        if let Some(hooks) = &layer.hooks {
+            assign(&mut self.hook_timeout_ms, hooks.timeout_ms);
             // Hooks accumulate across files rather than replacing: a
             // project's hooks run in addition to the global ones.
-            for entry in h.commands.iter().flatten() {
-                let phase = arbe_hooks::HookPhase::from_name(&entry.phase).ok_or_else(|| {
-                    let known: Vec<&str> = arbe_hooks::HookPhase::ALL
-                        .iter()
-                        .map(|p| p.name())
-                        .collect();
-                    invalid(
-                        path,
-                        &format!(
-                            "hooks.commands: unknown phase {:?} (one of: {})",
-                            entry.phase,
-                            known.join(", ")
-                        ),
-                    )
-                })?;
-                self.hook_commands.push(HookCommand {
-                    phase,
-                    command: entry.command.clone(),
-                    timeout: entry
-                        .timeout_ms
-                        .map(std::time::Duration::from_millis)
-                        .unwrap_or(arbe_hooks::command::DEFAULT_COMMAND_TIMEOUT),
-                });
+            for entry in hooks.commands.iter().flatten() {
+                self.hook_commands.push(hook_command(entry, path)?);
             }
         }
         if let Some(search) = layer.web.as_ref().and_then(|w| w.search.as_ref()) {
@@ -479,32 +490,10 @@ impl RuntimeConfig {
             set(&mut pending.web_search.base_url, search.base_url.clone());
         }
         if let Some(subagents) = &layer.subagents {
-            if let Some(depth) = subagents.max_depth {
-                self.subagent_max_depth = depth;
-            }
-            if let Some(concurrent) = subagents.max_concurrent {
-                if concurrent == 0 {
-                    return Err(invalid(
-                        path,
-                        "subagents.max_concurrent must be at least 1 (use max_depth = 0 to turn subagents off)",
-                    ));
-                }
-                self.subagent_max_concurrent = concurrent;
-            }
+            self.apply_subagents(subagents, path)?;
         }
-        if let Some(skills) = &layer.skills
-            && let Some(mode) = &skills.mode
-        {
-            self.skills_mode = match mode.as_str() {
-                "on_demand" => SkillsMode::OnDemand,
-                "always" => SkillsMode::Always,
-                other => {
-                    return Err(invalid(
-                        path,
-                        &format!("skills.mode {other:?} is not one of: on_demand, always"),
-                    ));
-                }
-            };
+        if let Some(mode) = layer.skills.as_ref().and_then(|s| s.mode.as_deref()) {
+            self.skills_mode = skills_mode(mode, path)?;
         }
         if let Some(mcp) = &layer.mcp {
             // A later layer's entry replaces the whole server definition.
@@ -514,12 +503,88 @@ impl RuntimeConfig {
         }
         set(&mut self.tools, layer.tools.clone());
         if let Some(prompt) = &layer.prompt {
-            self.prompt = PromptTemplate::parse(prompt, config_dir);
+            self.prompt = PromptTemplate::parse(prompt, path.parent());
         }
         if let Some(mode) = &layer.mode {
             self.mode = Some(validate_mode(mode).map_err(|e| invalid(path, &e))?);
         }
         Ok(())
+    }
+
+    /// `[provider]`: switching to another provider first drops the previous
+    /// one's endpoint, headers, key and model (see `switch_provider`).
+    fn apply_provider(&mut self, p: &file::ProviderSection, pending: &mut Pending) {
+        if let Some(name) = &p.name {
+            self.switch_provider(name, pending);
+        }
+        set(&mut pending.model, p.model.clone());
+        set(&mut self.base_url, p.base_url.clone());
+        set(&mut pending.api_key_env, p.api_key_env.clone());
+        set(&mut pending.api_key_command, p.api_key_command.clone());
+        if let Some(headers) = &p.headers {
+            self.extra_headers = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+    }
+
+    /// `[approval]`, with every rule checked to parse.
+    fn apply_approval(
+        &mut self,
+        a: &file::ApprovalSection,
+        path: &Path,
+    ) -> Result<(), ConfigError> {
+        assign(&mut self.policy_mode, a.mode);
+        for rule in a.allow.iter().chain(&a.deny).flatten() {
+            arbe_tools::ToolRule::parse(rule)
+                .map_err(|e| invalid(path, &format!("approval: {e}")))?;
+        }
+        assign(&mut self.allowlist, a.allow.clone());
+        assign(&mut self.denylist, a.deny.clone());
+        assign(
+            &mut self.session_approval_covers_high_risk,
+            a.session_approval_covers_high_risk,
+        );
+        Ok(())
+    }
+
+    /// `[subagents]`.
+    fn apply_subagents(
+        &mut self,
+        subagents: &file::SubagentsSection,
+        path: &Path,
+    ) -> Result<(), ConfigError> {
+        if let Some(depth) = subagents.max_depth {
+            self.subagent_max_depth = depth;
+        }
+        if let Some(concurrent) = subagents.max_concurrent {
+            if concurrent == 0 {
+                return Err(invalid(
+                    path,
+                    "subagents.max_concurrent must be at least 1 (use max_depth = 0 to turn subagents off)",
+                ));
+            }
+            self.subagent_max_concurrent = concurrent;
+        }
+        Ok(())
+    }
+
+    /// Selects provider `name`. The endpoint, headers, key and model set so
+    /// far belong to the provider they were set for: switching to another
+    /// one drops them, so a key is never sent to the previous provider's
+    /// address. Settings given alongside the new name (same layer, or
+    /// `ARBE_BASE_URL`/`ARBE_MODEL`/...) are applied after this.
+    fn switch_provider(&mut self, name: &str, pending: &mut Pending) {
+        if self.provider_name == name {
+            return;
+        }
+        self.provider_name = name.to_string();
+        self.base_url = None;
+        self.extra_headers.clear();
+        pending.api_key_env = None;
+        pending.api_key_command = None;
+        pending.model = None;
     }
 
     fn add_models(
@@ -597,7 +662,7 @@ impl RuntimeConfig {
         pending: &mut Pending,
     ) -> Result<(), ConfigError> {
         if let Some(name) = env("ARBE_PROVIDER") {
-            self.provider_name = name;
+            self.switch_provider(&name, pending);
         }
         set(&mut pending.model, env("ARBE_MODEL"));
         set(&mut self.base_url, env("ARBE_BASE_URL"));
@@ -710,19 +775,7 @@ fn validate_mode(mode: &str) -> Result<String, String> {
 /// Runs through the platform shell, like hooks; on Windows the command
 /// line is passed to `cmd` verbatim so quoting survives.
 fn run_key_command(command: &str) -> Result<String, ConfigError> {
-    let mut shell = if cfg!(windows) {
-        std::process::Command::new("cmd")
-    } else {
-        std::process::Command::new("sh")
-    };
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        shell.raw_arg(format!("/S /C \"{command}\""));
-    }
-    #[cfg(not(windows))]
-    shell.arg("-c").arg(command);
-    let output = shell
+    let output = arbe_core::shell::command(command)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| ConfigError::InvalidSchema(format!("provider.api_key_command: {e}")))?;
@@ -835,7 +888,8 @@ fn source_files(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProfileInfo {
     pub name: String,
-    /// `coding` or `general` (they exist without any config file).
+    /// One the harness ships (`coding`, `general`, `grok-subscription`),
+    /// whether or not a config file redefines it.
     pub builtin: bool,
     /// Provider settings the profile sets itself; `None` means it uses
     /// whatever the rest of the configuration (or the environment) says.
@@ -904,6 +958,56 @@ fn invalid(path: &Path, message: &str) -> ConfigError {
     ConfigError::InvalidSchema(format!("{}: {message}", path.display()))
 }
 
+/// One `[[hooks.commands]]` entry, validated.
+fn hook_command(entry: &file::CommandHookEntry, path: &Path) -> Result<HookCommand, ConfigError> {
+    let phase = arbe_hooks::HookPhase::from_name(&entry.phase).ok_or_else(|| {
+        let known: Vec<&str> = arbe_hooks::HookPhase::ALL
+            .iter()
+            .map(|p| p.name())
+            .collect();
+        invalid(
+            path,
+            &format!(
+                "hooks.commands: unknown phase {:?} (one of: {})",
+                entry.phase,
+                known.join(", ")
+            ),
+        )
+    })?;
+    let block_on_failure = match entry.on_failure.as_deref() {
+        None => phase == arbe_hooks::HookPhase::BeforeToolExecute,
+        Some("block") => true,
+        Some("skip") => false,
+        Some(other) => {
+            return Err(invalid(
+                path,
+                &format!("hooks.commands: on_failure {other:?} is not one of: block, skip"),
+            ));
+        }
+    };
+    Ok(HookCommand {
+        phase,
+        block_on_failure,
+        command: entry.command.clone(),
+        timeout: entry
+            .timeout_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(arbe_hooks::command::DEFAULT_COMMAND_TIMEOUT),
+    })
+}
+
+/// `skills.mode`.
+fn skills_mode(mode: &str, path: &Path) -> Result<SkillsMode, ConfigError> {
+    match mode {
+        "on_demand" => Ok(SkillsMode::OnDemand),
+        "always" => Ok(SkillsMode::Always),
+        other => Err(invalid(
+            path,
+            &format!("skills.mode {other:?} is not one of: on_demand, always"),
+        )),
+    }
+}
+
 fn validate_strategy(name: &str, path: &Path) -> Result<String, ConfigError> {
     match name {
         "truncation" | "compact_summary" => Ok(name.to_string()),
@@ -958,27 +1062,6 @@ fn parse_headers(raw: &str) -> Vec<(String, String)> {
 /// profile's prompt: small local models chosen for the job — a coding
 /// model for coding work, a general model for the `general` prompt. Both
 /// support tool calling.
-/// Built-in profile that signs in with a Grok subscription.
-const GROK_SUBSCRIPTION_PROFILE: &str = "grok-subscription";
-
-fn builtin_profile_names() -> impl Iterator<Item = &'static str> {
-    ["coding", "general", GROK_SUBSCRIPTION_PROFILE].into_iter()
-}
-
-fn is_builtin_profile(name: &str) -> bool {
-    builtin_profile_names().any(|builtin| builtin == name)
-}
-
-fn grok_subscription_profile() -> ProfileInfo {
-    ProfileInfo {
-        name: GROK_SUBSCRIPTION_PROFILE.to_string(),
-        builtin: true,
-        provider: Some("grok_subscription".to_string()),
-        model: Some("grok-4.7".to_string()),
-        base_url: None,
-    }
-}
-
 fn default_model(provider: &str, prompt: &PromptTemplate) -> &'static str {
     match (provider, prompt) {
         ("openai", _) => "gpt-5-mini",
@@ -1024,7 +1107,7 @@ mod tests {
         None
     }
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1514,6 +1597,22 @@ max_concurrent = 0
             c.hook_commands[1].timeout,
             std::time::Duration::from_millis(2000)
         );
+        // Guards block on failure by default; notifications are skipped.
+        assert!(!c.hook_commands[0].block_on_failure);
+        assert!(c.hook_commands[1].block_on_failure);
+        let skip = write(
+            &dir,
+            "s.toml",
+            "[[hooks.commands]]\nphase = \"before_tool_execute\"\ncommand = \"x\"\non_failure = \"skip\"\n",
+        );
+        assert!(!load(&[skip], &no_env).unwrap().hook_commands[0].block_on_failure);
+        let wrong = write(
+            &dir,
+            "w.toml",
+            "[[hooks.commands]]\nphase = \"on_error\"\ncommand = \"x\"\non_failure = \"maybe\"\n",
+        );
+        let err = load(&[wrong], &no_env).unwrap_err().to_string();
+        assert!(err.contains("block, skip"), "{err}");
 
         let bad = write(
             &dir,
@@ -1536,6 +1635,82 @@ max_concurrent = 0
         let c = RuntimeConfig::load_from_sources(&[], &[project], &no_env, dir.clone()).unwrap();
         assert!(c.hook_commands.is_empty());
         assert!(c.warnings[0].contains("hook commands"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_untrusted_project_cannot_read_a_file_into_the_prompt() {
+        let dir = temp_dir();
+        let project = write(
+            &dir,
+            "p.toml",
+            "prompt = \"/home/me/.aws/credentials\"\n[profiles.x]\nprompt = \"../secret.md\"\n",
+        );
+        let env = env_of(&[("ARBE_PROFILE", "x")]);
+        let c = RuntimeConfig::load_from_sources(&[], &[project], &env, dir.clone()).unwrap();
+        assert_eq!(c.prompt, PromptTemplate::Coding);
+        assert!(c.warnings[0].contains("prompt (a template file)"));
+
+        // The built-in templates are harmless and stay allowed.
+        let project = write(&dir, "q.toml", "prompt = \"general\"\n");
+        let c = RuntimeConfig::load_from_sources(&[], &[project], &no_env, dir.clone()).unwrap();
+        assert_eq!(c.prompt, PromptTemplate::General);
+        assert!(c.warnings.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn switching_provider_drops_the_previous_providers_endpoint_and_key() {
+        let dir = temp_dir();
+        let global = write(
+            &dir,
+            "g.toml",
+            r#"
+            [provider]
+            name = "openai_compatible"
+            base_url = "https://gateway.example/v1"
+            api_key_env = "GATEWAY_KEY"
+            headers = { X-Team = "a" }
+            model = "gw-model"
+
+            [profiles.claude]
+            provider = { name = "anthropic" }
+            "#,
+        );
+        let base = [
+            ("GATEWAY_KEY", "gw-secret"),
+            ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+        ];
+
+        // From the command line / environment.
+        let env = env_of(&[base[0], base[1], ("ARBE_PROVIDER", "anthropic")]);
+        let c = load(std::slice::from_ref(&global), &env).unwrap();
+        assert_eq!(c.provider_name, "anthropic");
+        assert_eq!(c.base_url, None);
+        assert!(c.extra_headers.is_empty());
+        assert_eq!(c.api_key.as_deref(), Some("sk-ant-secret"));
+        assert_eq!(c.model, "claude-sonnet-5");
+
+        // From a profile.
+        let env = env_of(&[base[0], base[1], ("ARBE_PROFILE", "claude")]);
+        let c = load(std::slice::from_ref(&global), &env).unwrap();
+        assert_eq!((c.provider_name.as_str(), c.base_url), ("anthropic", None));
+        assert_eq!(c.api_key.as_deref(), Some("sk-ant-secret"));
+
+        // Settings given with the switch still apply.
+        let env = env_of(&[
+            base[1],
+            ("ARBE_PROVIDER", "anthropic"),
+            ("ARBE_BASE_URL", "https://proxy.example"),
+        ]);
+        let c = load(std::slice::from_ref(&global), &env).unwrap();
+        assert_eq!(c.base_url.as_deref(), Some("https://proxy.example"));
+
+        // Naming the same provider again keeps its settings.
+        let env = env_of(&[base[0], ("ARBE_PROVIDER", "openai_compatible")]);
+        let c = load(std::slice::from_ref(&global), &env).unwrap();
+        assert_eq!(c.base_url.as_deref(), Some("https://gateway.example/v1"));
+        assert_eq!(c.api_key.as_deref(), Some("gw-secret"));
         std::fs::remove_dir_all(dir).ok();
     }
 

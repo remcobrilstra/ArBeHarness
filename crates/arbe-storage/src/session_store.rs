@@ -1,14 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use arbe_core::{
-    Compaction, Message, RuntimeEvent, SessionId, SessionMeta, SessionStatus, Turn, TurnId,
-};
+use arbe_core::{Compaction, Message, SessionId, SessionMeta, SessionStatus, Turn, TurnId};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::{append_line, write_atomic};
 use crate::error::StorageError;
-use crate::paths;
 
 /// One message of an in-progress turn, as written to `in_flight.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,25 +15,22 @@ pub struct InFlightMessage {
     pub message: Message,
 }
 
-/// Filesystem-backed session persistence rooted at `~/.arbe/sessions/`
+/// Filesystem-backed session persistence rooted at `<home>/sessions/`
 /// (harness spec FR-1, §5). `meta.json` is written atomically on every
-/// status change; `turns.jsonl` / `events.jsonl` are append-only.
+/// status change; `turns.jsonl`, `in_flight.jsonl` and `compactions.jsonl`
+/// are append-only.
 ///
-/// The sessions root is captured at construction (rather than re-resolved
-/// globally on every call) so tests can point multiple independent stores
-/// at their own temp directories without racing on process env vars.
+/// The sessions root is always given explicitly ([`with_root`]), never
+/// resolved from the process environment, so tests can point independent
+/// stores at their own temp directories without racing on env vars.
+///
+/// [`with_root`]: Self::with_root
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     sessions_root: PathBuf,
 }
 
 impl SessionStore {
-    pub fn new() -> Self {
-        Self {
-            sessions_root: paths::sessions_dir(),
-        }
-    }
-
     pub fn with_root(sessions_root: PathBuf) -> Self {
         Self { sessions_root }
     }
@@ -51,10 +45,6 @@ impl SessionStore {
 
     fn turns_path(&self, id: SessionId) -> PathBuf {
         self.session_dir(id).join("turns.jsonl")
-    }
-
-    fn events_path(&self, id: SessionId) -> PathBuf {
-        self.session_dir(id).join("events.jsonl")
     }
 
     fn compactions_path(&self, id: SessionId) -> PathBuf {
@@ -189,20 +179,6 @@ impl SessionStore {
         Ok(read_jsonl::<Compaction>(&self.compactions_path(id))?.pop())
     }
 
-    pub fn append_event(&self, id: SessionId, event: &RuntimeEvent) -> Result<(), StorageError> {
-        let path = self.events_path(id);
-        let line = serde_json::to_string(event).map_err(|source| StorageError::Serde {
-            path: path.display().to_string(),
-            source,
-        })?;
-        append_line(&path, &line)
-    }
-
-    pub fn list_events(&self, id: SessionId) -> Result<Vec<RuntimeEvent>, StorageError> {
-        let path = self.events_path(id);
-        read_jsonl(&path)
-    }
-
     /// Lists every session under the sessions root. A single damaged
     /// `meta.json` (unreadable or unparseable) is skipped rather than
     /// failing the entire listing — one corrupt session directory
@@ -231,18 +207,12 @@ impl SessionStore {
     }
 }
 
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Parses each non-blank line as `T`. A crash mid-`append_line` can only
-/// ever tear the *last* line in the file (all earlier lines were fully
-/// written and fsynced by prior calls), so only the last line is allowed to
-/// fail parsing — it's dropped rather than failing the whole load. A
-/// malformed line anywhere else indicates real corruption and is still a
-/// hard error.
+/// ever tear the *last* line in the file (earlier lines were written and
+/// flushed to disk by prior calls, and `append_line` cuts a torn tail off
+/// before appending after it), so only the last line is allowed to fail
+/// parsing — it's dropped rather than failing the whole load. A malformed
+/// line anywhere else indicates real corruption and is still a hard error.
 fn read_jsonl<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
 ) -> Result<Vec<T>, StorageError> {
@@ -434,6 +404,19 @@ mod tests {
         let turns = store.list_turns(meta.id).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_message().unwrap().text(), "hello");
+
+        // The session keeps working: later turns aren't glued onto the
+        // fragment (which would first hide them, then make the whole log
+        // unreadable).
+        for index in 1..=2 {
+            let mut next = Turn::new(meta.id, index);
+            next.messages
+                .push(arbe_core::Message::new(Role::User, format!("turn {index}")));
+            store.append_turn(&next).unwrap();
+        }
+        let turns = store.list_turns(meta.id).unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].user_message().unwrap().text(), "turn 2");
 
         fs::remove_dir_all(&dir).ok();
     }

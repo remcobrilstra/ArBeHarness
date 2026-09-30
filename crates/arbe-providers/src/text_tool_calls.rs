@@ -9,9 +9,15 @@
 //! so far could still be a textual tool call it holds the text back; as
 //! soon as it can't, it releases everything and passes text straight
 //! through. At the end of the stream, held text that parses as one or more
-//! calls to offered tools becomes tool calls; anything else is released as
-//! the text it was. Only a reply that is *entirely* tool calls qualifies:
-//! JSON inside prose is left alone, since it's usually an example.
+//! tool calls becomes tool calls; anything else is released as the text it
+//! was. Only a reply that is *entirely* tool calls qualifies: JSON inside
+//! prose is left alone, since it's usually an example.
+//!
+//! A call naming a tool that wasn't offered (small models sometimes use a
+//! tool's description as its name) still becomes a tool call: the harness
+//! then answers it with an "unknown tool" error listing the real names, so
+//! the model can correct itself — shown as text, it would silently become
+//! the model's answer instead.
 
 use serde_json::Value;
 
@@ -64,15 +70,20 @@ impl TextToolCallFilter {
     }
 
     /// Ends the stream: the held text as tool calls if it is entirely
-    /// calls to offered tools, otherwise as text to show.
+    /// tool calls, otherwise as text to show.
     pub(crate) fn finish(&mut self) -> Result<Vec<TextToolCall>, String> {
         let held = std::mem::take(&mut self.held);
         if held.trim().is_empty() {
             return Err(held);
         }
         match parse_calls(&held) {
-            Some(calls) if calls.iter().all(|c| self.offered.contains(&c.name)) => Ok(calls),
-            _ => Err(held),
+            Some(calls) => {
+                for call in calls.iter().filter(|c| !self.offered.contains(&c.name)) {
+                    tracing::debug!(name = %call.name, "text tool call names a tool that wasn't offered");
+                }
+                Ok(calls)
+            }
+            None => Err(held),
         }
     }
 }
@@ -187,11 +198,26 @@ mod tests {
     }
 
     #[test]
-    fn json_that_is_not_a_call_to_an_offered_tool_comes_back_as_text() {
+    fn a_call_to_a_tool_that_was_not_offered_is_still_a_call() {
+        // The harness answers it with an "unknown tool" error the model can
+        // learn from; as text it would become the model's final answer.
+        let text = "{\"name\": \"Find files matching a glob pattern\", \"arguments\": {\"pattern\": \"*\"}}";
+        let (shown, calls) = run(&["glob"], &[text]);
+        assert_eq!(shown, "");
+        assert_eq!(
+            calls,
+            Ok(vec![TextToolCall {
+                name: "Find files matching a glob pattern".into(),
+                arguments: json!({"pattern": "*"}),
+            }])
+        );
+    }
+
+    #[test]
+    fn json_that_is_not_a_tool_call_comes_back_as_text() {
         for text in [
-            "{\"name\": \"rm_rf\", \"arguments\": {}}", // not offered
             "{\"name\": \"get_weather\", \"city\": \"X\"}", // extra field
-            "{\"answer\": 42}",                         // other JSON
+            "{\"answer\": 42}",                             // other JSON
             "{\"name\": \"get_weather\", \"arguments\": {\"c", // truncated
         ] {
             let (shown, rest) = run(&["get_weather"], &[text]);

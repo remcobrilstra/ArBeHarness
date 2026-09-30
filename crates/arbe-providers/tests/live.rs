@@ -20,7 +20,9 @@
 //!   `ARBE_LIVE_COMPAT_API_KEY` if the server needs one
 
 use arbe_core::{Message, Role, StopReason, ToolSpec};
-use arbe_providers::{CancellationToken, ModelProvider, ModelRequest, build_provider, infer};
+use arbe_providers::{
+    CancellationToken, ModelProvider, ModelRequest, ProviderRegistry, ProviderSettings, infer,
+};
 use serde_json::json;
 
 struct Target {
@@ -65,7 +67,16 @@ fn target(name: &str) -> Option<Target> {
         _ => None,
     };
     Some(Target {
-        provider: build_provider(name, api_key, base_url).expect("provider builds"),
+        provider: ProviderRegistry::with_builtins()
+            .build(
+                name,
+                ProviderSettings {
+                    api_key,
+                    base_url,
+                    ..Default::default()
+                },
+            )
+            .expect("provider builds"),
         model,
         temperature: if name == "openai" { 1.0 } else { 0.0 },
     })

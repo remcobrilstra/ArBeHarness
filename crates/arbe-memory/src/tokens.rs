@@ -27,11 +27,34 @@ pub(crate) fn estimate_block_tokens(block: &ContentBlock) -> u64 {
         ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => estimate_tokens(text),
         ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
         ContentBlock::ToolUse { name, input, .. } => {
-            estimate_tokens(name) + estimate_tokens(&input.to_string())
+            estimate_tokens(name) + estimate_json_tokens(input)
         }
         ContentBlock::ToolResult { content, .. } => content.iter().map(estimate_block_tokens).sum(),
-        ContentBlock::Opaque { data, .. } => estimate_tokens(&data.to_string()),
+        ContentBlock::Opaque { data, .. } => estimate_json_tokens(data),
     }
+}
+
+/// [`estimate_tokens`] of `value`'s compact JSON text, counted while
+/// serializing instead of building the string: estimates run several
+/// times per request over the whole history, and tool-call arguments
+/// (whole files, for `write_file`) are its bulk.
+fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
+    /// Counts UTF-8 characters written to it (bytes that don't continue a
+    /// multi-byte character).
+    struct CharCounter(u64);
+    impl std::io::Write for CharCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.iter().filter(|b| (**b & 0xC0) != 0x80).count() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CharCounter(0);
+    // Writing to a counter can't fail, and a `Value` always serializes.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0.div_ceil(4)
 }
 
 /// Learns how far [`estimate_tokens`]'s ~4-chars/token heuristic is off
@@ -102,6 +125,20 @@ impl TokenCalibration {
 mod tests {
     use super::*;
     use arbe_core::{ImageSource, RequestedToolCall, Role};
+
+    #[test]
+    fn json_is_counted_like_its_text_without_building_it() {
+        for value in [
+            serde_json::json!({"path": "src/main.rs", "content": "fn main() {}\n"}),
+            serde_json::json!({"text": "café 🎉 — ünïcode", "n": [1, 2.5, null, true]}),
+            serde_json::json!("plain"),
+        ] {
+            assert_eq!(
+                estimate_json_tokens(&value),
+                estimate_tokens(&value.to_string())
+            );
+        }
+    }
     use serde_json::json;
 
     #[test]

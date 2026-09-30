@@ -617,7 +617,7 @@ async fn a_failing_tool_call_goes_back_to_the_model_instead_of_failing_the_turn(
     let requests = requests.lock().unwrap();
     let (_, text, is_error) = tool_result_of(requests[1].messages.last().unwrap(), 0);
     assert!(is_error);
-    assert!(text.contains("no tool registered"));
+    assert!(text.contains("there is no tool named"), "{text}");
 }
 
 #[tokio::test]
@@ -667,10 +667,17 @@ async fn an_approval_prompt_is_answered_while_the_turn_is_running() {
     })
     .await;
     assert!(t.agent.is_busy());
+    // A UI that missed the event can still find the call.
+    let pending = t.agent.pending_approvals();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].tool_call_id, id);
+    assert_eq!(pending[0].tool_name, "echo");
+    assert_eq!(pending[0].arguments, json!({"x": 1}));
     assert!(
         t.agent
             .supply_tool_decision(id, ApprovalDecision::ApprovedOnce)
     );
+    assert!(t.agent.pending_approvals().is_empty());
 
     let reply = tokio::time::timeout(Duration::from_secs(5), turn)
         .await
@@ -1131,6 +1138,35 @@ async fn builtin_tools_are_registered_and_usable_through_the_real_agent() {
     std::fs::remove_dir_all(&project_dir).ok();
 }
 
+#[tokio::test]
+async fn a_provider_that_cannot_start_leaves_no_session_behind() {
+    let store_dir = temp_dir("no-orphan-store");
+    let store = SessionStore::with_root(store_dir.clone());
+    // `openai` without a key fails to build.
+    let config = crate::RuntimeConfig {
+        provider_name: "openai".into(),
+        api_key: None,
+        ..crate::RuntimeConfig::defaults(temp_dir("no-orphan-project"))
+    };
+    assert!(Agent::create(&config, store.clone(), Arc::new(EventBus::default())).is_err());
+    assert!(store.list_sessions().unwrap().is_empty());
+
+    // Resuming under a broken provider leaves the session as it was.
+    let ok = crate::RuntimeConfig {
+        provider_name: "ollama".into(),
+        ..config.clone()
+    };
+    let agent = Agent::create(&ok, store.clone(), Arc::new(EventBus::default())).unwrap();
+    let id = agent.session_id();
+    agent.close().unwrap();
+    drop(agent);
+    assert!(Agent::resume(&config, store.clone(), id, Arc::new(EventBus::default())).is_err());
+    let meta = store.load_meta(id).unwrap();
+    assert_eq!(meta.status, arbe_core::SessionStatus::Closed);
+    assert_eq!(meta.pid, None);
+    std::fs::remove_dir_all(&store_dir).ok();
+}
+
 /// A profile's tool allow-set is enforced by construction: tools outside
 /// it aren't registered, so they're neither offered nor callable.
 #[tokio::test]
@@ -1166,7 +1202,7 @@ async fn the_general_profile_agent_only_has_its_allowed_tools() {
         .unwrap();
     let (_, text, is_error) = tool_result_of(&message, 0);
     assert!(is_error);
-    assert!(text.contains("no tool registered"), "{text}");
+    assert!(text.contains("there is no tool named"), "{text}");
     std::fs::remove_dir_all(&store_dir).ok();
 }
 
@@ -1181,6 +1217,7 @@ fn mcp_tools_replace_their_servers_previous_set_and_respect_the_allow_set() {
             "gh__*".into(),
             "docs__search".into(),
         ]),
+        owned: Arc::default(),
     };
     let tool = |name: &str| {
         (
@@ -1342,6 +1379,58 @@ async fn command_hooks_can_veto_tool_calls_and_their_failures_are_reported() {
     assert!(reason.contains('4'), "{reason}");
 }
 
+#[test]
+fn mcp_servers_with_colliding_names_keep_each_others_tools() {
+    let registry = Arc::new(RwLock::new(Arc::new(ToolRegistry::new())));
+    let sink = RegistrySink {
+        registry: registry.clone(),
+        allowed: None,
+        owned: Arc::default(),
+    };
+    let tool = |name: &str| {
+        (
+            name.to_string(),
+            Arc::new(EchoExecutor) as Arc<dyn ToolExecutor>,
+        )
+    };
+    // `foo` + `bar__baz` and `foo__bar` + `baz` qualify to the same name.
+    sink.replace_server_tools("foo__bar", vec![tool("foo__bar__baz")]);
+    sink.replace_server_tools("foo", vec![tool("foo__bar__baz"), tool("foo__x")]);
+    let names = registry.read().unwrap().names();
+    assert_eq!(names, ["foo__bar__baz", "foo__bar__baz_2", "foo__x"]);
+
+    // Refreshing `foo` replaces only its own tools, not `foo__bar`'s
+    // (which share its name prefix).
+    sink.replace_server_tools("foo", vec![tool("foo__y")]);
+    let names = registry.read().unwrap().names();
+    assert_eq!(names, ["foo__bar__baz", "foo__y"]);
+}
+
+#[tokio::test]
+async fn a_failing_guard_hook_blocks_the_call_unless_set_to_skip() {
+    for (block, expect_blocked) in [(true, true), (false, false)] {
+        let provider = ScriptedProvider::new(
+            vec![tool_calls(&[("c1", "echo", json!({"x": 1}))])],
+            answer("ok"),
+        );
+        let requests = provider.requests.clone();
+        let (t, _rx) = test_agent_with(provider, |parts| {
+            allow(&["echo"])(parts);
+            parts.hooks.register(Arc::new(
+                arbe_hooks::CommandHook::new(HookPhase::BeforeToolExecute, "exit 2")
+                    .blocking_on_failure(block),
+            ));
+        });
+        t.agent.register_tool("echo", Arc::new(EchoExecutor));
+        t.agent.submit_message("go".into()).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let (_, text, is_error) = tool_result_of(requests[1].messages.last().unwrap(), 0);
+        assert_eq!(is_error, expect_blocked, "{text}");
+        assert_eq!(text.starts_with("blocked: "), expect_blocked, "{text}");
+    }
+}
+
 #[tokio::test]
 async fn secrets_in_tool_output_never_reach_the_model_the_log_or_the_screen() {
     let provider = ScriptedProvider::new(
@@ -1456,7 +1545,10 @@ async fn history_past_the_trigger_is_summarized_by_the_model_and_the_summary_rep
     let requests = provider.requests.clone();
     let (t, mut rx) = test_agent_with(provider, |parts| {
         parts.settings.auto_compact = true;
-        parts.settings.budget_tokens = 2_000; // compacts past ~1600
+        // ~300 of it goes to the system prompt, leaving ~2000 for history:
+        // compaction starts past ~1600 — not after three ~505-token turns,
+        // but after four.
+        parts.settings.budget_tokens = 2_300;
     });
     for i in 0..4 {
         t.agent

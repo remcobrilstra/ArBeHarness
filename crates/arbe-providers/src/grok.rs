@@ -217,7 +217,7 @@ impl ModelProvider for GrokSubscriptionProvider {
                     Attempt::Ready(response) => response,
                     Attempt::Unauthorized => {
                         let scheme = self.account.scheme();
-                        return Err(ProviderError::Auth(format!(
+                        return Err(ProviderError::SignIn(format!(
                             "the {} rejected the session. {}",
                             scheme.display_name,
                             scheme.login_hint()
@@ -422,7 +422,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ProviderError::Auth(ref message)
+            matches!(err, ProviderError::SignIn(ref message)
                 if message.contains("isn't entitled to the Grok subscription")
                     && message.contains("XAI_API_KEY")),
             "{err}"

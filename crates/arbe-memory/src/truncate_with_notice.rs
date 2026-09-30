@@ -6,16 +6,18 @@ use crate::{ContextInput, ContextOutput, ContextStrategy};
 
 /// Same selection rule as [`crate::TruncationStrategy`] (pinned turns kept,
 /// most recent unpinned entries kept until budget runs out), but instead of
-/// silently dropping older messages it prepends one synthetic system
-/// message summarizing what was dropped. This is a deterministic
-/// placeholder summary (message count + estimated token size) rather than
-/// an LLM-generated one, since `ContextStrategy::build_context` is
-/// synchronous and has no provider to call — a future strategy can swap in
-/// real summarization behind the same trait without touching call sites.
+/// silently dropping older messages it prepends one system notice saying
+/// how much was left out, so the model knows the conversation started
+/// earlier.
+///
+/// It's the history strategy of `memory_strategy = "compact_summary"`,
+/// whose actual summary is written by the model: the runtime's compaction
+/// (`agent::compaction`) summarizes old turns before this strategy ever
+/// has to drop any, so this only acts on what's still too big after that.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CompactWithSummaryStrategy;
+pub struct TruncateWithNoticeStrategy;
 
-impl ContextStrategy for CompactWithSummaryStrategy {
+impl ContextStrategy for TruncateWithNoticeStrategy {
     fn name(&self) -> &'static str {
         "compact_summary"
     }
@@ -72,7 +74,7 @@ mod tests {
 
     #[test]
     fn no_summary_when_nothing_dropped() {
-        let strategy = CompactWithSummaryStrategy;
+        let strategy = TruncateWithNoticeStrategy;
         let out = strategy.build_context(ContextInput {
             session_history: &[entry(0, "hi")],
             budget_tokens: 1000,
@@ -84,7 +86,7 @@ mod tests {
 
     #[test]
     fn prepends_a_summary_message_when_entries_are_dropped() {
-        let strategy = CompactWithSummaryStrategy;
+        let strategy = TruncateWithNoticeStrategy;
         let out = strategy.build_context(ContextInput {
             session_history: &[entry(0, "aaaa"), entry(1, "bbbb"), entry(2, "cccc")],
             budget_tokens: 1,

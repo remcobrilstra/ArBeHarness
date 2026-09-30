@@ -1,9 +1,14 @@
-use arbe_core::SessionId;
 use std::path::{Path, PathBuf};
 
 /// Resolves the ArBeHarness root directory (`~/.arbe/`, overall design §6):
 /// where the harness's *own* persistent state lives (sessions, skills,
 /// memory, mcp config, logs).
+///
+/// Only the entry points call this (the binary, and `RuntimeConfig`'s
+/// defaults); everything else is handed the resolved home explicitly
+/// (`RuntimeConfig::home`, `SessionStore::with_root`, the `*_at`
+/// functions), so tests and embedders never depend on the process
+/// environment.
 ///
 /// Honors `ARBE_HOME` as an override. This is a **dev/test-only** knob —
 /// it relocates the harness's entire storage root, not just one session —
@@ -39,44 +44,9 @@ fn dirs_home() -> PathBuf {
         })
 }
 
-pub fn config_dir() -> PathBuf {
-    arbe_home().join("config")
-}
-
-pub fn sessions_dir() -> PathBuf {
-    arbe_home().join("sessions")
-}
-
-pub fn session_dir(session_id: SessionId) -> PathBuf {
-    sessions_dir().join(session_id.to_string())
-}
-
-pub fn skills_dir() -> PathBuf {
-    arbe_home().join("skills")
-}
-
-pub fn instructions_dir() -> PathBuf {
-    instructions_dir_at(&arbe_home())
-}
-
-/// Same as [`instructions_dir`] but resolves against an explicit root
-/// instead of always reading `ARBE_HOME` — same reasoning as
-/// `SessionStore::with_root`: env vars are process-global and race across
-/// parallel tests.
+/// `<arbe_home>/instructions`.
 pub fn instructions_dir_at(arbe_home: &Path) -> PathBuf {
     arbe_home.join("instructions")
-}
-
-pub fn memory_dir() -> PathBuf {
-    arbe_home().join("memory")
-}
-
-pub fn mcp_dir() -> PathBuf {
-    arbe_home().join("mcp")
-}
-
-pub fn logs_dir() -> PathBuf {
-    arbe_home().join("logs")
 }
 
 #[cfg(test)]

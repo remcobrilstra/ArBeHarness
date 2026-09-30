@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use arbe_core::{RiskLevel, RuntimeEvent, ToolCallId, ToolError, ToolInvocation, ToolResult};
 use arbe_tools::{ToolContext, ToolDescription, ToolExecutor, schemars};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -24,16 +24,28 @@ pub(super) const ASK_USER_TOOL: &str = "ask_user";
 /// Most options a question may offer.
 const MAX_OPTIONS: usize = 8;
 
+/// A question waiting for the user's answer, as `UserQuestionAsked` said
+/// it — kept so a UI that missed the event can still show it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingQuestion {
+    pub question_id: ToolCallId,
+    pub question: String,
+    pub options: Vec<String>,
+    pub allow_free_text: bool,
+}
+
 /// Answers to questions that are waiting for one.
 #[derive(Default)]
 pub(super) struct QuestionMailbox {
-    waiting: Mutex<HashMap<ToolCallId, oneshot::Sender<String>>>,
+    waiting: Mutex<HashMap<ToolCallId, (oneshot::Sender<String>, PendingQuestion)>>,
 }
 
+type Waiting = HashMap<ToolCallId, (oneshot::Sender<String>, PendingQuestion)>;
+
 impl QuestionMailbox {
-    fn register(&self, id: ToolCallId) -> oneshot::Receiver<String> {
+    fn register(&self, question: PendingQuestion) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
-        self.lock().insert(id, tx);
+        self.lock().insert(question.question_id, (tx, question));
         rx
     }
 
@@ -41,7 +53,7 @@ impl QuestionMailbox {
     /// waiting on it (already answered, or the turn was cancelled).
     pub(super) fn answer(&self, id: ToolCallId, answer: String) -> bool {
         match self.lock().remove(&id) {
-            Some(tx) => tx.send(answer).is_ok(),
+            Some((tx, _)) => tx.send(answer).is_ok(),
             None => false,
         }
     }
@@ -50,7 +62,12 @@ impl QuestionMailbox {
         self.lock().remove(&id);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ToolCallId, oneshot::Sender<String>>> {
+    /// Every question waiting for an answer.
+    pub(super) fn pending(&self) -> Vec<PendingQuestion> {
+        self.lock().values().map(|(_, q)| q.clone()).collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Waiting> {
         self.waiting.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -111,7 +128,12 @@ impl ToolExecutor for AskUserTool {
         let allow_free_text = options.is_empty() || args.allow_free_text.unwrap_or(true);
 
         let id = invocation.id;
-        let answer = self.mailbox.register(id);
+        let answer = self.mailbox.register(PendingQuestion {
+            question_id: id,
+            question: question.clone(),
+            options: options.clone(),
+            allow_free_text,
+        });
         self.events.publish(RuntimeEvent::UserQuestionAsked {
             turn_id: invocation.source_turn,
             question_id: id,
@@ -202,7 +224,11 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        let pending = mailbox.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].question, "Tabs or spaces?");
         assert!(mailbox.answer(id, "spaces".into()));
+        assert!(mailbox.pending().is_empty());
         assert!(!mailbox.answer(id, "again".into()));
         let result = run.await.unwrap().unwrap();
         assert_eq!(result.output, json!({"answer": "spaces"}));

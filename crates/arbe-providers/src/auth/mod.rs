@@ -71,7 +71,7 @@ impl AuthScheme {
         } else {
             format!(" {}", self.entitlement_hint)
         };
-        ProviderError::Auth(format!(
+        ProviderError::SignIn(format!(
             "this account isn't entitled to the {}{code}.{hint}",
             self.display_name
         ))

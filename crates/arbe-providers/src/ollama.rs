@@ -22,7 +22,7 @@ const DEFAULT_BASE_URL: &str = "http://localhost:11434";
 /// version, so it's always set explicitly — and taken from
 /// `capabilities(model)`, so what the harness budgets for and what the
 /// server allocates always agree (override per model via the catalog).
-pub(crate) const CONTEXT_WINDOW: u64 = 8_192;
+pub(crate) const CONTEXT_WINDOW: u64 = 16_384;
 
 pub struct OllamaProvider {
     client: reqwest::Client,

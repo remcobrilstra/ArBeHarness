@@ -5,7 +5,6 @@
 pub mod atomic;
 pub mod error;
 pub mod instructions;
-pub mod memory_files;
 pub mod paths;
 pub mod session_store;
 

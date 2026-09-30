@@ -26,24 +26,6 @@ use std::sync::Arc;
 
 use crate::ToolRegistry;
 
-/// The fixed tool-name -> executor wiring. Kept in one place so the set of
-/// builtin tools (and their names, which a future automatic tool-call
-/// parser will need to match against a model's requested tool) has a
-/// single source of truth.
-pub const TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_dir",
-    "glob",
-    "grep",
-    "execute",
-    "process_output",
-    "process_kill",
-    "todo_write",
-    "web_fetch",
-];
-
 /// Registers every builtin tool, sandboxed to `root` (the agent's project
 /// directory — `RuntimeConfig::project_dir`).
 pub fn register_all(registry: &mut ToolRegistry, root: &Path) {
@@ -120,16 +102,25 @@ mod tests {
     }
 
     #[test]
-    fn registers_every_declared_tool_name() {
+    fn registers_the_builtin_tools() {
         let mut registry = ToolRegistry::new();
         register_all(&mut registry, Path::new("."));
-
-        for name in TOOL_NAMES {
-            assert!(
-                registry.contains(name),
-                "expected {name:?} to be registered"
-            );
-        }
+        assert_eq!(
+            registry.names(),
+            [
+                "edit_file",
+                "execute",
+                "glob",
+                "grep",
+                "list_dir",
+                "process_kill",
+                "process_output",
+                "read_file",
+                "todo_write",
+                "web_fetch",
+                "write_file",
+            ]
+        );
     }
 
     fn builtin_specs() -> Vec<arbe_core::ToolSpec> {
@@ -150,7 +141,7 @@ mod tests {
     #[test]
     fn every_builtin_describes_itself_with_an_object_schema() {
         let specs = builtin_specs();
-        assert_eq!(specs.len(), TOOL_NAMES.len());
+        assert_eq!(specs.len(), 11);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),

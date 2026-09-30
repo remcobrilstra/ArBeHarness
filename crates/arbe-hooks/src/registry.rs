@@ -55,6 +55,7 @@ impl HookRegistry {
         let mut failures = Vec::new();
         for hook in self.hooks.iter().filter(|h| h.phase() == phase) {
             let name = hook.name();
+            let blocking = hook.blocks_on_failure();
             let limit = hook.timeout().unwrap_or(self.timeout);
             let hook = hook.clone();
             let input = current.clone();
@@ -79,7 +80,11 @@ impl HookRegistry {
                 }
             };
             tracing::warn!(hook = %name, %reason, "hook failed; skipping its output");
-            failures.push(HookFailure { hook: name, reason });
+            failures.push(HookFailure {
+                hook: name,
+                reason,
+                blocking,
+            });
         }
         (current, failures)
     }
@@ -90,6 +95,10 @@ impl HookRegistry {
 pub struct HookFailure {
     pub hook: String,
     pub reason: String,
+    /// The hook asked for its failure to block what it guards (e.g. a
+    /// `before_tool_execute` guard: the call is refused) instead of being
+    /// skipped.
+    pub blocking: bool,
 }
 
 #[cfg(test)]

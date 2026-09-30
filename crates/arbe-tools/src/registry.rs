@@ -23,10 +23,17 @@ impl ToolRegistry {
         self.executors.insert(tool_name.into(), executor);
     }
 
+    /// The executor for `tool_name`. The error for an unknown name lists
+    /// the real ones: it's what the model reads after calling a tool that
+    /// doesn't exist (a typo, or a small model using a tool's description
+    /// as its name), and the list is how it corrects itself.
     pub fn get(&self, tool_name: &str) -> Result<&Arc<dyn ToolExecutor>, ToolError> {
-        self.executors
-            .get(tool_name)
-            .ok_or_else(|| ToolError::Validation(format!("no tool registered as {tool_name:?}")))
+        self.executors.get(tool_name).ok_or_else(|| {
+            ToolError::Validation(format!(
+                "there is no tool named {tool_name:?}; call one of these by its exact name: {}",
+                self.names().join(", ")
+            ))
+        })
     }
 
     pub fn contains(&self, tool_name: &str) -> bool {

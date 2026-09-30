@@ -58,6 +58,21 @@ impl ToolRule {
         self.pattern.is_some()
     }
 
+    /// Whether matching `command` (a shell command line) would rely on
+    /// `*` swallowing a shell operator the rule doesn't spell out — so
+    /// `cargo test*` would also cover `cargo test && rm -rf ~`. Such a
+    /// match mustn't auto-approve. Exact rules compare literally and never
+    /// chain beyond themselves.
+    pub fn chains_beyond(&self, command: &str) -> bool {
+        const OPERATORS: &[&str] = &[";", "&", "|", "`", "$(", ">", "<", "\n", "\r"];
+        match &self.pattern {
+            Some(Pattern::Wildcard(pattern)) => OPERATORS
+                .iter()
+                .any(|op| command.contains(op) && !pattern.contains(op)),
+            _ => false,
+        }
+    }
+
     /// A rule with a pattern only matches calls that have a subject.
     pub fn matches(&self, tool: &str, subject: Option<&str>) -> bool {
         let tool_matches = match &self.pattern {

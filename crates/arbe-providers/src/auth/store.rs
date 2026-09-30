@@ -55,7 +55,7 @@ pub(super) fn fresh_access_token(
 
 pub(super) fn read_required(scheme: &AuthScheme, path: &Path) -> Result<Stored, ProviderError> {
     read_optional(scheme, path)?.ok_or_else(|| {
-        ProviderError::Auth(format!(
+        ProviderError::SignIn(format!(
             "not signed in to the {}. {}",
             scheme.display_name,
             scheme.login_hint()
@@ -66,7 +66,7 @@ pub(super) fn read_required(scheme: &AuthScheme, path: &Path) -> Result<Stored, 
 fn read_optional(scheme: &AuthScheme, path: &Path) -> Result<Option<Stored>, ProviderError> {
     match fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map(Some).map_err(|_| {
-            ProviderError::Auth(format!(
+            ProviderError::SignIn(format!(
                 "the {} credential file is unreadable. {}",
                 scheme.display_name,
                 scheme.login_hint()

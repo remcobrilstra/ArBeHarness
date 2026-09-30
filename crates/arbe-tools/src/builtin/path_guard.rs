@@ -84,9 +84,12 @@ pub async fn verify_no_symlink_escape(root: &Path, path: &Path) -> Result<(), To
         ))
     })?;
 
+    // `symlink_metadata`, not `metadata`: a symlink whose target doesn't
+    // exist must count as existing here (and then fail to resolve below),
+    // not be skipped over as "a path that doesn't exist yet".
     let mut existing = path;
     loop {
-        if tokio::fs::metadata(existing).await.is_ok() {
+        if tokio::fs::symlink_metadata(existing).await.is_ok() {
             break;
         }
         match existing.parent() {
@@ -96,10 +99,17 @@ pub async fn verify_no_symlink_escape(root: &Path, path: &Path) -> Result<(), To
     }
 
     let canonical_existing = tokio::fs::canonicalize(existing).await.map_err(|e| {
-        ToolError::RuntimeFailure(format!(
-            "could not canonicalize {}: {e}",
-            existing.display()
-        ))
+        let is_link = std::fs::symlink_metadata(existing).is_ok_and(|m| m.file_type().is_symlink());
+        if is_link {
+            ToolError::Validation(format!(
+                "path {path:?} goes through a symbolic link whose target can't be resolved ({e})"
+            ))
+        } else {
+            ToolError::RuntimeFailure(format!(
+                "could not canonicalize {}: {e}",
+                existing.display()
+            ))
+        }
     })?;
 
     if !canonical_existing.starts_with(&canonical_root) {
@@ -232,6 +242,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_a_dangling_symlink_instead_of_treating_it_as_a_new_file() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        // Points outside at a file that doesn't exist (yet).
+        symlink(
+            outside.path().join("new.txt"),
+            sandbox.path().join("dangling.txt"),
+        )
+        .unwrap();
+
+        let resolved = resolve_within_root(sandbox.path(), "dangling.txt").unwrap();
+        let err = verify_no_symlink_escape(sandbox.path(), &resolved)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(ref m) if m.contains("symbolic link")));
+        // Also as a directory on the way to a new file.
+        symlink(outside.path().join("dir"), sandbox.path().join("d")).unwrap();
+        let resolved = resolve_within_root(sandbox.path(), "d/new.txt").unwrap();
+        assert!(
+            verify_no_symlink_escape(sandbox.path(), &resolved)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gone");
+        let err = verify_no_symlink_escape(&root, &root.join("f.txt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::RuntimeFailure(_)));
     }
 
     #[tokio::test]

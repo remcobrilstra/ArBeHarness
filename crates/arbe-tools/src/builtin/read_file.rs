@@ -35,9 +35,9 @@ fn image_media_type(path: &std::path::Path) -> Option<&'static str> {
 struct Args {
     /// Path relative to the project root.
     path: String,
-    /// First line to read, 1-indexed and inclusive. Omit (with `end_line`) to read the whole file.
+    /// First line to read, 1-indexed and inclusive. Default: the first line.
     start_line: Option<u64>,
-    /// Last line to read, 1-indexed and inclusive.
+    /// Last line to read, 1-indexed and inclusive. Default: the last line.
     end_line: Option<u64>,
 }
 
@@ -55,6 +55,10 @@ impl ReadFileTool {
 impl ToolExecutor for ReadFileTool {
     fn read_only(&self) -> bool {
         true
+    }
+
+    fn subject_kind(&self) -> crate::SubjectKind {
+        crate::SubjectKind::Path
     }
 
     /// Rule subject: the path (see `ToolExecutor::subject`).
@@ -136,8 +140,9 @@ impl ToolExecutor for ReadFileTool {
     }
 }
 
-/// Extracts `[start_line, end_line]` (1-indexed, inclusive) from `text`,
-/// or the whole text if both are `None`. Pure and separately tested so the
+/// Extracts `[start_line, end_line]` (1-indexed, inclusive) from `text`;
+/// a missing bound is the start or end of the file, and with neither the
+/// whole text comes back as it is. Pure and separately tested so the
 /// line-range edge cases (out-of-range, reversed, single-line files) don't
 /// need a real file on disk to verify.
 fn slice_lines(
@@ -148,9 +153,11 @@ fn slice_lines(
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len() as u64;
 
-    let (Some(start), Some(end)) = (start_line, end_line) else {
+    if start_line.is_none() && end_line.is_none() {
         return Ok((text.to_string(), total_lines));
-    };
+    }
+    let start = start_line.unwrap_or(1);
+    let end = end_line.unwrap_or(total_lines.max(start));
 
     if start == 0 || start > end {
         return Err(ToolError::Validation(format!(
@@ -197,6 +204,14 @@ mod tests {
         let (content, total) = slice_lines("a\nb\nc\nd", Some(2), Some(3)).unwrap();
         assert_eq!(content, "b\nc");
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn a_missing_bound_means_the_start_or_end_of_the_file() {
+        assert_eq!(slice_lines("a\nb\nc\nd", Some(3), None).unwrap().0, "c\nd");
+        assert_eq!(slice_lines("a\nb\nc\nd", None, Some(2)).unwrap().0, "a\nb");
+        // Starting past the end is empty, not an error.
+        assert_eq!(slice_lines("a\nb", Some(5), None).unwrap().0, "");
     }
 
     #[test]

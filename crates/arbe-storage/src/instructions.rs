@@ -6,16 +6,10 @@ use crate::paths;
 
 /// Reads `<arbe_home>/instructions/agent.md` — instructions that apply to
 /// every session/project on the machine. Returns `Ok(None)` rather than an
-/// error when the file doesn't exist, mirroring `memory_files`: an absent
-/// global instructions file is a normal starting state, not a failure.
+/// error when the file doesn't exist: an absent global instructions file
+/// is a normal starting state, not a failure.
 pub fn read_global_instructions_at(arbe_home: &Path) -> Result<Option<String>, StorageError> {
     read_optional(&global_instructions_path(arbe_home))
-}
-
-/// Same as [`read_global_instructions_at`] but resolves the root via
-/// [`paths::arbe_home`] (honors `ARBE_HOME`).
-pub fn read_global_instructions() -> Result<Option<String>, StorageError> {
-    read_global_instructions_at(&paths::arbe_home())
 }
 
 /// Reads project-specific instructions from the project root: prefers

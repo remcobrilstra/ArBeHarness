@@ -3,8 +3,8 @@
 //!
 //! Requests (client → harness): `initialize`, `session/new`,
 //! `session/resume`, `session/list`, `session/set_title`, `session/close`,
-//! `session/context`, `session/set_mode`, `turn/send`, `turn/cancel`, `approval/decide`, `question/answer`,
-//! `shutdown`. Every event
+//! `session/context`, `session/set_mode`, `session/pending`, `turn/send`,
+//! `turn/cancel`, `approval/decide`, `question/answer`, `shutdown`. Every event
 //! of an open session arrives as an `event` notification
 //! (`{"session_id", "seq", "event"}`). Requests run concurrently: while
 //! `turn/send` waits for its turn, the client can answer approvals or
@@ -318,6 +318,15 @@ impl Server {
                 let usage = self.with_session(p.session_id, |s| Ok(s.context_usage()))?;
                 Ok(json!({"usage": usage}))
             }),
+            // What's waiting for the client, for one that missed events.
+            "session/pending" => params::<SessionParams>(raw).and_then(|p| {
+                self.with_session(p.session_id, |s| {
+                    Ok(json!({
+                        "approvals": s.agent().pending_approvals(),
+                        "questions": s.agent().pending_questions(),
+                    }))
+                })
+            }),
             "turn/send" => match params::<SendParams>(raw) {
                 // Answered by the session's forwarder, after the turn's events.
                 Ok(p) => match self.send_turn(id.clone(), p) {
@@ -541,72 +550,8 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbe_tui::arbe_runtime::arbe_core::{ProviderError, Role, Usage};
-    use arbe_tui::arbe_runtime::arbe_providers::{
-        CancellationToken, ModelCapabilities, ModelProvider, ModelRequest, ProviderEvent,
-        ProviderStream,
-    };
-    use async_trait::async_trait;
+    use crate::test_support::scripted_harness;
     use tokio::io::BufReader;
-
-    /// Asks to read `a.txt`, then says whether the read returned its text.
-    struct ReadThenAnswer;
-
-    #[async_trait]
-    impl ModelProvider for ReadThenAnswer {
-        fn id(&self) -> &str {
-            "scripted"
-        }
-        fn capabilities(&self, _model: &str) -> ModelCapabilities {
-            ModelCapabilities {
-                streaming: true,
-                tool_calls: true,
-                vision: false,
-                thinking: false,
-                prompt_caching: false,
-                max_context_tokens: 32_000,
-            }
-        }
-        async fn stream(
-            &self,
-            req: ModelRequest,
-            _cancel: CancellationToken,
-        ) -> Result<ProviderStream, ProviderError> {
-            let last = req.messages.last().unwrap();
-            let events = if last.role == Role::Tool {
-                vec![
-                    ProviderEvent::TextDelta(
-                        if serde_json::to_string(&last.content)
-                            .unwrap()
-                            .contains("hello from a.txt")
-                        {
-                            "the file says hello".into()
-                        } else {
-                            "the read failed".into()
-                        },
-                    ),
-                    ProviderEvent::Usage(Usage::default()),
-                    ProviderEvent::Stop(StopReason::EndTurn),
-                ]
-            } else {
-                vec![
-                    ProviderEvent::ToolUseStart {
-                        id: "c1".into(),
-                        name: "read_file".into(),
-                    },
-                    ProviderEvent::ToolUseInputDelta {
-                        id: "c1".into(),
-                        partial_json: r#"{"path":"a.txt"}"#.into(),
-                    },
-                    ProviderEvent::ToolUseEnd { id: "c1".into() },
-                    ProviderEvent::Stop(StopReason::ToolUse),
-                ]
-            };
-            Ok(Box::pin(futures_util::stream::iter(
-                events.into_iter().map(Ok),
-            )))
-        }
-    }
 
     struct Client {
         input: tokio::io::WriteHalf<tokio::io::DuplexStream>,
@@ -649,20 +594,7 @@ mod tests {
     }
 
     fn start() -> (Client, JoinHandle<()>, tempfile::TempDir, tempfile::TempDir) {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("a.txt"), "hello from a.txt").unwrap();
-        let harness = Harness::builder()
-            .ignore_env()
-            .home(home.path())
-            .project_dir(project.path())
-            .register_provider("scripted", |_| {
-                Ok(Box::new(ReadThenAnswer) as Box<dyn ModelProvider>)
-            })
-            .provider("scripted")
-            .model("any")
-            .build()
-            .unwrap();
+        let (harness, home, project) = scripted_harness();
         let (client_end, server_end) = tokio::io::duplex(1 << 16);
         let (server_read, server_write) = tokio::io::split(server_end);
         let server = tokio::spawn(serve(harness, BufReader::new(server_read), server_write));
@@ -692,6 +624,14 @@ mod tests {
         let approval = client
             .until(|m| m["params"]["event"]["type"] == "tool_approval_requested")
             .await;
+        let pending = client
+            .call(7, "session/pending", json!({"session_id": session_id}))
+            .await;
+        assert_eq!(
+            pending["result"]["approvals"][0]["tool_call_id"],
+            approval["params"]["event"]["tool_call_id"]
+        );
+        assert_eq!(pending["result"]["questions"], json!([]));
         let decided = client
             .call(
                 4,

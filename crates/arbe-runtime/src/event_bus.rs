@@ -39,9 +39,14 @@ impl EventBus {
     }
 }
 
+/// Events a bus buffers per subscriber before the slowest one starts
+/// missing the oldest. Generous: a streamed answer is one event per chunk,
+/// and a UI redrawing a large transcript can fall behind briefly.
+pub const DEFAULT_CAPACITY: usize = 4_096;
+
 impl Default for EventBus {
     fn default() -> Self {
-        Self::new(256)
+        Self::new(DEFAULT_CAPACITY)
     }
 }
 

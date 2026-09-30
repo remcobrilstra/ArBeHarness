@@ -75,9 +75,20 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - `/clear` clears the transcript and starts a fresh session (same as `Ctrl+N`). The previous session stays on disk and can be resumed.
 - The model's reasoning in a collapsible `[thinking]` entry (`Ctrl+T`); live preview of tool arguments while they stream; subagent activity nested under its `task` call.
 
+### Fixes from the 2026-09-30 code review
+
+See [`reports/Code review 2026-09-30.md`](reports/Code%20review%202026-09-30.md).
+
+- **Security:** an untrusted project's config can no longer point `prompt` at a file (it could have read any local file into requests). Selecting a different provider drops the previous provider's endpoint, headers and key settings, so a key is never sent to another provider's address. A `*` in an `execute` allow rule no longer approves chained or redirected commands (`cargo test && …`). `web_fetch` follows redirects only within the same site. A `before_tool_execute` hook that fails now blocks the call (`on_failure = "skip"` to opt out).
+- **Durability:** a crash mid-append can no longer make a session's history unreadable later (torn last lines are cut off before the next append); history and metadata writes are flushed to disk; replacing a file keeps its permissions (scripts stay executable).
+- **Reliability:** hooks can't deadlock on large payloads; `execute` keeps at most the first and last 512 KB of each output stream; a provider that fails to start no longer leaves a half-open session behind; the TUI gives each session its own event stream, reopens approval/question dialogs it missed, times approvals by the clock, and restores the terminal if it crashes; MCP tools with clashing names no longer replace each other; OpenAI-compatible mid-stream errors are reported for what they are.
+- **Small models:** Ollama runs with a 16k context by default (was 8k); automatic compaction measures history against the room it actually has; a tool call written as text with a wrong tool name gets an error listing the real names instead of becoming the answer.
+- **Smaller:** `read_file` accepts just `start_line` or just `end_line`; `process_kill` is medium risk; `remember` appends instead of rewriting; `/tool` with invalid JSON is refused; `session/pending` in `--headless`; config and storage problems no longer say "please report a bug".
+- Removed unused code: `RuntimeCommand`, `arbe_storage::memory_files`, the `ARBE_HOME`-reading path helpers, the `events.jsonl` API, `build_provider`, `register_demo_tool`, `Message::cache_breakpoint`, the session-local skill scope and unused error variants. One shared shell helper (`arbe_core::shell`) replaces four copies.
+
 ### Development
 
-- 471 tests, plus live tests against real models (`#[ignore]`d; a manual CI workflow), HTTP-level provider tests, criterion benchmarks, and `cargo-deny` checks.
+- 565 tests, plus live tests against real models (`#[ignore]`d; a manual CI workflow), HTTP-level provider tests, criterion benchmarks, and `cargo-deny` checks.
 - Updated rustls to 0.23.45 (RUSTSEC-2026-0285).
 
 ## 0.1.0

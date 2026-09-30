@@ -5,19 +5,19 @@
 //! instructions/skills/memory/history/user-input (overall design §5.2).
 
 pub mod breakdown;
-pub mod compact_summary;
 pub mod history;
 pub mod pipeline;
 pub mod prune;
 pub mod tokens;
+pub mod truncate_with_notice;
 pub mod truncation;
 
 pub use breakdown::{count_stubbed_results, count_turns, estimate_tool_specs, measure_messages};
-pub use compact_summary::CompactWithSummaryStrategy;
 pub use history::HistoryEntry;
 pub use pipeline::ContextPipeline;
 pub use prune::{drop_oldest_turns, prune_history, prune_tool_results};
 pub use tokens::{TokenCalibration, estimate_message_tokens, estimate_tokens};
+pub use truncate_with_notice::TruncateWithNoticeStrategy;
 pub use truncation::TruncationStrategy;
 
 use serde::{Deserialize, Serialize};

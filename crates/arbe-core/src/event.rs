@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::context::ContextUsage;
 use crate::ids::{SessionId, ToolCallId, TurnId};
-use crate::tool::{ApprovalDecision, RiskLevel, ToolResult};
+use crate::tool::{RiskLevel, ToolResult};
 use crate::usage::{StopReason, Usage};
 
 /// A published `RuntimeEvent` plus its position in the bus's stream.
@@ -17,8 +17,9 @@ pub struct EventEnvelope {
 }
 
 /// Events emitted by the runtime for UI/debug tooling to consume
-/// (TUI spec §5, harness spec FR-10). The TUI must never depend on
-/// anything but this contract plus `RuntimeCommand`.
+/// (TUI spec §5, harness spec FR-10). Clients act on a session through
+/// `Agent`'s methods (or the `--headless` JSON-RPC protocol) and learn
+/// what happened from these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -195,35 +196,4 @@ impl RuntimeEvent {
         }
         (event, depth)
     }
-}
-
-/// Commands the TUI (or any other client) sends to the runtime (TUI spec §5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RuntimeCommand {
-    SubmitUserMessage {
-        session_id: SessionId,
-        content: String,
-    },
-    ApproveToolCall {
-        tool_call_id: ToolCallId,
-        decision: ApprovalDecision,
-    },
-    DenyToolCall {
-        tool_call_id: ToolCallId,
-        decision: ApprovalDecision,
-    },
-    CreateSession {
-        profile: String,
-    },
-    ResumeSession {
-        session_id: SessionId,
-    },
-    TerminateSession {
-        session_id: SessionId,
-    },
-    /// Cancel the session's in-flight turn, if any.
-    CancelTurn {
-        session_id: SessionId,
-    },
 }

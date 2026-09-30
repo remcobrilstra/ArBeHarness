@@ -5,10 +5,6 @@ use crate::error::SkillError;
 use crate::manifest::parse_manifest;
 use crate::{SkillManifest, SkillScope};
 
-/// Loads every `*.md` manifest directly inside `dir` (non-recursive). A
-/// missing directory is not an error — an empty scope is a normal starting
-/// state (mirrors `arbe_storage::memory_files` treating a missing memory
-/// file as `None`, not a failure).
 /// What loading a directory found: the skills that parsed, and a
 /// problem for each file that didn't (so one bad file is reported, not
 /// fatal to the rest).
@@ -19,8 +15,8 @@ pub struct Loaded {
 }
 
 /// Loads every `*.md` skill directly in `dir` (not subdirectories). A
-/// missing directory is simply empty. Files are read in name order, so
-/// results are stable.
+/// missing directory is not an error — an empty scope is a normal
+/// starting state. Files are read in name order, so results are stable.
 pub fn load_dir(dir: &Path, scope: SkillScope) -> Loaded {
     let mut loaded = Loaded::default();
     if !dir.exists() {

@@ -14,11 +14,10 @@ pub use merge::merge_skills;
 use serde::{Deserialize, Serialize};
 
 /// Where a skill was resolved from; determines merge precedence
-/// (session-local > project-local > global).
+/// (project-local > global).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillScope {
-    SessionLocal,
     ProjectLocal,
     Global,
 }
