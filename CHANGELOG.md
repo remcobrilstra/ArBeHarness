@@ -9,6 +9,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 ### Models
 
 - Providers: OpenAI, **Anthropic** (with extended thinking), **Ollama** (tool calling on), and **any OpenAI-compatible server** (xAI, vLLM, LM Studio, OpenRouter, …). Switching is a setting.
+- **Signing in with an account** instead of an API key: `arbeharness login <account>` / `logout <account>` (OAuth device code), one session file per account under `~/.arbe/auth/`, refreshed automatically. Accounts are provider-neutral `AuthScheme`s; the first is **`grok`**: the `grok-subscription` profile calls `cli-chat-proxy.grok.com` with it. An `XAI_API_KEY` on `api.x.ai` stays a separate, metered profile. The subscription token is not sent to any other host.
 - Streaming everywhere, including tool calls and reasoning (`reasoning_content` from compatible servers shows as thinking).
 - Retries with backoff for rate limits, overload, timeouts and server errors 500/502/503/529, honoring `Retry-After`.
 - A reply that breaks off partway is an error, never a silently truncated answer.
@@ -63,6 +64,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - `--print "<prompt>"`: one turn without a UI, with `--approve none|reads|all`, `--output text|json` and meaningful exit codes.
 - `--headless`: JSON-RPC 2.0 over stdio (sessions, turns, approvals, cancellation, events).
 - `--resume <id>`, `--prompt`, `--name`, `--profile`, `--provider`, `--model`, `--config`, `--version`, `--help`; unknown options are errors.
+- `arbeharness login [account]` / `logout [account]` for signed-in accounts (today: `grok`).
 - A library API: `arbe_runtime::Harness::builder()` → `Session::send` → a stream of events and the answer.
 - `meta.json` records each session's `workdir`, git `branch`, live `activity` and `pid`, so other programs can track sessions.
 - Resuming a session runs it on the current profile's provider and model (previously the saved model name was sent to the current provider).
@@ -70,6 +72,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 ### Terminal UI
 
 - Switch the session to another profile — and so another provider/model — with `Ctrl+P` or `/profile [name]`; the conversation carries over.
+- `/clear` clears the transcript and starts a fresh session (same as `Ctrl+N`). The previous session stays on disk and can be resumed.
 - The model's reasoning in a collapsible `[thinking]` entry (`Ctrl+T`); live preview of tool arguments while they stream; subagent activity nested under its `task` call.
 
 ### Development

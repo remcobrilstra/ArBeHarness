@@ -4,11 +4,13 @@
 //! `match` — and an embedder can register its own alongside the builtins.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arbe_core::ProviderError;
 
 use crate::catalog::ModelCatalog;
+use crate::grok::GrokSubscriptionProvider;
 use crate::{AnthropicProvider, ModelProvider, OllamaProvider, OpenAiProvider};
 
 /// Everything config can say about how to reach a provider.
@@ -21,6 +23,10 @@ pub struct ProviderSettings {
     pub extra_headers: Vec<(String, String)>,
     /// Per-model capability overrides on top of the built-in table.
     pub catalog: ModelCatalog,
+    /// Where signed-in accounts are stored (`<home>/auth`, see
+    /// [`crate::auth`]), for providers that sign in instead of taking an
+    /// API key.
+    pub auth_dir: Option<PathBuf>,
 }
 
 pub type ProviderFactory =
@@ -45,7 +51,7 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// `openai`, `openai_compatible`, `anthropic`, `ollama`.
+    /// `openai`, `openai_compatible`, `anthropic`, `ollama`, `grok_subscription`.
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register("openai", |s: ProviderSettings| {
@@ -88,6 +94,19 @@ impl ProviderRegistry {
                 p = p.with_base_url(url);
             }
             Ok(Box::new(p) as Box<dyn ModelProvider>)
+        });
+        registry.register("grok_subscription", |s: ProviderSettings| {
+            let auth_dir = s.auth_dir.clone().ok_or_else(|| {
+                ProviderError::InvalidRequest(
+                    "grok_subscription needs a directory for its sign-in credential".into(),
+                )
+            })?;
+            Ok(Box::new(GrokSubscriptionProvider::new(
+                s.base_url,
+                &auth_dir,
+                s.extra_headers,
+                s.catalog,
+            )?) as Box<dyn ModelProvider>)
         });
         registry
     }
@@ -132,7 +151,13 @@ mod tests {
     fn builtins_are_registered() {
         assert_eq!(
             ProviderRegistry::with_builtins().ids(),
-            vec!["anthropic", "ollama", "openai", "openai_compatible"]
+            vec![
+                "anthropic",
+                "grok_subscription",
+                "ollama",
+                "openai",
+                "openai_compatible"
+            ]
         );
     }
 

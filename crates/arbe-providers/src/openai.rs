@@ -520,45 +520,58 @@ impl ModelProvider for OpenAiProvider {
         }
         let request = http::with_extra_headers(request, &self.extra_headers);
         let response = http::send(request, &cancel).await?;
+        Ok(stream_sse_chat(response, cancel))
+    }
+}
 
-        let events = async_stream::stream! {
-            let mut decoder = SseDecoder::new();
-            let mut state = StreamState::default();
-            let mut chunks = Box::pin(http::text_chunks(response));
-            while let Some(text) = chunks.next().await {
-                let text = match text {
-                    Ok(text) => text,
+/// The Chat Completions body for `req`. Shared with the Grok subscription
+/// adapter, which speaks the same stream.
+pub(crate) fn chat_completion_body(req: &ModelRequest) -> serde_json::Value {
+    serde_json::to_value(build_request_body(req)).expect("chat request serializes")
+}
+
+/// SSE `data:` chunks from a Chat Completions response, as provider events.
+pub(crate) fn stream_sse_chat(
+    response: reqwest::Response,
+    cancel: CancellationToken,
+) -> ProviderStream {
+    let events = async_stream::stream! {
+        let mut decoder = SseDecoder::new();
+        let mut state = StreamState::default();
+        let mut chunks = Box::pin(http::text_chunks(response));
+        while let Some(text) = chunks.next().await {
+            let text = match text {
+                Ok(text) => text,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            for item in decoder.push(&text) {
+                let payload = match item {
+                    SseItem::Done => {
+                        for event in stop_on_done(&mut state) {
+                            yield Ok(event);
+                        }
+                        return;
+                    }
+                    SseItem::Data(payload) => payload,
+                };
+                match translate_chunk(&mut state, &payload) {
+                    Ok(events) => {
+                        for event in events {
+                            yield Ok(event);
+                        }
+                    }
                     Err(e) => {
                         yield Err(e);
                         return;
                     }
-                };
-                for item in decoder.push(&text) {
-                    let payload = match item {
-                        SseItem::Done => {
-                            for event in stop_on_done(&mut state) {
-                                yield Ok(event);
-                            }
-                            return;
-                        }
-                        SseItem::Data(payload) => payload,
-                    };
-                    match translate_chunk(&mut state, &payload) {
-                        Ok(events) => {
-                            for event in events {
-                                yield Ok(event);
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    }
                 }
             }
-        };
-        Ok(http::cancellable(events, cancel))
-    }
+        }
+    };
+    http::cancellable(events, cancel)
 }
 
 #[cfg(test)]

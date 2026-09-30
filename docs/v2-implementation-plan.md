@@ -30,6 +30,7 @@ Update this table and the task checkboxes as work lands. Status values: `Not sta
 
 Newest first. One entry per working session: what landed, and anything the next session needs to know.
 
+- **2026-09-30 — Grok subscription sign-in.** `grok_subscription` provider and built-in `grok-subscription` profile: device-code login to `auth.x.ai`, credential under `<home>/auth/grok.json`, Chat Completions on `cli-chat-proxy.grok.com` only. Sign-in is provider-neutral (`arbe_providers::auth`: `AuthScheme` + `Account`, `login [account]`); Grok is the first registered scheme. The `XAI_API_KEY` / `api.x.ai` path is unchanged. Not a live-verified subscription call in this session.
 - **2026-09-30 — P6.6 plan mode, on a general session-mode mechanism.** `default` and `plan` modes; the model leaves plan mode through `exit_plan_mode`, which the user approves. P6 complete.
 - **2026-09-30 — P5.7 context accounting.** Per-request context breakdown by source (event, `/context`, header %, `session/context`); tool definitions now counted against the budget; calibration learns from every round and adopts its first observation. Groundwork for further context-management work.
 - **2026-09-30 — P3 closed, pending work consolidated.** The maintainer accepted the TUI (P3's last exit criterion). All open items now live in one list: `docs/v2-status.md` → Pending work. `v2` merged into `main`.

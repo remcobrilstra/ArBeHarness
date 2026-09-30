@@ -9,9 +9,11 @@
 
 pub mod accumulator;
 pub mod anthropic;
+pub mod auth;
 pub mod catalog;
 pub mod error_map;
 pub mod event;
+mod grok;
 pub mod http;
 pub mod ollama;
 pub mod openai;

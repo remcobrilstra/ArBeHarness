@@ -189,6 +189,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

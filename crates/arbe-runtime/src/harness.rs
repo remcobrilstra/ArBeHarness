@@ -599,7 +599,10 @@ mod tests {
         );
         let profiles = harness(home.path(), project.path()).profiles().unwrap();
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["careful", "coding", "fast", "general"]);
+        assert_eq!(
+            names,
+            ["careful", "coding", "fast", "general", "grok-subscription"]
+        );
         let fast = profiles.iter().find(|p| p.name == "fast").unwrap();
         assert_eq!(
             (fast.provider.as_deref(), fast.model.as_deref()),
@@ -615,6 +618,19 @@ mod tests {
                 .unwrap()
                 .builtin
         );
+        let subscription = profiles
+            .iter()
+            .find(|p| p.name == "grok-subscription")
+            .unwrap();
+        assert!(subscription.builtin && subscription.sets_provider());
+        assert_eq!(subscription.provider.as_deref(), Some("grok_subscription"));
+        // The builder's provider stands in for ARBE_PROVIDER. A profile that
+        // chooses its own model service ignores it.
+        let switched = harness(home.path(), project.path())
+            .with_profile("grok-subscription")
+            .unwrap();
+        assert_eq!(switched.config().provider_name, "grok_subscription");
+        assert_eq!(switched.config().model, "grok-4.7");
     }
 
     #[tokio::test]
@@ -654,7 +670,10 @@ mod tests {
         assert_eq!(plain.config().provider_name, "echo");
 
         let err = harness.with_profile("nope").err().unwrap().to_string();
-        assert!(err.contains("known: big, coding, general, plain"), "{err}");
+        assert!(
+            err.contains("known: big, coding, general, grok-subscription, plain"),
+            "{err}"
+        );
     }
 
     #[test]

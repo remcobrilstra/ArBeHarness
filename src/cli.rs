@@ -8,9 +8,13 @@ use arbe_tui::arbe_runtime::arbe_core::SessionId;
 
 pub const USAGE: &str = "\
 Usage: arbeharness [OPTIONS]
+       arbeharness login [ACCOUNT] [--dev-home DIR]
+       arbeharness logout [ACCOUNT] [--dev-home DIR]
 
 Starts the interactive terminal UI, or with --print runs one prompt
-without a UI and exits.
+without a UI and exits. `login` / `logout` sign this harness in to (or
+out of) a model service account, for providers that use one instead of
+an API key. ACCOUNT: grok. It can be left out while there is only one.
 
 Session:
       --workdir <DIR>      Project directory the agent works in [default: current
@@ -31,10 +35,12 @@ Headless:
                            `json` prints every event, then the result, as JSON lines
 
 Configuration:
-      --profile <NAME>     Settings profile: coding, general, or one from a config file
+      --profile <NAME>     Settings profile: coding, general, grok-subscription, or one
+                           from a config file
       --mode <MODE>        Start in MODE: `default`, or `plan` (read-only until you
                            approve the model's plan); also applies to --resume
-      --provider <ID>      Model provider: ollama, openai, anthropic, openai_compatible
+      --provider <ID>      Model provider: ollama, openai, anthropic, openai_compatible,
+                           grok_subscription
       --model <ID>         Model to use
       --config <FILE>      Extra config file, applied after ~/.arbe/config/config.toml
                            with the same trust (repeatable)
@@ -64,9 +70,20 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    Interactive { prompt: Option<String> },
-    Print { prompt: String },
+    Interactive {
+        prompt: Option<String>,
+    },
+    Print {
+        prompt: String,
+    },
     Headless,
+    /// `login [ACCOUNT]`: `None` when no account was named.
+    Login {
+        account: Option<String>,
+    },
+    Logout {
+        account: Option<String>,
+    },
     Help,
     Version,
 }
@@ -109,6 +126,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut prompt = None;
     let mut print = None;
     let mut headless = false;
+    // `login` / `logout`, and the account named after it.
+    let mut command: Option<(String, Option<String>)> = None;
     let mut approve = None;
     let mut output = None;
     let mut seen = Vec::new();
@@ -134,6 +153,20 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             _ => {}
         }
         if !flag.starts_with('-') {
+            match &mut command {
+                None if matches!(flag.as_str(), "login" | "logout") => {
+                    command = Some((flag, None));
+                    continue;
+                }
+                Some(_) if matches!(flag.as_str(), "login" | "logout") => {
+                    return Err("login and logout can't be combined".into());
+                }
+                Some((_, account @ None)) => {
+                    *account = Some(flag);
+                    continue;
+                }
+                _ => {}
+            }
             return Err(format!("unexpected argument {arg:?}"));
         }
         let mut value = || -> Result<String, String> {
@@ -193,6 +226,32 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         seen.push(flag);
     }
 
+    if let Some((command, account)) = command {
+        if headless
+            || prompt.is_some()
+            || print.is_some()
+            || cli.resume.is_some()
+            || cli.name.is_some()
+            || cli.profile.is_some()
+            || cli.session_mode.is_some()
+            || cli.provider.is_some()
+            || cli.model.is_some()
+            || !cli.config_files.is_empty()
+            || cli.workdir.is_some()
+            || approve.is_some()
+            || output.is_some()
+        {
+            return Err(format!(
+                "{command} only accepts an account name and --dev-home (it does not start a session)"
+            ));
+        }
+        cli.mode = if command == "login" {
+            Mode::Login { account }
+        } else {
+            Mode::Logout { account }
+        };
+        return Ok(cli);
+    }
     if headless {
         if prompt.is_some() || print.is_some() || cli.resume.is_some() || cli.name.is_some() {
             return Err("--headless can't be combined with --prompt, --print, --resume or --name                  (sessions are opened through the protocol)"
@@ -310,6 +369,31 @@ mod tests {
     }
 
     #[test]
+    fn login_and_logout_are_commands() {
+        let cli = parse_str(&["login", "--dev-home", "home"]).unwrap();
+        assert_eq!(cli.mode, Mode::Login { account: None });
+        assert_eq!(cli.dev_home, Some(PathBuf::from("home")));
+        assert_eq!(
+            parse_str(&["logout"]).unwrap().mode,
+            Mode::Logout { account: None }
+        );
+        assert_eq!(
+            parse_str(&["--dev-home", "home", "login", "grok"])
+                .unwrap()
+                .mode,
+            Mode::Login {
+                account: Some("grok".into())
+            }
+        );
+        assert_eq!(
+            parse_str(&["logout", "grok"]).unwrap().mode,
+            Mode::Logout {
+                account: Some("grok".into())
+            }
+        );
+    }
+
+    #[test]
     fn mistakes_are_errors_not_ignored() {
         for (args, expected) in [
             (&["--verison"][..], "unknown option --verison"),
@@ -325,6 +409,13 @@ mod tests {
             (&["--print", "x", "--prompt", "y"][..], "can't be combined"),
             (&["--print", " "][..], "non-empty"),
             (&["--headless", "--print", "x"][..], "can't be combined"),
+            (
+                &["login", "--print", "x"][..],
+                "only accepts an account name",
+            ),
+            (&["login", "logout"][..], "can't be combined"),
+            (&["login", "grok", "extra"][..], "unexpected argument"),
+            (&["grok"][..], "unexpected argument"),
         ] {
             let err = parse_str(args).unwrap_err();
             assert!(err.contains(expected), "{args:?}: {err}");

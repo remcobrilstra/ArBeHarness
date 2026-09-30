@@ -73,6 +73,12 @@ impl UserFacing for ProviderError {
     fn likely_fix(&self) -> Option<String> {
         Some(
             match self {
+                Self::Auth(message)
+                    // Sign-in errors (arbe_providers::auth) carry their own fix.
+                    if message.contains("arbeharness login") || message.contains("isn't entitled") =>
+                {
+                    return None;
+                }
                 Self::Auth(_) => {
                     "check the provider's API key (e.g. OPENAI_API_KEY) is set and valid"
                 }

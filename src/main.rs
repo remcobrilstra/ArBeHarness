@@ -29,6 +29,18 @@ fn main() {
             println!("arbeharness {}", env!("CARGO_PKG_VERSION"));
             return;
         }
+        Mode::Login { .. } | Mode::Logout { .. } => {
+            let home = cli
+                .dev_home
+                .clone()
+                .unwrap_or_else(arbe_storage::paths::arbe_home);
+            init_logging(&home);
+            let runtime =
+                tokio::runtime::Runtime::new().expect("failed to start the tokio runtime");
+            let code = runtime.block_on(account_command(&cli.mode, &home));
+            runtime.shutdown_background();
+            std::process::exit(code);
+        }
         _ => {}
     }
 
@@ -42,7 +54,9 @@ fn main() {
         Mode::Print { prompt } => runtime.block_on(print::run(&harness, &cli, prompt)),
         Mode::Headless => runtime.block_on(headless::run(harness)),
         Mode::Interactive { prompt } => runtime.block_on(interactive(harness, &cli, prompt)),
-        Mode::Help | Mode::Version => unreachable!(),
+        Mode::Help | Mode::Version | Mode::Login { .. } | Mode::Logout { .. } => {
+            unreachable!()
+        }
     };
     // Don't wait for background tasks (e.g. MCP servers) to wind down.
     runtime.shutdown_background();
@@ -138,6 +152,104 @@ fn build_harness(cli: &Cli) -> Result<Harness, String> {
     builder
         .build()
         .map_err(|e| format!("invalid configuration: {e}"))
+}
+
+/// `login` and `logout` talk only to an account's credential file, under
+/// `<home>/auth`. Exit status: 0 done, 1 the sign-in service or the file
+/// failed, 2 no such account, 130 interrupted.
+async fn account_command(mode: &Mode, home: &std::path::Path) -> i32 {
+    use arbe_tui::arbe_runtime::arbe_core::ProviderError;
+    use arbe_tui::arbe_runtime::arbe_providers::CancellationToken;
+    use arbe_tui::arbe_runtime::arbe_providers::auth::{self, Account};
+
+    let (Mode::Login { account: name } | Mode::Logout { account: name }) = mode else {
+        unreachable!()
+    };
+    let scheme = match pick_scheme(auth::builtin_schemes(), name.as_deref()) {
+        Ok(scheme) => scheme,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return EXIT_USAGE;
+        }
+    };
+    let account = Account::new(scheme, &auth::auth_dir(home));
+    let display_name = account.scheme().display_name.clone();
+    let path = account.credential_path().display().to_string();
+
+    if matches!(mode, Mode::Logout { .. }) {
+        return match account.logout().await {
+            Ok(true) => {
+                eprintln!("Signed out of the {display_name}. Removed {path}.");
+                0
+            }
+            Ok(false) => {
+                eprintln!("Not signed in to the {display_name}; nothing to remove.");
+                0
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                1
+            }
+        };
+    }
+
+    let cancel = CancellationToken::new();
+    let cancelling = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        cancelling.cancel();
+    });
+    let result = account
+        .login(&auth::oauth_client(), &cancel, |prompt| {
+            eprintln!("Sign in to the {display_name}.");
+            eprintln!();
+            if let Some(url) = &prompt.verification_uri_complete {
+                eprintln!("Open this URL and confirm the code:");
+                eprintln!("  {url}");
+            } else {
+                eprintln!("Open this URL:");
+                eprintln!("  {}", prompt.verification_uri);
+                eprintln!();
+                eprintln!("Confirm this code: {}", prompt.user_code);
+            }
+            eprintln!();
+            eprintln!("Waiting for authorization...");
+        })
+        .await;
+    match result {
+        Ok(()) => {
+            eprintln!("Signed in to the {display_name}. Credential saved to {path}.");
+            0
+        }
+        Err(ProviderError::Cancelled) => 130,
+        Err(err) => {
+            eprintln!("error: {err}");
+            1
+        }
+    }
+}
+
+/// The account `login` / `logout` acts on: the one named, or the only one
+/// there is when none is named.
+fn pick_scheme(
+    mut schemes: Vec<arbe_tui::arbe_runtime::arbe_providers::auth::AuthScheme>,
+    name: Option<&str>,
+) -> Result<arbe_tui::arbe_runtime::arbe_providers::auth::AuthScheme, String> {
+    let known = || {
+        schemes
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        Some(name) => match schemes.iter().position(|s| s.id == name) {
+            Some(index) => Ok(schemes.swap_remove(index)),
+            None => Err(format!("no account named {name:?} (known: {})", known())),
+        },
+        None if schemes.len() == 1 => Ok(schemes.remove(0)),
+        None => Err(format!("name the account to use (known: {})", known())),
+    }
 }
 
 fn absolute(dir: PathBuf) -> PathBuf {

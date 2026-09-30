@@ -55,6 +55,13 @@ arbeharness
 ARBE_PROVIDER=openai OPENAI_API_KEY=sk-... arbeharness
 ```
 
+Some providers take a signed-in account instead of an API key (today: a Grok subscription). `login` prints a URL to confirm in a browser and saves the session under the harness home; the next command starts a chat on that session:
+
+```bash
+arbeharness login grok
+arbeharness --profile grok-subscription
+```
+
 The agent works on the directory you start it in. To point it somewhere else, use `--workdir`.
 
 ---
@@ -71,16 +78,18 @@ The agent works on the directory you start it in. To point it somewhere else, us
 | `--headless` | | Instead of the chat screen, take requests as JSON-RPC on stdin and answer on stdout, for editors and other programs. Can't be combined with `--prompt`, `--print`, `--resume` or `--name`. See [JSON-RPC](#json-rpc---headless). |
 | `--approve <policy>` | | With `--print` only: `none`, `reads` or `all`. See [Headless mode](#headless-mode). |
 | `--output <format>` | | With `--print` only: `text` or `json`. See [Headless mode](#headless-mode). |
-| `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, or one defined in a config file. |
+| `--profile <name>` | `ARBE_PROFILE` | Which [profile](#profiles) to use: `coding` (default), `general`, `grok-subscription`, or one defined in a config file. |
+| `login [account]` | | Sign in to an [account](#signing-in-with-an-account) and save the session under the harness home. Accounts: `grok`. The name can be left out while only one account type exists. Only `--dev-home` applies; it does not start a chat. Exit status `0` saved, `1` failed, `2` unknown account, `130` interrupted. |
+| `logout [account]` | | Delete an account's saved session. Only `--dev-home` applies. Exit status `0` when the file is gone or was never there, `1` if it could not be removed, `2` unknown account. |
 | `--mode <mode>` | `ARBE_MODE` | Start in this [mode](#modes-and-plan-mode): `default` or `plan`. New sessions start in it; with `--resume` it also switches the resumed session (otherwise a resumed session keeps its own mode). |
-| `--provider <id>` | `ARBE_PROVIDER` | The model provider. See [Providers and models](#providers-and-models). |
+| `--provider <id>` | `ARBE_PROVIDER` | The model provider: `ollama`, `openai`, `anthropic`, `openai_compatible`, or `grok_subscription`. See [Providers and models](#providers-and-models). |
 | `--model <id>` | `ARBE_MODEL` | The model. |
 | `--config <file>` | | An extra [configuration file](#configuration-file), applied right after the global one and trusted like it. Can be given more than once. Meant for a program that launches ArBeHarness and keeps its own settings (for example [hooks](#hooks)) without editing yours. The file must exist. |
 | `--dev-home <path>` | `ARBE_HOME` | **For development and testing only.** Moves the harness's own storage (normally `~/.arbe/`) to another directory so experiments don't touch your real sessions and settings. |
 | `-h`, `--help` | | Print the list of options and exit. |
 | `-V`, `--version` | | Print the version (`arbeharness 0.1.0`) and exit. |
 
-Options take `--flag value` or `--flag=value`. If you pass both a flag and its env var, the flag wins. An unknown option, a stray argument, or an option given twice is an error (exit status 2) rather than being ignored.
+Options take `--flag value` or `--flag=value`. If you pass both a flag and its env var, the flag wins. An unknown option, a stray argument, or an option given twice is an error (exit status 2) rather than being ignored. `login` and `logout` are commands, not options: `arbeharness login grok`. Giving either one a session option (`--print`, `--profile`, `--workdir`, …) or a second account name is the same kind of argument error. Their own results use exit status `0`, `1`, `2`, or `130`, as in the table. Messages from both commands go to stderr.
 
 When running through Cargo, put the arguments after `--`:
 
@@ -240,7 +249,7 @@ trusted_projects = ["C:/code/my-app", "/home/me/work"]   # a folder and everythi
 profile = "coding"                 # default profile (see Profiles)
 
 [provider]
-name = "anthropic"                 # ollama | openai | anthropic | openai_compatible
+name = "anthropic"                 # ollama | openai | anthropic | openai_compatible | grok_subscription
 model = "claude-sonnet-5"
 # base_url = "https://..."
 api_key_env = "ANTHROPIC_API_KEY"  # NAME of the env var holding the key
@@ -320,14 +329,15 @@ context_window = 32768
 
 A profile is a named set of settings: which tools the agent has, which system prompt it uses, and anything else from the config file. Pick one with `--profile`, `ARBE_PROFILE`, or `profile = "..."` in a config file. The header shows the active profile.
 
-Two profiles are built in:
+Three profiles are built in:
 
 | Profile | Tools | System prompt |
 |---|---|---|
 | `coding` (default) | all builtin tools | A software-engineering agent working in the workdir. |
 | `general` | only `todo_write`, `remember`, `ask_user`, `web_fetch` and `web_search` (no file access, no shell) | A general-purpose assistant. |
+| `grok-subscription` | all builtin tools | The same software-engineering prompt as `coding`. Provider `grok_subscription`, model `grok-4.7`. See [Grok subscription](#grok-subscription). |
 
-Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine `coding` or `general` this way.
+Define your own in a config file as `[profiles.<name>]`, using any of the keys above except `profile` and `[[models]]`. A profile's settings override the file's top-level settings. You can also redefine a built-in profile this way: a `[profiles.grok-subscription]` section replaces the built-in one, including its provider and model.
 
 ```toml
 [profiles.review]                  # a read-only code reviewer
@@ -349,6 +359,7 @@ A profile can also pick the model: give it a `provider` table. With one profile 
 
 ```toml
 # ~/.arbe/config/config.toml
+# Metered developer API. The built-in grok-subscription profile is separate.
 [profiles.grok]
 provider = { name = "openai_compatible", base_url = "https://api.x.ai/v1", model = "grok-4.7", api_key_env = "XAI_API_KEY" }
 
@@ -377,19 +388,19 @@ Environment variables override the [configuration file](#configuration-file). Th
 |---|---|---|
 | `ARBE_PROFILE` | `coding` | Same as `--profile`. See [Profiles](#profiles). |
 | `ARBE_MODE` | `default` | The [mode](#modes-and-plan-mode) new sessions start in (same as `--mode`, except it doesn't switch resumed sessions). |
-| `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`. See [Providers and models](#providers-and-models). |
-| `ARBE_MODEL` | ollama: `qwen2.5-coder:3b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5` | The model ID sent to the provider. |
-| `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. |
+| `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`, `grok_subscription`. See [Providers and models](#providers-and-models). |
+| `ARBE_MODEL` | ollama: `qwen2.5-coder:3b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5`; grok_subscription: `grok-4.7` | The model ID sent to the provider. |
+| `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. For `grok_subscription`, only `https://cli-chat-proxy.grok.com` or that URL with `/v1` is accepted. |
 | `OPENAI_API_KEY` | none | API key for `openai`. |
 | `ANTHROPIC_API_KEY` | none | API key for `anthropic`. |
 | `ARBE_API_KEY` | none | Fallback key, used when the provider-specific variable is not set. Convenient for `openai_compatible` gateways. |
 | `ARBE_HTTP_HEADERS` | none | Extra HTTP headers for every provider request, written as `Name: value; Other-Name: value`. Malformed entries are skipped. |
 
-API keys are only ever read from the environment or from `provider.api_key_command`. They are never written to disk by the harness.
+API keys are only ever read from the environment or from `provider.api_key_command`. They are never written to disk by the harness. A signed-in account is separate: `arbeharness login <account>` writes that session to `auth/<account>.json` under the harness home and refreshes it there.
 
 **Secrets in tool output are hidden.** If a tool prints a secret — say the model runs `env`, or reads a `.env` file — every occurrence is replaced with `[REDACTED]` before the model sees it, before it's saved in `turns.jsonl`, and before it's shown on screen. What counts as a secret:
 
-- the provider API key, and MCP bearer tokens;
+- the provider API key, MCP bearer tokens, and the access and refresh tokens of every signed-in account in `auth/` (whichever provider the session uses);
 - values of configured headers whose name contains `auth`, `key`, `token`, `secret` or `cookie`;
 - values (8+ characters) of environment variables whose name ends in `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIALS`, e.g. `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`.
 
@@ -426,13 +437,46 @@ The maximum response length is fixed at 4096 output tokens.
 | `ollama` | no | `http://localhost:11434` | Runs with an 8,192-token context window. If the model doesn't support tool calling, the harness detects that and retries without tools. The agent can then only chat and can't touch files. Some models (such as `qwen2.5-coder`) write a tool call as plain JSON text instead of using Ollama's tool-call format; when a reply consists only of such calls to offered tools, the harness treats them as real tool calls. A reply that could be one is shown once it's complete rather than word by word. |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | Chat Completions API. |
 | `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` | Messages API. Supports extended thinking (`ARBE_THINKING_BUDGET`). |
-| `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (xAI, vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. Reasoning that the server streams as `reasoning_content` (xAI, DeepSeek, vLLM) is shown as thinking. |
+| `openai_compatible` | optional | none, so `ARBE_BASE_URL` is required | Any server that speaks the OpenAI Chat Completions format (xAI's developer API, vLLM, LM Studio, LiteLLM, OpenRouter, …). Set the base URL including the `/v1` part, e.g. `http://localhost:8000/v1`. Reasoning that the server streams as `reasoning_content` (xAI, DeepSeek, vLLM) is shown as thinking. |
+| `grok_subscription` | no API key; run `arbeharness login grok` | `https://cli-chat-proxy.grok.com/v1` | Your Grok subscription (SuperGrok or X Premium+), the same capacity Grok Build uses. See [Grok subscription](#grok-subscription). The endpoint is fixed; a `base_url` pointing anywhere else is rejected. |
 
-For example, xAI's Grok models (the key goes in `ARBE_API_KEY`):
+For example, xAI's developer API (the key goes in `ARBE_API_KEY`, and usage is billed per token):
 
 ```bash
 ARBE_PROVIDER=openai_compatible ARBE_BASE_URL=https://api.x.ai/v1 ARBE_API_KEY=xai-... ARBE_MODEL=grok-4.7 arbeharness
 ```
+
+### Signing in with an account
+
+Some providers are paid for by a subscription you sign in to, not by an API key. `arbeharness login <account>` signs in, `arbeharness logout <account>` signs out, and each account's session is kept in its own file, `auth/<account>.json` under the harness home. Accounts today:
+
+| Account | Provider | Profile |
+|---|---|---|
+| `grok` | `grok_subscription` | `grok-subscription` |
+
+Sign-in uses the OAuth device-code flow: the command prints a URL to confirm in a browser, and a separate code when the server does not put the code in the URL. It opens no local callback port, so it also works from another machine. Ctrl+C cancels the wait (exit status 130). `login` and `logout` do not start a chat and run even when no model provider is configured. Messages go to stderr. The access token is refreshed on its own shortly before it expires, and once more if a request comes back unauthorized. A second unauthorized response, or a refresh token the server no longer accepts, tells you which `login` command to run again. If the account is not entitled to the service, the error says so; signing in again does not change that.
+
+The credential files are listed with the [file formats](#file-formats). On Linux and macOS each file is mode `0600` and the `auth` directory is mode `0700`. On Windows they are protected by your user profile. Tokens from every file in `auth/` are replaced with `[REDACTED]` in tool output, whichever provider is in use.
+
+### Grok subscription
+
+`arbeharness login grok` signs this harness in with a Grok subscription (SuperGrok or X Premium+), the same capacity Grok Build uses. Requests go to `https://cli-chat-proxy.grok.com/v1` with the saved session. The metered developer API is the `openai_compatible` example above: `XAI_API_KEY` (or `ARBE_API_KEY`) and `https://api.x.ai/v1`. The built-in `grok-subscription` profile uses the subscription and does not require an API key. `XAI_API_KEY` and `ARBE_API_KEY`, when set, are not sent on this provider (a key in the environment is still hidden from tool output).
+
+Sign in once (see [Signing in with an account](#signing-in-with-an-account)):
+
+```bash
+arbeharness login grok
+arbeharness --profile grok-subscription
+arbeharness logout grok
+```
+
+The profile keeps the coding tools and the coding prompt, and sets provider `grok_subscription` and model `grok-4.7`. A `provider.base_url` from the rest of your config is dropped for this built-in profile, so an `api.x.ai` URL configured for the developer API stays with that other profile. `ARBE_BASE_URL` still applies at startup; the only values accepted are `https://cli-chat-proxy.grok.com` and `https://cli-chat-proxy.grok.com/v1` (a trailing slash is fine). Any other URL stops the session from starting, and stops a switch onto this provider. `ARBE_PROVIDER=grok_subscription` selects the provider without the profile. In the chat screen, switch with `Ctrl+P` or `/profile grok-subscription`.
+
+Calls use the Chat Completions API. Reasoning the server streams as `reasoning_content` is shown as `[thinking]`.
+
+If the account is not entitled to subscription capacity, the error says so and names the developer API at `https://api.x.ai`.
+
+The credential file is `~/.arbe/auth/grok.json`, or the same path under `--dev-home` / `ARBE_HOME`. Grok Build keeps its own session at `~/.grok/auth.json`; each program refreshes only its own file.
 
 **Context windows.** The harness sizes the context budget from a built-in table of known models, matched by name prefix:
 
@@ -443,7 +487,7 @@ ARBE_PROVIDER=openai_compatible ARBE_BASE_URL=https://api.x.ai/v1 ARBE_API_KEY=x
 | `gpt-4o*` | 128,000 |
 | `o1*`, `o3*`, `o4*` | 200,000 |
 | `claude-*` | 200,000 |
-| other OpenAI / compatible models | 128,000 |
+| other OpenAI / compatible models, and `grok_subscription` | 128,000 |
 | Ollama models | 8,192 |
 
 If your model's real window is smaller than this, set `ARBE_CONTEXT_BUDGET` to avoid "context length exceeded" errors.
@@ -473,7 +517,7 @@ The screen has three parts:
 
 1. **Header**: `workdir` (followed by `MODE: PLAN` in [plan mode](#modes-and-plan-mode)), then `profile | provider | model | session <id> | phase | context | used`. `phase` shows what the agent is doing right now (e.g. `calling model`, `thinking…`, `running tool: grep…`, `rate limited — retrying in 4s`), or `idle`. `context` is the estimated size of the last request sent, against the context budget: `~12.3k/124k (10%)` (type `/context` for what it's made of). `used` is the total tokens the provider has reported for this session, followed by its cost (e.g. `($0.0421)`) if you've set the model's [prices](#costs). While a tool call's arguments are still arriving, `phase` shows their last characters as they stream in (`preparing edit_file …"path":"src/ma`).
 
-**Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, reasoning models on OpenAI-compatible servers such as xAI), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
+**Thinking.** When a model shows its reasoning (Anthropic with `ARBE_THINKING_BUDGET`, or a server that streams `reasoning_content`, including xAI's developer API and the Grok subscription), it appears in the transcript as a `[thinking]` entry before the answer, collapsed to one line (`▸ 12 line(s) — Ctrl+T to show`). `Ctrl+T` expands or collapses all of them. Resumed sessions don't show earlier turns' thinking.
 2. **Transcript**: your messages, the assistant's replies (basic Markdown formatting), tool activity, and `[error]` / `[info]` status lines. Replies stream in as they are generated, including any text the model writes between tool calls. If you scroll up, new output doesn't pull you back down. Scroll to the bottom to follow it again.
 3. **Input box**: what you are typing. Its title shows the available keys.
 
@@ -498,7 +542,7 @@ When a turn ends for a reason other than a normal answer, an `[info]` line says 
 | `Ctrl+U` / `Ctrl+D` | Scroll half a page up / down |
 | `Ctrl+T` | Show or hide the model's reasoning ([thinking](#the-chat-screen)) in the transcript |
 | `Ctrl+L` | Clear the transcript view (nothing is deleted from disk) |
-| `Ctrl+N` | Start a new session |
+| `Ctrl+N` | Start a new session (same as `/clear`) |
 | `Ctrl+R` | Open the session picker to resume an earlier session |
 | `Ctrl+P` | Open the profile picker to [switch this session to another profile](#switching-models-with-profiles) (and so, usually, another model) |
 | `Shift+Tab` | Switch to the next [mode](#modes-and-plan-mode) (`default` → `plan` → `default`). Works during a turn too |
@@ -566,6 +610,7 @@ Anything you type is sent to the model, except lines starting with a recognized 
 | `/plan` | Switch plan mode on, or off if it's on. |
 | `/context` | Show what the latest model call's context was made of: system prompt, instruction files, skills, memory, summary, tool definitions, history and this turn, in tokens and percent (see [Token counts](#providers-and-models)). |
 | `/compact` | Have the model summarize everything but your latest exchange now, to free up context. Works with either memory strategy. |
+| `/clear` | Clear the screen and start a fresh session, the same as `Ctrl+N`. The session you leave is saved and can be resumed with `Ctrl+R`. Approvals for the session, the to-do list, and background processes do not carry over. Not available while a turn is running. |
 | `/tool <name> <json-args>` | Run one of the [builtin tools](#builtin-tools) yourself. It goes through exactly the same path as a call from the model: the same approval dialog, the same output limit, the same transcript lines. Handy for checking that a tool works. Invalid JSON is treated as `{}`. Not available while a turn is running. |
 
 Examples:
@@ -781,7 +826,7 @@ Prefer `thiserror` for error types.
 
 - `name` and `description` are required. `tags` is an optional comma-separated list.
 - Everything after the second `---` is the instruction text given to the model.
-- Skills load once, when a session starts. Start a new session (`Ctrl+N`) after changing them.
+- Skills load once, when a session starts. Start a new session (`Ctrl+N` or `/clear`) after changing them.
 - A file that can't be loaded (missing `name` or `description`, frontmatter not closed with a second `---`) is skipped, and an `[error]` line names it when the session starts. The other skills still load.
 
 **How the model gets them** is set by `skills.mode` in the [configuration file](#configuration-file):
@@ -864,7 +909,7 @@ Each launch starts a **new session**. Everything a turn produces is saved as it 
 
 - **Resume**: press `Ctrl+R`, pick a session, press `Enter` — or start with `--resume <id>`. The transcript is reloaded and the conversation continues where it left off. Current settings apply, so you can resume a session with a different model. Without `--workdir`, `--resume` works in the session's own directory, wherever you start it from.
 - **Name**: `--name <title>` names a new or resumed session; otherwise the first line of its first message becomes its name.
-- **New**: `Ctrl+N` starts a fresh session without quitting.
+- **New**: `Ctrl+N` or `/clear` starts a fresh session without quitting. The conversation you leave is saved.
 - **Clear view**: `Ctrl+L` only clears the screen. The session on disk is unchanged.
 
 When you resume, the transcript shows each turn's question, how many tool calls it made, and its final answer. The model gets the full history, tool calls and results included, so it remembers what it looked at and did.
@@ -911,6 +956,8 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 ├── mcp/                        (unused; MCP servers are configured in config.toml)
 ├── config/
 │   └── config.toml            your global settings (active)
+├── auth/
+│   └── <account>.json         signed-in account session, e.g. grok.json (active after `login`)
 └── logs/
     └── mcp/<server>.log       error output of each stdio MCP server (active)
 ```
@@ -999,6 +1046,28 @@ One line per summary made by `compact_summary` or `/compact`: `{"through_turn_in
 
 A write-ahead log for the turn in progress: one line per message, `{"turn_id": ..., "turn_index": ..., "message": {...}}`, appended as each message is produced. When the turn finishes, it's written to `turns.jsonl` and this file is deleted. If it's still there when a session is resumed, the previous run stopped mid-turn and its contents are recovered into `turns.jsonl` as an interrupted turn. Don't edit it by hand.
 
+### `auth/<account>.json`
+
+One file per signed-in [account](#signing-in-with-an-account), e.g. `auth/grok.json`. Written by `arbeharness login <account>` and rewritten when the session is refreshed. `logout <account>` deletes it. Do not copy it into a project, a ticket, or a chat, and do not edit it by hand. A missing file means you are not signed in. A file the harness cannot parse is reported as unreadable; run `login` again to replace it.
+
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "expires_at": 4102444800,
+  "refresh_skew_secs": 60
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `access_token` | Bearer token sent to the account's service (for `grok`, `https://cli-chat-proxy.grok.com`). |
+| `refresh_token` | Used to obtain a new pair. Each successful refresh replaces it; the new pair is written before the old one is dropped. |
+| `expires_at` | Unix time, in seconds, when `access_token` expires. |
+| `refresh_skew_secs` | How many seconds before `expires_at` the harness refreshes. |
+
+While a refresh is in progress the harness creates `auth/<account>.lock` beside the credential and deletes it when finished. A lock left behind by a crash is ignored once it is older than 45 seconds.
+
 ### `instructions/agent.md`, `<workdir>/agent.md`, `<workdir>/CLAUDE.md`
 
 Free-form Markdown, used as-is (up to 8,000 characters). See [Instructions and skills](#instructions-and-skills).
@@ -1046,6 +1115,14 @@ Common problems:
 | An MCP server's tools don't appear | The server hasn't finished connecting yet (watch for the `connected` line), or a `tools` allow-list is set and doesn't include them — add `"<server>__*"`. |
 | Connection error with the default setup | Ollama isn't running. Start it, or set `ARBE_PROVIDER`. |
 | `... provider requires an api_key` | Set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (or `ARBE_API_KEY`). |
+| `not signed in to the <service>. Run arbeharness login <account>` | `auth/<account>.json` is missing. Run the `login` command the message names. |
+| `the <service> credential file is unreadable` | The file is there but is not valid JSON. Run the named `login` command again to replace it. |
+| `the <service> rejected the session` or `the <service> session expired` | The saved session is no longer accepted. Run the named `login` command again. |
+| `the sign-in code expired before it was confirmed` | Confirm the code in the browser, then run `login` again if it has already lapsed. The server usually allows about 10 minutes. |
+| `no account named "..."` from `login` / `logout` | The account name is misspelled. The message lists the known ones. |
+| `this account isn't entitled to the Grok subscription` | This account cannot use the subscription proxy. The metered path is `openai_compatible` with `XAI_API_KEY` (or `ARBE_API_KEY`) and `https://api.x.ai/v1`. |
+| `grok_subscription only sends the subscription token to ...` | `ARBE_BASE_URL` or `provider.base_url` for this provider has to be `https://cli-chat-proxy.grok.com` or that URL with `/v1`. Remove the override. The built-in `grok-subscription` profile already drops a base URL that came from the rest of the config. |
+| `timed out waiting for .../auth/<account>.lock` | Another process is refreshing the same file. Wait for it, or delete that lock file if it is older than a minute and nothing else is signing in. |
 | `openai_compatible provider requires a base_url` | Set `ARBE_BASE_URL`. |
 | Agent answers but never uses tools | The model doesn't support tool calling (common with small Ollama models). Pick a tool-capable model. |
 | Approval prompts for tool calls that make no sense (e.g. `remember` with a plain fact) | Small models tend to call whatever tool is available. Deny it; `d` denies that tool for the rest of the session. |

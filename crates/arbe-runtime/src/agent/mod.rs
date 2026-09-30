@@ -317,7 +317,9 @@ fn redactor_for(config: &RuntimeConfig) -> Redactor {
         }
     }
     explicit.extend(config.web_search.as_ref().and_then(|s| s.api_key.clone()));
-    Redactor::from_process_env(explicit)
+    let mut redactor = Redactor::from_process_env(explicit);
+    redactor.watch_auth_dir(arbe_providers::auth::auth_dir(&config.home));
+    redactor
 }
 
 /// Every message of every persisted turn, tagged with its turn index — the
@@ -425,6 +427,7 @@ impl Agent {
                 base_url: config.base_url.clone(),
                 extra_headers: config.extra_headers.clone(),
                 catalog: config.catalog.clone(),
+                auth_dir: Some(arbe_providers::auth::auth_dir(&config.home)),
             },
         )?;
         let mut registry = ToolRegistry::new();

@@ -46,7 +46,7 @@ const KNOWN: &[(&str, &str, ModelCapabilities)] = &[
 /// What a provider falls back to for a model the catalog doesn't know.
 pub fn provider_default(provider: &str) -> ModelCapabilities {
     match provider {
-        "openai" | "openai_compatible" => caps(128_000, true, false),
+        "openai" | "openai_compatible" | "grok_subscription" => caps(128_000, true, false),
         "anthropic" => caps(200_000, true, true),
         // Matches the `num_ctx` the Ollama adapter requests.
         "ollama" => ModelCapabilities {

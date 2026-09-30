@@ -29,6 +29,8 @@ Or a hosted model:
 ARBE_PROVIDER=anthropic ANTHROPIC_API_KEY=... cargo run --release
 ARBE_PROVIDER=openai OPENAI_API_KEY=... cargo run --release
 ARBE_PROVIDER=openai_compatible ARBE_BASE_URL=https://api.x.ai/v1 ARBE_API_KEY=... ARBE_MODEL=grok-4.7 cargo run --release
+cargo run --release -- login grok     # Grok subscription, then:
+cargo run --release -- --profile grok-subscription
 ```
 
 Small local models are fine for trying it out, but they're weak at multi-step tool use; a hosted model makes a much better agent.

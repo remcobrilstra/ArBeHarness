@@ -780,6 +780,9 @@ fn handle_key(
                 None => {}
             }
         }
+        (_, KeyCode::Enter) if app.input.trim() == "/clear" => {
+            clear_session(app, agent, harness, events);
+        }
         (_, KeyCode::Enter) => submit_input(app, agent, handle, outcome_tx),
         (_, KeyCode::Backspace) => app.input_backspace(),
         (_, KeyCode::Delete) => app.input_delete_forward(),
@@ -835,12 +838,44 @@ fn show_startup_warnings(app: &mut App, agent: &Agent) {
 }
 
 fn new_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events: &Arc<EventBus>) {
+    if start_fresh_session(app, agent, harness, events) {
+        app.notice = Some("started a new session".to_string());
+    }
+}
+
+/// `/clear`: same as `Ctrl+N` (a new session; the previous one stays on
+/// disk and can be resumed) plus an empty transcript. Refused while a
+/// turn is running, like the other chat commands — the typed command
+/// stays in the input box.
+fn clear_session(app: &mut App, agent: &mut Arc<Agent>, harness: &Harness, events: &Arc<EventBus>) {
+    if agent.is_busy() {
+        app.notice =
+            Some("a turn is in progress — wait for it, or press Esc to cancel".to_string());
+        return;
+    }
+    let _ = app.take_input();
+    if start_fresh_session(app, agent, harness, events) {
+        app.notice = Some("cleared the conversation and started a fresh session".to_string());
+    }
+}
+
+/// Closes the current session and opens a new one on the same event bus.
+/// Returns whether that succeeded. The caller sets the notice.
+fn start_fresh_session(
+    app: &mut App,
+    agent: &mut Arc<Agent>,
+    harness: &Harness,
+    events: &Arc<EventBus>,
+) -> bool {
     match harness.create_agent(events.clone()) {
         Ok(new_agent) => {
             swap_in_agent(app, agent, new_agent);
-            app.notice = Some("started a new session".to_string());
+            true
         }
-        Err(err) => app.status_message = Some(format!("failed to start new session: {err}")),
+        Err(err) => {
+            app.status_message = Some(format!("failed to start new session: {err}"));
+            false
+        }
     }
 }
 
@@ -1210,5 +1245,52 @@ mod tests {
             message.contains("missed"),
             "expected a lag warning, got: {message}"
         );
+    }
+
+    #[test]
+    fn clear_starts_a_fresh_session_and_keeps_the_previous_one() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut config = arbe_runtime::RuntimeConfig::defaults(project.path().to_path_buf());
+        config.home = home.path().to_path_buf();
+        let harness = arbe_runtime::Harness::builder()
+            .config(config)
+            .build()
+            .unwrap();
+        let events = Arc::new(EventBus::new(16));
+        let created = harness.create_agent(events.clone()).unwrap();
+        let previous = created.session_id();
+        let mut agent = Arc::new(created);
+        let mut app = App::new(
+            previous,
+            agent.profile().to_string(),
+            agent.provider_name().to_string(),
+            agent.model().to_string(),
+            project.path().display().to_string(),
+        );
+        app.push_line(Role::User, "remember this".to_string());
+        app.input = "/clear".to_string();
+        app.input_cursor = app.input.len();
+        app.session_tokens = 42;
+
+        clear_session(&mut app, &mut agent, &harness, &events);
+
+        assert_ne!(agent.session_id(), previous);
+        assert_eq!(app.session_id, agent.session_id());
+        assert!(app.transcript.is_empty());
+        assert!(app.input.is_empty());
+        assert_eq!(app.session_tokens, 0);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("cleared the conversation and started a fresh session")
+        );
+        let ids: Vec<_> = harness
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect();
+        assert!(ids.contains(&previous), "previous session was removed");
+        assert!(ids.contains(&agent.session_id()));
     }
 }

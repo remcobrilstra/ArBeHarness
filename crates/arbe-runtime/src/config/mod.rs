@@ -248,6 +248,12 @@ impl RuntimeConfig {
                 }
             }
         }
+        if !profiles.contains_key(GROK_SUBSCRIPTION_PROFILE) {
+            profiles.insert(
+                GROK_SUBSCRIPTION_PROFILE.to_string(),
+                grok_subscription_profile(),
+            );
+        }
         Ok(profiles.into_values().collect())
     }
 
@@ -330,11 +336,11 @@ impl RuntimeConfig {
         let defined_in_files = layers
             .iter()
             .any(|(_, l)| l.profiles.contains_key(&profile));
-        if !matches!(profile.as_str(), "coding" | "general") && !defined_in_files {
+        if !is_builtin_profile(&profile) && !defined_in_files {
             let mut known: Vec<String> = layers
                 .iter()
                 .flat_map(|(_, l)| l.profiles.keys().cloned())
-                .chain(["coding".to_string(), "general".to_string()])
+                .chain(builtin_profile_names().map(str::to_string))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -367,6 +373,13 @@ impl RuntimeConfig {
                 config.apply(profile_layer, path, &mut pending)?;
             }
             config.add_models(layer, path, &mut pending)?;
+        }
+        if profile == GROK_SUBSCRIPTION_PROFILE && !defined_in_files {
+            config.provider_name = "grok_subscription".to_string();
+            pending.model = Some("grok-4.7".to_string());
+            // A top-level endpoint belongs to whatever provider was
+            // configured above. This profile has its own, fixed one.
+            config.base_url = None;
         }
         config.apply_env(env, &mut pending)?;
         config.finish(pending, env)?;
@@ -945,10 +958,32 @@ fn parse_headers(raw: &str) -> Vec<(String, String)> {
 /// profile's prompt: small local models chosen for the job — a coding
 /// model for coding work, a general model for the `general` prompt. Both
 /// support tool calling.
+/// Built-in profile that signs in with a Grok subscription.
+const GROK_SUBSCRIPTION_PROFILE: &str = "grok-subscription";
+
+fn builtin_profile_names() -> impl Iterator<Item = &'static str> {
+    ["coding", "general", GROK_SUBSCRIPTION_PROFILE].into_iter()
+}
+
+fn is_builtin_profile(name: &str) -> bool {
+    builtin_profile_names().any(|builtin| builtin == name)
+}
+
+fn grok_subscription_profile() -> ProfileInfo {
+    ProfileInfo {
+        name: GROK_SUBSCRIPTION_PROFILE.to_string(),
+        builtin: true,
+        provider: Some("grok_subscription".to_string()),
+        model: Some("grok-4.7".to_string()),
+        base_url: None,
+    }
+}
+
 fn default_model(provider: &str, prompt: &PromptTemplate) -> &'static str {
     match (provider, prompt) {
         ("openai", _) => "gpt-5-mini",
         ("anthropic", _) => "claude-sonnet-5",
+        ("grok_subscription", _) => "grok-4.7",
         (_, PromptTemplate::General) => "llama3.2:3b",
         _ => "qwen2.5-coder:3b",
     }
@@ -1045,6 +1080,33 @@ mod tests {
         assert_eq!(c.tools, None);
         assert_eq!(c.prompt, PromptTemplate::Coding);
         assert!(c.api_key.is_none());
+    }
+
+    #[test]
+    fn the_grok_subscription_profile_needs_no_api_key() {
+        let c = load(&[], &env_of(&[("ARBE_PROFILE", "grok-subscription")])).unwrap();
+        assert_eq!(c.provider_name, "grok_subscription");
+        assert_eq!(c.model, "grok-4.7");
+        assert!(c.api_key.is_none());
+        assert!(c.base_url.is_none());
+    }
+
+    #[test]
+    fn a_top_level_endpoint_does_not_follow_the_subscription_profile() {
+        let dir = temp_dir();
+        let file = write(
+            &dir,
+            "c.toml",
+            "[provider]\nname = \"openai_compatible\"\nbase_url = \"https://api.x.ai/v1\"\nmodel = \"grok-4.7\"\n",
+        );
+        let c = load(
+            std::slice::from_ref(&file),
+            &env_of(&[("ARBE_PROFILE", "grok-subscription")]),
+        )
+        .unwrap();
+        assert_eq!(c.provider_name, "grok_subscription");
+        assert!(c.base_url.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
