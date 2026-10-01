@@ -27,6 +27,10 @@ pub enum HookPhase {
     AfterToolExecute,
     OnError,
     OnTurnComplete,
+    /// The model has answered and the turn is about to end, after it changed
+    /// something. A hook can send the turn back to the model with feedback
+    /// (a check that failed, or `"continue": "<what to do>"`).
+    BeforeTurnEnd,
     /// A tool call is waiting for the user's approval. Notification only:
     /// what the hook returns is ignored.
     OnApprovalRequested,
@@ -43,11 +47,12 @@ impl HookPhase {
             Self::AfterToolExecute => "after_tool_execute",
             Self::OnError => "on_error",
             Self::OnTurnComplete => "on_turn_complete",
+            Self::BeforeTurnEnd => "before_turn_end",
             Self::OnApprovalRequested => "on_approval_requested",
         }
     }
 
-    pub const ALL: [HookPhase; 8] = [
+    pub const ALL: [HookPhase; 9] = [
         Self::BeforeContextAssembly,
         Self::BeforeModelCall,
         Self::AfterModelCall,
@@ -55,6 +60,7 @@ impl HookPhase {
         Self::AfterToolExecute,
         Self::OnError,
         Self::OnTurnComplete,
+        Self::BeforeTurnEnd,
         Self::OnApprovalRequested,
     ];
 

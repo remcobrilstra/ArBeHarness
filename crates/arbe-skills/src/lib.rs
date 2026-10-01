@@ -11,6 +11,8 @@ pub use loader::{Loaded, load_dir};
 pub use manifest::parse_manifest;
 pub use merge::merge_skills;
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Where a skill was resolved from; determines merge precedence
@@ -29,6 +31,10 @@ pub struct SkillManifest {
     pub scope: SkillScope,
     pub instructions: String,
     pub tags: Vec<String>,
+    /// The skill's folder, for a skill written as `<folder>/SKILL.md`: the
+    /// files its instructions refer to are there. `None` for a single file.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
 }
 
 /// The skills in effect for a session, after merging scopes.
@@ -87,6 +93,7 @@ mod tests {
             scope: SkillScope::Global,
             instructions: format!("{name} body"),
             tags: vec![],
+            dir: None,
         }
     }
 

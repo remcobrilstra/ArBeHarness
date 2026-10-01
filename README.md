@@ -19,7 +19,7 @@ cargo build --release          # produces target/release/arbeharness
 With no configuration it uses a local [Ollama](https://ollama.com) server:
 
 ```bash
-ollama pull qwen2.5-coder:3b
+ollama pull qwen2.5-coder:7b
 cargo run --release -- --workdir ../my-project
 ```
 

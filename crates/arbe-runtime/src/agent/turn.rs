@@ -15,8 +15,12 @@ use arbe_providers::{
 };
 use arbe_storage::InFlightMessage;
 use futures_util::StreamExt;
+use serde_json::Value;
+use std::sync::atomic::Ordering;
 
-use super::hooks::{self, ErrorPayload, ModelCallPayload, ModelResultPayload, TurnPayload};
+use super::hooks::{
+    self, ErrorPayload, ModelCallPayload, ModelResultPayload, TurnEndPayload, TurnPayload,
+};
 use super::{Agent, build_system_prompt_async, compaction, memory, tools};
 
 /// The assembled context as measured for the first model call; later
@@ -30,6 +34,10 @@ struct MeasuredContext {
 /// How many consecutive rounds may request the identical set of tool calls
 /// before the turn is stopped as stuck.
 const MAX_IDENTICAL_ROUNDS: u32 = 3;
+
+/// How many times `before_turn_end` hooks may send one turn back to the
+/// model; after that the model's next answer ends the turn unchecked.
+const MAX_TURN_END_CHECKS: u32 = 3;
 
 /// Moves the loop to `to`, turning an illegal transition into a
 /// `HarnessError::Internal` instead of a panic. It's still a harness bug,
@@ -323,6 +331,10 @@ impl TurnRunner<'_> {
         let agent = self.agent;
         let turn_id = self.turn_id();
         advance(&mut self.machine, LoopPhase::ReceiveUserInput)?;
+        if agent.settings.depth == 0 {
+            // `before_turn_end` asks whether *this* turn changed anything.
+            agent.changed.store(false, Ordering::Relaxed);
+        }
         agent.events.publish(RuntimeEvent::TurnStarted {
             session_id: agent.session_id(),
             turn_id,
@@ -512,6 +524,7 @@ impl TurnRunner<'_> {
         let mut turn_start = messages.len().saturating_sub(1);
         let mut previous_calls: Option<Vec<(String, String)>> = None;
         let mut identical_rounds = 1;
+        let mut checks = 0;
         let max_rounds = agent.settings.max_tool_rounds;
 
         // One round past the limit: the wrap-up, where the model is told to
@@ -624,6 +637,15 @@ impl TurnRunner<'_> {
             messages.push(response.message);
 
             if tool_calls.is_empty() {
+                if let Some(feedback) = self.check_before_end(round, &mut checks).await {
+                    // Recorded: the model's next round (and later turns)
+                    // must see why the turn went on.
+                    let note = Message::new(Role::User, feedback);
+                    self.record(note.clone());
+                    messages.push(note);
+                    advance(&mut self.machine, LoopPhase::PostToolReflection)?;
+                    continue;
+                }
                 advance(&mut self.machine, LoopPhase::PersistTurn)?;
                 return Ok(LoopEnd {
                     stop_reason: response.stop_reason,
@@ -659,6 +681,41 @@ impl TurnRunner<'_> {
         Ok(LoopEnd {
             stop_reason: StopReason::ToolRoundLimit,
         })
+    }
+
+    /// Runs the `before_turn_end` hooks once the model has answered — for
+    /// a top-level agent, and only if something may have changed since the
+    /// last check (subagents' calls count) — and returns what to tell the
+    /// model if a hook sends the turn back.
+    async fn check_before_end(&self, round: u32, checks: &mut u32) -> Option<String> {
+        let agent = self.agent;
+        if agent.settings.depth > 0
+            || *checks >= MAX_TURN_END_CHECKS
+            || !agent.changed.swap(false, Ordering::Relaxed)
+        {
+            return None;
+        }
+        let payload = TurnEndPayload {
+            turn_id: self.turn_id().to_string(),
+            round,
+            checks: *checks,
+        };
+        *checks += 1;
+        let (result, blocked) = hooks::run_guarded(agent, HookPhase::BeforeTurnEnd, &payload).await;
+        let reason = blocked.or_else(|| {
+            result
+                .get("continue")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })?;
+        Some(format!(
+            "[harness] A check before ending the turn did not pass:\n{}\n\n\
+             Fix what it reports (or explain why it can't be fixed), then reply again.",
+            tools::truncate_middle(
+                agent.redactor.redact(&reason),
+                agent.settings.max_tool_output_chars
+            )
+        ))
     }
 
     /// Streams one inference call (retrying transient failures, each
@@ -744,9 +801,6 @@ impl TurnRunner<'_> {
     }
 }
 
-/// A round's tool calls, reduced to what makes two rounds "the same
-/// request": names and arguments, in order (provider call ids differ every
-/// round).
 /// What the model is told in the wrap-up round after the tool-round limit.
 fn wrap_up_notice(max_rounds: u32) -> String {
     format!(
@@ -756,6 +810,9 @@ fn wrap_up_notice(max_rounds: u32) -> String {
     )
 }
 
+/// A round's tool calls, reduced to what makes two rounds "the same
+/// request": names and arguments, in order (provider call ids differ every
+/// round).
 fn call_signature(calls: &[RequestedToolCall]) -> Vec<(String, String)> {
     calls
         .iter()

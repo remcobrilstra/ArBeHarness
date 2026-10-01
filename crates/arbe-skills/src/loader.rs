@@ -14,9 +14,14 @@ pub struct Loaded {
     pub problems: Vec<SkillError>,
 }
 
-/// Loads every `*.md` skill directly in `dir` (not subdirectories). A
+/// The file that makes a folder a skill (the `SKILL.md` format other
+/// agents share), with the files it refers to next to it.
+pub const SKILL_FILE: &str = "SKILL.md";
+
+/// Loads the skills directly in `dir`: every `*.md` file, and every
+/// folder holding a [`SKILL_FILE`] (deeper folders aren't searched). A
 /// missing directory is not an error — an empty scope is a normal
-/// starting state. Files are read in name order, so results are stable.
+/// starting state. Entries are read in name order, so results are stable.
 pub fn load_dir(dir: &Path, scope: SkillScope) -> Loaded {
     let mut loaded = Loaded::default();
     if !dir.exists() {
@@ -34,10 +39,17 @@ pub fn load_dir(dir: &Path, scope: SkillScope) -> Loaded {
     };
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter_map(|p| {
+            if p.is_dir() {
+                let file = p.join(SKILL_FILE);
+                file.is_file().then_some((file, Some(p)))
+            } else {
+                (p.extension().and_then(|e| e.to_str()) == Some("md")).then_some((p, None))
+            }
+        })
         .collect();
     paths.sort();
-    for path in paths {
+    for (path, folder) in paths {
         let parsed = fs::read_to_string(&path)
             .map_err(|source| SkillError::Io {
                 path: path.display().to_string(),
@@ -45,7 +57,10 @@ pub fn load_dir(dir: &Path, scope: SkillScope) -> Loaded {
             })
             .and_then(|text| parse_manifest(&text, scope, &path.display().to_string()));
         match parsed {
-            Ok(skill) => loaded.skills.push(skill),
+            Ok(skill) => loaded.skills.push(SkillManifest {
+                dir: folder,
+                ..skill
+            }),
             Err(problem) => loaded.problems.push(problem),
         }
     }
@@ -86,6 +101,35 @@ mod tests {
         assert_eq!(manifests.len(), 2);
         assert_eq!(manifests[0].name, "a");
         assert_eq!(manifests[1].name, "b");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_folder_with_a_skill_file_is_a_skill_and_remembers_its_folder() {
+        let dir = std::env::temp_dir().join(format!("arbe-skills-dir-{}", uuid::Uuid::new_v4()));
+        let folder = dir.join("pdf");
+        fs::create_dir_all(folder.join("scripts")).unwrap();
+        fs::write(
+            folder.join(SKILL_FILE),
+            "---\nname: pdf\ndescription: PDFs\n---\nRun scripts/fill.py",
+        )
+        .unwrap();
+        fs::write(folder.join("scripts/fill.py"), "").unwrap();
+        // A folder without a skill file is not a skill, and not an error.
+        fs::create_dir_all(dir.join("notes")).unwrap();
+        fs::write(
+            dir.join("single.md"),
+            "---\nname: single\ndescription: s\n---\nb",
+        )
+        .unwrap();
+
+        let loaded = load_dir(&dir, SkillScope::ProjectLocal);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        let names: Vec<_> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["pdf", "single"]);
+        assert_eq!(loaded.skills[0].dir.as_deref(), Some(folder.as_path()));
+        assert_eq!(loaded.skills[1].dir, None);
 
         fs::remove_dir_all(&dir).ok();
     }

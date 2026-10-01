@@ -975,7 +975,11 @@ fn hook_command(entry: &file::CommandHookEntry, path: &Path) -> Result<HookComma
         )
     })?;
     let block_on_failure = match entry.on_failure.as_deref() {
-        None => phase == arbe_hooks::HookPhase::BeforeToolExecute,
+        // Guards and checks: one that can't run must not wave things through.
+        None => matches!(
+            phase,
+            arbe_hooks::HookPhase::BeforeToolExecute | arbe_hooks::HookPhase::BeforeTurnEnd
+        ),
         Some("block") => true,
         Some("skip") => false,
         Some(other) => {
@@ -1068,7 +1072,7 @@ fn default_model(provider: &str, prompt: &PromptTemplate) -> &'static str {
         ("anthropic", _) => "claude-sonnet-5",
         ("grok_subscription", _) => "grok-4.7",
         (_, PromptTemplate::General) => "llama3.2:3b",
-        _ => "qwen2.5-coder:3b",
+        _ => "qwen2.5-coder:7b",
     }
 }
 
@@ -1148,7 +1152,7 @@ mod tests {
                 c.model.as_str(),
                 c.profile.as_str()
             ),
-            ("ollama", "qwen2.5-coder:3b", "coding")
+            ("ollama", "qwen2.5-coder:7b", "coding")
         );
     }
 
@@ -1157,7 +1161,7 @@ mod tests {
         let c = load(&[], &no_env).unwrap();
         assert_eq!(c.profile, "coding");
         assert_eq!(c.provider_name, "ollama");
-        assert_eq!(c.model, "qwen2.5-coder:3b");
+        assert_eq!(c.model, "qwen2.5-coder:7b");
         assert_eq!(c.temperature, 0.2);
         assert_eq!(c.policy_mode, ApprovalPolicyMode::AlwaysPrompt);
         assert_eq!(c.tools, None);

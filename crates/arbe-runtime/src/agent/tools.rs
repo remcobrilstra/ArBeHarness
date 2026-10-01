@@ -3,6 +3,7 @@
 //! assembled into one tool-result message, in the model's original order.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arbe_core::{
     ApprovalDecision, ContentBlock, Message, RequestedToolCall, Role, RuntimeEvent,
@@ -442,6 +443,10 @@ async fn run_batch(
     }
     let runs = batch.into_iter().map(|(index, authorized, id)| async move {
         let tool_name = authorized.invocation().tool_name.clone();
+        // Even a call that fails may have changed something partway.
+        if !authorized.read_only() {
+            agent.changed.store(true, Ordering::Relaxed);
+        }
         let events = agent.events.clone();
         let run = ToolRun {
             cancel: cancel.clone(),

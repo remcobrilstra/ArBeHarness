@@ -39,7 +39,7 @@ cargo run --release
 
 The binary is called `arbeharness` (`target/release/arbeharness`, or `arbeharness.exe` on Windows); you can run it directly instead of going through `cargo run`.
 
-With no configuration it talks to a local [Ollama](https://ollama.com) server at `http://localhost:11434` using model `qwen2.5-coder:3b` (or `llama3.2:3b` with the [`general` profile](#profiles)). No API key is needed to start it, but Ollama must be running and have the model pulled (`ollama pull qwen2.5-coder:3b`, and `ollama pull llama3.2:3b` for the general profile) before you get a reply.
+With no configuration it talks to a local [Ollama](https://ollama.com) server at `http://localhost:11434` using model `qwen2.5-coder:7b` (or `llama3.2:3b` with the [`general` profile](#profiles)). No API key is needed to start it, but Ollama must be running and have the model pulled (`ollama pull qwen2.5-coder:7b`, and `ollama pull llama3.2:3b` for the general profile) before you get a reply.
 
 To use a hosted provider, set environment variables first:
 
@@ -369,7 +369,7 @@ provider = { name = "openai_compatible", base_url = "https://api.x.ai/v1", model
 provider = { name = "anthropic", model = "claude-sonnet-5" }
 
 [profiles.local]
-provider = { name = "ollama", model = "qwen2.5-coder:3b" }
+provider = { name = "ollama", model = "qwen2.5-coder:7b" }
 ```
 
 - **In the chat screen:** `Ctrl+P` (or `/profile`) lists every profile, with the provider and model each one uses; pick one with `Enter`. `/profile grok` switches directly. The header and the session's `meta.json` show the new profile, provider and model. You can't switch while a turn is running (`Esc` first).
@@ -391,7 +391,7 @@ Environment variables override the [configuration file](#configuration-file). Th
 | `ARBE_PROFILE` | `coding` | Same as `--profile`. See [Profiles](#profiles). |
 | `ARBE_MODE` | `default` | The [mode](#modes-and-plan-mode) new sessions start in (same as `--mode`, except it doesn't switch resumed sessions). |
 | `ARBE_PROVIDER` | `ollama` | One of `ollama`, `openai`, `anthropic`, `openai_compatible`, `grok_subscription`. See [Providers and models](#providers-and-models). |
-| `ARBE_MODEL` | ollama: `qwen2.5-coder:3b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5`; grok_subscription: `grok-4.7` | The model ID sent to the provider. |
+| `ARBE_MODEL` | ollama: `qwen2.5-coder:7b`, or `llama3.2:3b` for profiles using the general prompt; openai: `gpt-5-mini`; anthropic: `claude-sonnet-5`; grok_subscription: `grok-4.7` | The model ID sent to the provider. |
 | `ARBE_BASE_URL` | the provider's official endpoint | Override the API endpoint, e.g. a proxy, gateway, or remote Ollama. **Required** for `openai_compatible`. For `grok_subscription`, only `https://cli-chat-proxy.grok.com` or that URL with `/v1` is accepted. |
 | `OPENAI_API_KEY` | none | API key for `openai`. |
 | `ANTHROPIC_API_KEY` | none | API key for `anthropic`. |
@@ -649,7 +649,7 @@ Every session gets these tools. When the model supports tool calling, it decides
 | `web_search` | `query`, optional `count` (default 5, max 10) | medium | Searches the web and returns titles, URLs and snippets. Only present when [a search service is configured](#web-tools). |
 | `todo_write` | `todos`: list of `{content, status}` with status `pending` / `in_progress` / `completed` | low | Keeps the agent's task list. Each call replaces the whole list. At most one item can be `in_progress`, and the list holds at most 200 items. Kept in memory only. |
 | `write_file` | `path`, `content` | medium | Creates or overwrites a file, creating parent directories. The write is atomic, and an overwritten file keeps its permissions (e.g. a script stays executable). |
-| `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, matches more than once without `replace_all: true`, or is identical to `replace`. In a file that uses one line-ending style throughout (LF or CRLF), `find` and `replace` are converted to it, so the model doesn't have to reproduce `\r\n`; a file with mixed endings is matched exactly. The file keeps its permissions. |
+| `edit_file` | `path`, `find`, `replace`, optional `replace_all` | medium | Replaces text in a file. Fails if `find` isn't found, matches more than once without `replace_all: true`, or is identical to `replace`. In a file that uses one line-ending style throughout (LF or CRLF), `find` and `replace` are converted to it, so the model doesn't have to reproduce `\r\n`. If `find` isn't in the file exactly, whole lines are compared ignoring trailing whitespace, then ignoring indentation (the replacement is then re-indented to match the file); this must match exactly one place, is never used with `replace_all`, and the result says `"matched": "ignoring …"`. The file keeps its permissions. |
 | `execute` | `command`, optional `timeout_secs` (default 30, max 300), optional `background` | **high** | Runs a shell command (`cmd /C` on Windows, `sh -c` elsewhere) in the workdir. On timeout, the whole process tree is killed. Of each output stream, the first and last 512 KB are kept (the rest is replaced by a `[... N bytes omitted ...]` marker), so a command that prints without end can't exhaust memory. With `background: true` it keeps running and returns a handle (`bg-1`, …) instead of waiting — see [Background processes](#background-processes). |
 | `process_output` | optional `handle`, optional `wait_secs` (0–30) | low | Reads what a background process printed since the last read (up to 32 KB per call), and whether it's still running (with its exit code once it has exited). Without a handle, lists all background processes. Never needs approval (it only reads). |
 | `process_kill` | `handle` | medium | Stops a background process and everything it started. |
@@ -811,12 +811,15 @@ The model gets a system prompt made from a built-in template plus up to two inst
 
 ### Skills
 
-A skill is a reusable block of instructions for a particular kind of work. One `.md` file per skill, directly in one of these folders (subfolders are ignored):
+A skill is a reusable block of instructions for a particular kind of work. Each skill is either one `.md` file, or a folder with a `SKILL.md` file in it (the format other coding agents share, so their skills work here unchanged), directly in one of these folders:
 
 | Folder | Scope |
 |---|---|
 | `~/.arbe/skills/` | Global: every project. |
 | `<workdir>/.arbe/skills/` | Project: this workdir only. A project skill replaces a global skill with the same `name`. |
+| `<workdir>/.agents/skills/` | Project, shared with other agents. On a name clash, `.arbe/skills/` wins. |
+
+A skill folder can hold files the instructions refer to (scripts, reference docs). When the model loads such a skill it's told the folder (relative to the workdir for project skills), so it can read them; a global skill's folder is outside the workdir, where the file tools can't reach. Folders without a `SKILL.md`, and anything deeper, are ignored.
 
 ```markdown
 ---
@@ -828,7 +831,8 @@ Always run `cargo fmt` after editing Rust files.
 Prefer `thiserror` for error types.
 ```
 
-- `name` and `description` are required. `tags` is an optional comma-separated list.
+- `name` and `description` are required. `tags` is an optional comma-separated list (`[a, b]` works too).
+- Values may be quoted, and `description: >` or `|` followed by indented lines works. Other fields (`license`, `allowed-tools`, `metadata`, …) are ignored.
 - Everything after the second `---` is the instruction text given to the model.
 - Skills load once, when a session starts. Start a new session (`Ctrl+N` or `/clear`) after changing them.
 - A file that can't be loaded (missing `name` or `description`, frontmatter not closed with a second `---`) is skipped, and an `[error]` line names it when the session starts. The other skills still load.
@@ -871,6 +875,11 @@ on_failure = "block"                     # optional; see "When a hook fails"
 [[hooks.commands]]
 phase = "on_turn_complete"
 command = "notify-send 'ArBe finished'"
+
+[[hooks.commands]]
+phase = "before_turn_end"                # check the work before the turn ends
+command = "cargo check --quiet"
+timeout_ms = 300000
 ```
 
 Hooks from the global and the project config both run (global first). Project hooks only run if the project is [trusted](#trusted-projects), since they're programs. Commands run in the workdir.
@@ -886,20 +895,28 @@ Hooks from the global and the project config both run (global first). Project ho
 | `after_tool_execute` | `turn_id`, `tool_name`, `is_error`, `output_chars` |
 | `on_error` | `turn_id`, `error` |
 | `on_turn_complete` | `turn_id` |
+| `before_turn_end` | `turn_id`, `round`, `checks` (how many times it already ran this turn) — the model has answered, and the turn changed something (see below) |
 | `on_approval_requested` | `turn_id`, `tool_call_id`, `tool_name`, `arguments`, `risk` — a tool call is now waiting for your decision |
 
-**What it can change.** Only `before_tool_execute` hooks affect anything; the others are notifications. `on_approval_requested` is useful for "needs your attention" notifications; the call waits for your answer, not for the hook. A `before_tool_execute` hook can print a JSON object to stdout:
+**What it can change.** Only `before_tool_execute` and `before_turn_end` hooks affect anything; the others are notifications. `on_approval_requested` is useful for "needs your attention" notifications; the call waits for your answer, not for the hook. A `before_tool_execute` hook can print a JSON object to stdout:
 
 - the same object with different `arguments`: the tool call is rewritten (the approval dialog then shows the rewritten arguments);
 - an object with `"veto": "reason"`: the call is refused, and the model is told `blocked by hook: reason`.
 
 Printing nothing leaves the call as it was. A hook runs *before* the approval dialog, so it can't be used to skip approvals.
 
+**Checking the work before a turn ends.** A `before_turn_end` hook runs when the model gives its answer, if the turn ran a tool that isn't read-only since the last check — `write_file`, `edit_file`, `execute`, an MCP tool not marked read-only, and so on, including calls by [subagents](#subagents). A turn that only read and answered isn't checked. The hook can send the turn back to the model:
+
+- by **failing** — exiting non-zero, as a failing `cargo check`, `pytest` or `npm test` does. What it printed (stderr and stdout) goes to the model as `[harness] A check before ending the turn did not pass: …`, and the model gets another round to fix it. `on_failure` defaults to `"block"` for this phase; with `"skip"`, a failing check is only reported.
+- by printing `{"continue": "what to do"}`: the text goes to the model the same way. Use this for checks that aren't a single command (a script that reads the payload, a review step).
+
+Printing nothing (and exiting 0) lets the turn end. A turn is sent back at most 3 times; after that the model's next answer ends it. The check only runs again if something changed since it last ran, so a model that explains why it can't fix something isn't sent back again. Rounds spent this way count toward the turn's tool-round limit. The check runs for the main agent only, not inside subagents. The `[harness]` message is kept in the conversation, so later turns know why the turn went on. A failing check is also shown as an `[error]` line. Set `timeout_ms` to what the check needs: the default 10 seconds is too short for most builds.
+
 **When a hook fails** — non-zero exit, output that isn't a JSON object, or running past its time limit — an `[error]` line says which hook failed and why (including what it printed to stderr). What happens next is set per hook with `on_failure`:
 
 | `on_failure` | Default for | Effect |
 |---|---|---|
-| `"block"` | `before_tool_execute` | The tool call is refused, and the model is told `blocked: <hook> failed: <reason>`. A guard that can't run doesn't let calls through. |
+| `"block"` | `before_tool_execute`, `before_turn_end` | The tool call is refused, and the model is told `blocked: <hook> failed: <reason>`. For `before_turn_end`, the turn is sent back to the model with the failure (see above). A guard or check that can't run doesn't let things through. |
 | `"skip"` | every other phase | The hook is skipped and the turn carries on as if it weren't there. |
 
 The payload is written to the hook's stdin while its output is being read, so a hook that prints as it reads works with payloads of any size.
@@ -947,7 +964,7 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 | Linux / macOS | `~/.arbe/` (from `$HOME`) |
 | Windows | `%USERPROFILE%\.arbe\`, e.g. `C:\Users\you\.arbe\` |
 
-`--dev-home` / `ARBE_HOME` moves the whole tree. In the workdir, the harness only *reads* `agent.md`/`CLAUDE.md`, `.arbe/config.toml`, and `.arbe/skills/`. It never writes there itself. Only the tools the model calls (and you approve) change files there.
+`--dev-home` / `ARBE_HOME` moves the whole tree. In the workdir, the harness only *reads* `agent.md`/`CLAUDE.md`, `.arbe/config.toml`, `.arbe/skills/` and `.agents/skills/`. It never writes there itself. Only the tools the model calls (and you approve) change files there.
 
 ```text
 ~/.arbe/
@@ -960,7 +977,8 @@ Everything ArBeHarness saves goes under one directory, the **harness home**:
 ├── instructions/
 │   └── agent.md               your global instructions (active)
 ├── skills/
-│   └── *.md                   skill files (active)
+│   ├── *.md                   skill files (active)
+│   └── <name>/SKILL.md        skill folders (active)
 ├── memory/
 │   ├── global/memory.md       notes for every project (active; see Memory)
 │   └── projects/<id>/memory.md notes for one project (active)
@@ -1083,7 +1101,7 @@ While a refresh is in progress the harness creates `auth/<account>.lock` beside 
 
 Free-form Markdown, used as-is (up to 8,000 characters). See [Instructions and skills](#instructions-and-skills).
 
-### `skills/*.md`
+### `skills/*.md`, `skills/<name>/SKILL.md`
 
 Markdown with a `---` frontmatter block. See [Skills](#skills). A leading byte-order mark is tolerated.
 

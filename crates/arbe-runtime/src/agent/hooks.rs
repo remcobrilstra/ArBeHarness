@@ -31,6 +31,18 @@ pub(super) struct ModelResultPayload {
     pub tool_calls: usize,
 }
 
+/// `BeforeTurnEnd`: the model has answered after the turn changed
+/// something. A hook sends the turn back to the model by failing (with
+/// `on_failure = "block"`, the default: what it printed is the feedback) or
+/// by returning `"continue": "<feedback>"`.
+#[derive(Debug, Serialize)]
+pub(super) struct TurnEndPayload {
+    pub turn_id: String,
+    pub round: u32,
+    /// How many times the phase already ran this turn (0 the first time).
+    pub checks: u32,
+}
+
 /// `BeforeToolExecute` runs *before* the approval gate, so a human always
 /// approves the arguments that will actually run. A hook may return:
 /// - the payload with `arguments` changed, to rewrite the call, or

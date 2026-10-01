@@ -14,25 +14,40 @@ use serde_json::Value;
 pub(super) const LOAD_SKILL_TOOL: &str = "load_skill";
 
 /// Global skills (`~/.arbe/skills/`) and project skills
-/// (`<project>/.arbe/skills/`); a project skill replaces a global one of
-/// the same name. Returns the merged set and a readable problem for each
-/// file that couldn't be loaded.
+/// (`<project>/.arbe/skills/`, then `<project>/.agents/skills/` — the
+/// folder other agents share); a project skill replaces a global one of
+/// the same name, and `.arbe` wins over `.agents`. Returns the merged set
+/// and a readable problem for each file that couldn't be loaded.
 pub(super) fn load_session_skills(
     global_dir: &Path,
     project_dir: &Path,
 ) -> (SkillSet, Vec<String>) {
     let global = arbe_skills::load_dir(global_dir, SkillScope::Global);
-    let project = arbe_skills::load_dir(
+    let ours = arbe_skills::load_dir(
         &project_dir.join(".arbe").join("skills"),
+        SkillScope::ProjectLocal,
+    );
+    let shared = arbe_skills::load_dir(
+        &project_dir.join(".agents").join("skills"),
         SkillScope::ProjectLocal,
     );
     let problems = global
         .problems
         .iter()
-        .chain(&project.problems)
+        .chain(&ours.problems)
+        .chain(&shared.problems)
         .map(|p| format!("skill skipped — {p}"))
         .collect();
-    let merged = arbe_skills::merge_skills(project.skills, global.skills);
+    let project = arbe_skills::merge_skills(ours.skills, shared.skills);
+    let mut merged = arbe_skills::merge_skills(project, global.skills);
+    // Folders as the tools see them: relative to the project when inside it.
+    for skill in &mut merged {
+        if let Some(dir) = &skill.dir
+            && let Ok(relative) = dir.strip_prefix(project_dir)
+        {
+            skill.dir = Some(relative.to_path_buf());
+        }
+    }
     (SkillSet::new(merged), problems)
 }
 
@@ -68,7 +83,17 @@ impl ToolExecutor for LoadSkillTool {
         let args: Args = serde_json::from_value(invocation.arguments)
             .map_err(|e| ToolError::Validation(format!("invalid load_skill arguments: {e}")))?;
         let (output, is_error) = match self.skills.get(&args.name) {
-            Some(skill) => (skill.instructions.clone(), false),
+            Some(skill) => match &skill.dir {
+                Some(dir) => (
+                    format!(
+                        "{}\n\n(This skill's files are in `{}`; paths in it are relative to that folder.)",
+                        skill.instructions,
+                        dir.display().to_string().replace('\\', "/")
+                    ),
+                    false,
+                ),
+                None => (skill.instructions.clone(), false),
+            },
             None => (
                 format!(
                     "no skill named {:?}; available: {}",
@@ -133,6 +158,49 @@ mod tests {
         assert_eq!(skills.get("deploy").unwrap().instructions, "how to deploy");
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("broken.md"), "{}", problems[0]);
+    }
+
+    #[tokio::test]
+    async fn shared_agents_skill_folders_load_and_point_at_their_files() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let shared = project.join(".agents/skills");
+        write_skill(
+            &shared.join("pdf"),
+            "SKILL.md",
+            "pdf",
+            "run scripts/fill.py",
+        );
+        write_skill(&shared, "style.md", "style", "shared style");
+        write_skill(
+            &project.join(".arbe/skills"),
+            "style.md",
+            "style",
+            "our style",
+        );
+
+        let (skills, problems) = load_session_skills(&root.path().join("global"), &project);
+        assert!(problems.is_empty(), "{problems:?}");
+        // `.arbe/skills` wins over `.agents/skills`.
+        assert_eq!(skills.get("style").unwrap().instructions, "our style");
+
+        let tool = LoadSkillTool::new(skills);
+        let call = ToolInvocation {
+            id: ToolCallId::new(),
+            source_turn: TurnId::new(),
+            tool_name: LOAD_SKILL_TOOL.into(),
+            arguments: json!({ "name": "pdf" }),
+            risk: RiskLevel::Low,
+            rationale: None,
+        };
+        let found = tool
+            .execute(call, &ToolContext::for_testing())
+            .await
+            .unwrap();
+        let text = found.output.as_str().unwrap();
+        assert!(text.starts_with("run scripts/fill.py"), "{text}");
+        // Relative to the project, so the file tools can open them.
+        assert!(text.contains("are in `.agents/skills/pdf`"), "{text}");
     }
 
     #[tokio::test]

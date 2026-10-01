@@ -50,6 +50,9 @@ pub(super) struct Lineage {
     pub parent: Option<SessionId>,
     /// The tree's mode: a subagent works under its parent's.
     pub mode: Arc<super::modes::ModeState>,
+    /// Set when any agent in the tree runs a tool that can change things;
+    /// the top-level turn's `before_turn_end` check reads and clears it.
+    pub changed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Lineage {
@@ -63,6 +66,7 @@ impl Lineage {
             slots: Arc::new(Semaphore::new(config.subagent_max_concurrent)),
             parent: None,
             mode: Arc::new(super::modes::ModeState::new(config.mode.as_deref())),
+            changed: Arc::default(),
         }
     }
 

@@ -13,7 +13,7 @@
 //! - Anthropic: `ANTHROPIC_API_KEY` (model: `ARBE_LIVE_ANTHROPIC_MODEL`,
 //!   default `claude-haiku-4-5-20251001`)
 //! - Ollama: `ARBE_LIVE_OLLAMA=1` with a local server (model:
-//!   `ARBE_LIVE_OLLAMA_MODEL`, default `qwen2.5-coder:3b`; `ARBE_BASE_URL` overrides
+//!   `ARBE_LIVE_OLLAMA_MODEL`, default `qwen2.5-coder:7b`; `ARBE_BASE_URL` overrides
 //!   the server address)
 //! - Any OpenAI-compatible server (e.g. xAI): `ARBE_LIVE_COMPAT_BASE_URL`
 //!   (e.g. `https://api.x.ai/v1`), `ARBE_LIVE_COMPAT_MODEL`, and
@@ -56,7 +56,7 @@ fn target(name: &str) -> Option<Target> {
             env("ARBE_LIVE_OLLAMA")?;
             (
                 None,
-                env("ARBE_LIVE_OLLAMA_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into()),
+                env("ARBE_LIVE_OLLAMA_MODEL").unwrap_or_else(|| "qwen2.5-coder:7b".into()),
             )
         }
         _ => unreachable!(),

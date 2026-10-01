@@ -22,7 +22,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 ## P0 — Housekeeping & quick correctness fixes — Met
 
 - *Session approvals covered by gate + policy tests:* met — `arbe-tools` gate/policy/`session_approvals` tests.
-- *An Ollama model calls a builtin tool end-to-end:* met, live — `crates/arbe-runtime/tests/live_agent.rs` on `qwen2.5-coder:3b` (`read_file`, `edit_file`), 2026-09-28. This needed a fix found by that run: qwen writes tool calls as JSON text (`arbe-providers/src/text_tool_calls.rs`).
+- *An Ollama model calls a builtin tool end-to-end:* met, live — `crates/arbe-runtime/tests/live_agent.rs` on `qwen2.5-coder:7b` (`read_file`, `edit_file`), 2026-09-28. This needed a fix found by that run: qwen writes tool calls as JSON text (`arbe-providers/src/text_tool_calls.rs`).
 - *fmt / clippy / test clean:* met.
 
 ## P1 — Core types v2 — Met
@@ -34,7 +34,7 @@ The v2.0 release bar (plan, risk register): **P0–P5 + P6.1–P6.3 + P7.**
 ## P2 — Provider layer v2 — Open
 
 - *The same turn (with a tool call) runs on OpenAI, Anthropic and Ollama by config switch only:* **partly.**
-  - Ollama: live (`qwen2.5-coder:3b`, `llama3.2:3b`).
+  - Ollama: live (`qwen2.5-coder:7b`, `llama3.2:3b`).
   - OpenAI's wire format: live through `openai_compatible` against xAI (`grok-4.7`, `grok-4.20-0309-reasoning`) — the same adapter code (SSE, streamed tool-call deltas, `reasoning_content`) — but **not against api.openai.com** itself.
   - Anthropic: **not run live.** Covered by fixture tests and by `crates/arbe-providers/tests/http.rs`, which drives the real adapter over HTTP (streaming, tool calls, errors, `Retry-After`, truncation).
 - *All three pass fixture tests:* met — plus the HTTP-level suite above for all three.
@@ -115,4 +115,4 @@ Everything not done yet, in one place. Nothing here blocks using the harness tod
 ## Known limitations (by design or deferred)
 
 - No built-in model prices (they go stale): costs appear only for models whose prices you set in `[[models]]`.
-- Small local models (3B) are unreliable at tool use: `llama3.2:3b` calls `remember` on trivia, and `qwen2.5-coder:3b` sometimes repeats a tool call. The harness handles both safely (approval gate, repeated-call guard) but can't make them good agents.
+- Small local models (3B) are unreliable at tool use: `llama3.2:3b` calls `remember` on trivia, and `qwen2.5-coder:7b` sometimes repeats a tool call. The harness handles both safely (approval gate, repeated-call guard) but can't make them good agents.

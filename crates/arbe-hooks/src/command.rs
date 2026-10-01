@@ -127,14 +127,20 @@ impl Hook for CommandHook {
         let output = output.map_err(|e| HookError::ContractViolation(e.to_string()))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Both streams: a check command (compiler, test runner) may
+            // report what failed on either.
+            let printed: Vec<String> = [&output.stderr, &output.stdout]
+                .into_iter()
+                .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+                .filter(|text| !text.is_empty())
+                .collect();
             return Err(HookError::ContractViolation(format!(
                 "exited with {}{}",
                 output.status,
-                if stderr.trim().is_empty() {
+                if printed.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", stderr.trim())
+                    format!(": {}", printed.join("\n"))
                 }
             )));
         }
@@ -236,6 +242,14 @@ mod tests {
         let hook = CommandHook::new(HookPhase::OnError, "echo nope 1>&2 && exit 3");
         let err = hook.run(payload()).await.unwrap_err().to_string();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_exit_reports_stdout_too() {
+        // Test runners print their failures to stdout.
+        let hook = CommandHook::new(HookPhase::BeforeTurnEnd, "echo 1 failed && exit 1");
+        let err = hook.run(payload()).await.unwrap_err().to_string();
+        assert!(err.contains("1 failed"), "{err}");
     }
 
     #[tokio::test]

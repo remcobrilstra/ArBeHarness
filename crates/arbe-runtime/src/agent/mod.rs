@@ -31,6 +31,7 @@ pub use approvals::PendingDecision;
 pub use ask::PendingQuestion;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
@@ -137,6 +138,9 @@ pub struct Agent {
     questions: Arc<ask::QuestionMailbox>,
     /// The session's mode; shared with subagents like `decisions`.
     mode: Arc<modes::ModeState>,
+    /// Whether a tool that can change things ran since the last
+    /// `before_turn_end` check; shared with subagents like `decisions`.
+    changed: Arc<AtomicBool>,
     /// Held for the duration of a turn (or a manual tool call); `try_lock`
     /// failing is what makes a concurrent submission `Busy`.
     turn_lock: tokio::sync::Mutex<()>,
@@ -172,6 +176,7 @@ struct Parts {
     decisions: Arc<ToolDecisions>,
     questions: Arc<ask::QuestionMailbox>,
     mode: Arc<modes::ModeState>,
+    changed: Arc<AtomicBool>,
 }
 
 /// Records in `meta.json` where the session works, which profile, provider
@@ -394,6 +399,7 @@ impl Agent {
             decisions: parts.decisions,
             questions: parts.questions,
             mode: parts.mode,
+            changed: parts.changed,
             turn_lock: tokio::sync::Mutex::new(()),
             active_cancel: Mutex::new(None),
             state: Mutex::new(SessionState {
@@ -587,6 +593,7 @@ impl Agent {
             decisions: lineage.decisions,
             questions: lineage.questions,
             mode: lineage.mode,
+            changed: lineage.changed,
         })
         .with_mcp_servers(config.mcp_servers.clone()))
     }

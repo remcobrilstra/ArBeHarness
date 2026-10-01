@@ -30,6 +30,7 @@ mod tests {
             scope,
             instructions: instructions.to_string(),
             tags: vec![],
+            dir: None,
         }
     }
 

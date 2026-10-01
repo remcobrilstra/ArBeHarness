@@ -57,7 +57,7 @@ impl ToolExecutor for EditFileTool {
 
     fn description(&self) -> ToolDescription {
         ToolDescription::from_args::<Args>(
-            "Find-and-replace a substring within an existing file. Fails if `find` doesn't match, or matches more than once unless replace_all is set.",
+            "Find-and-replace a substring within an existing file. Fails if `find` doesn't match, or matches more than once unless replace_all is set. If `find` has no exact match, whole lines are compared ignoring trailing whitespace, then indentation (the replacement is re-indented); the result's `matched` says when that happened.",
         )
     }
 
@@ -95,18 +95,21 @@ impl ToolExecutor for EditFileTool {
             .await
             .map_err(|e| ToolError::RuntimeFailure(format!("{}: {e}", path.display())))?;
 
-        let (updated, replacements) =
-            apply_edit(&original, &args.find, &args.replace, args.replace_all)?;
+        let edited = apply_edit(&original, &args.find, &args.replace, args.replace_all)?;
 
         let write_path = path.clone();
-        tokio::task::spawn_blocking(move || write_atomic(&write_path, updated.as_bytes()))
+        let text = edited.text;
+        tokio::task::spawn_blocking(move || write_atomic(&write_path, text.as_bytes()))
             .await
             .map_err(|e| ToolError::RuntimeFailure(format!("write task panicked: {e}")))?
             .map_err(|e| ToolError::RuntimeFailure(e.to_string()))?;
 
         Ok(ToolResult {
             id: invocation.id,
-            output: json!({ "replacements": replacements }),
+            output: match edited.loose {
+                Some(how) => json!({ "replacements": edited.replacements, "matched": how }),
+                None => json!({ "replacements": edited.replacements }),
+            },
             is_error: false,
             attachments: Vec::new(),
         })
@@ -121,7 +124,7 @@ fn apply_edit(
     find: &str,
     replace: &str,
     replace_all: bool,
-) -> Result<(String, usize), ToolError> {
+) -> Result<Edited, ToolError> {
     if find.is_empty() {
         return Err(ToolError::Validation("find must not be empty".to_string()));
     }
@@ -143,6 +146,9 @@ fn apply_edit(
 
     let occurrences = original.matches(find).count();
     if occurrences == 0 {
+        if !replace_all && let Some(loose) = loose_edit(original, find, replace)? {
+            return Ok(loose);
+        }
         return Err(ToolError::Validation(format!(
             "find string {find:?} was not found in the file"
         )));
@@ -158,7 +164,137 @@ fn apply_edit(
     } else {
         original.replacen(find, replace, 1)
     };
-    Ok((updated, occurrences))
+    Ok(Edited {
+        text: updated,
+        replacements: occurrences,
+        loose: None,
+    })
+}
+
+/// The result of an edit.
+#[derive(Debug)]
+struct Edited {
+    text: String,
+    replacements: usize,
+    /// Set when `find` only matched loosely: how.
+    loose: Option<&'static str>,
+}
+
+/// How `find` may match when it doesn't match exactly: whole lines,
+/// compared with less and less whitespace (models often get indentation or
+/// trailing spaces wrong when they copy code).
+#[derive(Debug, Clone, Copy)]
+enum Loose {
+    TrailingWhitespace,
+    Indentation,
+}
+
+impl Loose {
+    fn normalize(self, line: &str) -> &str {
+        match self {
+            Self::TrailingWhitespace => line.trim_end(),
+            Self::Indentation => line.trim(),
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::TrailingWhitespace => "ignoring trailing whitespace",
+            Self::Indentation => "ignoring indentation; the replacement was re-indented to match",
+        }
+    }
+}
+
+/// Tries the [`Loose`] matches in order. The first that matches anything
+/// decides, and must match exactly once — never a guess between places.
+/// The matched lines are replaced (keeping the last one's line ending).
+fn loose_edit(original: &str, find: &str, replace: &str) -> Result<Option<Edited>, ToolError> {
+    let find = find.replace("\r\n", "\n");
+    let (find, trailing_newline) = match find.strip_suffix('\n') {
+        Some(body) => (body, true),
+        None => (find.as_str(), false),
+    };
+    let find_lines: Vec<&str> = find.split('\n').collect();
+    let Some(first_text) = find_lines.iter().position(|l| !l.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    // Each line's start offset and its text without the line ending.
+    let mut starts = Vec::new();
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for piece in original.split_inclusive('\n') {
+        starts.push(offset);
+        let text = piece.strip_suffix('\n').unwrap_or(piece);
+        lines.push(text.strip_suffix('\r').unwrap_or(text));
+        offset += piece.len();
+    }
+    let n = find_lines.len();
+    if n > lines.len() {
+        return Ok(None);
+    }
+
+    for loose in [Loose::TrailingWhitespace, Loose::Indentation] {
+        let matches: Vec<usize> = (0..=lines.len() - n)
+            .filter(|&i| {
+                find_lines
+                    .iter()
+                    .enumerate()
+                    .all(|(k, f)| loose.normalize(lines[i + k]) == loose.normalize(f))
+            })
+            .collect();
+        let at = match matches.as_slice() {
+            [] => continue,
+            [at] => *at,
+            many => {
+                return Err(ToolError::Validation(format!(
+                    "find string {find:?} doesn't match exactly, and matches {} places {}; include more surrounding lines",
+                    many.len(),
+                    loose.describe().split(';').next().unwrap_or_default()
+                )));
+            }
+        };
+
+        let mut replacement = replace.replace("\r\n", "\n");
+        if trailing_newline && replacement.ends_with('\n') {
+            replacement.pop();
+        }
+        if let Loose::Indentation = loose {
+            replacement = reindent(
+                &replacement,
+                indentation(find_lines[first_text]),
+                indentation(lines[at + first_text]),
+            );
+        }
+        if let Some(ending) = LineEnding::of(original) {
+            replacement = ending.apply(&replacement);
+        }
+        let start = starts[at];
+        let end = starts[at + n - 1] + lines[at + n - 1].len();
+        return Ok(Some(Edited {
+            text: format!("{}{replacement}{}", &original[..start], &original[end..]),
+            replacements: 1,
+            loose: Some(loose.describe()),
+        }));
+    }
+    Ok(None)
+}
+
+fn indentation(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// Moves `text`'s lines from indentation `from` to `to`: lines starting
+/// with `from` get `to` instead; blank lines and lines indented less than
+/// `from` are left alone.
+fn reindent(text: &str, from: &str, to: &str) -> String {
+    text.split('\n')
+        .map(|line| match line.strip_prefix(from) {
+            Some(rest) if !line.trim().is_empty() => format!("{to}{rest}"),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A file's line-ending style, when it has exactly one.
@@ -210,7 +346,11 @@ mod tests {
 
     #[test]
     fn apply_edit_replaces_a_single_match() {
-        let (updated, count) = apply_edit("hello world", "world", "there", false).unwrap();
+        let Edited {
+            text: updated,
+            replacements: count,
+            ..
+        } = apply_edit("hello world", "world", "there", false).unwrap();
         assert_eq!(updated, "hello there");
         assert_eq!(count, 1);
     }
@@ -228,7 +368,11 @@ mod tests {
 
     #[test]
     fn apply_edit_replaces_every_occurrence_with_replace_all() {
-        let (updated, count) = apply_edit("a a a", "a", "b", true).unwrap();
+        let Edited {
+            text: updated,
+            replacements: count,
+            ..
+        } = apply_edit("a a a", "a", "b", true).unwrap();
         assert_eq!(updated, "b b b");
         assert_eq!(count, 3);
     }
@@ -249,7 +393,11 @@ mod tests {
     #[test]
     fn apply_edit_matches_lf_text_in_a_crlf_file_and_keeps_crlf() {
         let original = "fn main() {\r\n    old();\r\n}\r\n";
-        let (updated, count) = apply_edit(
+        let Edited {
+            text: updated,
+            replacements: count,
+            ..
+        } = apply_edit(
             original,
             "{\n    old();\n}",
             "{\n    new();\n    more();\n}",
@@ -262,16 +410,65 @@ mod tests {
 
     #[test]
     fn apply_edit_matches_crlf_text_in_an_lf_file_and_keeps_lf() {
-        let (updated, _) = apply_edit("a\nb\nc\n", "a\r\nb", "x\r\ny", false).unwrap();
+        let Edited { text: updated, .. } =
+            apply_edit("a\nb\nc\n", "a\r\nb", "x\r\ny", false).unwrap();
         assert_eq!(updated, "x\ny\nc\n");
     }
 
     #[test]
     fn apply_edit_matches_a_mixed_ending_file_as_given() {
         let original = "a\r\nb\nc";
-        assert!(apply_edit(original, "a\nb", "x", false).is_err());
-        let (updated, _) = apply_edit(original, "b\nc", "y", false).unwrap();
-        assert_eq!(updated, "a\r\ny");
+        let exact = apply_edit(original, "b\nc", "y", false).unwrap();
+        assert_eq!(exact.text, "a\r\ny");
+        assert_eq!(exact.loose, None);
+        // Not an exact match, but the line-by-line fallback finds it.
+        let loose = apply_edit(original, "a\nb", "x", false).unwrap();
+        assert_eq!(loose.text, "x\nc");
+        assert!(loose.loose.is_some());
+    }
+
+    #[test]
+    fn a_find_with_wrong_trailing_whitespace_matches_whole_lines() {
+        let original = "fn a() {   \n    one();\n}\n";
+        let edited = apply_edit(
+            original,
+            "fn a() {\n    one();",
+            "fn a() {\n    two();",
+            false,
+        )
+        .unwrap();
+        assert_eq!(edited.text, "fn a() {\n    two();\n}\n");
+        assert_eq!(edited.loose, Some("ignoring trailing whitespace"));
+    }
+
+    #[test]
+    fn a_find_with_wrong_indentation_is_reindented_to_the_file() {
+        let original = "impl X {\r\n    fn a() {\r\n        one();\r\n    }\r\n}\r\n";
+        // The model dropped the indentation, and added a trailing newline.
+        let edited = apply_edit(
+            original,
+            "fn a() {\n    one();\n}\n",
+            "fn a() {\n    one();\n    two();\n}\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            edited.text,
+            "impl X {\r\n    fn a() {\r\n        one();\r\n        two();\r\n    }\r\n}\r\n"
+        );
+        assert!(edited.loose.unwrap().starts_with("ignoring indentation"));
+    }
+
+    #[test]
+    fn a_loose_match_must_be_unique() {
+        let original = "if x {\n    go();\n}\nif y {\n  go();\n}\n";
+        let err = apply_edit(original, "go();", "stop();", false).unwrap_err();
+        // Exactly "go();" is in the file twice already: the exact rule.
+        assert!(err.to_string().contains("matches 2 times"), "{err}");
+        let err = apply_edit(original, "\tgo();", "stop();", false).unwrap_err();
+        assert!(err.to_string().contains("matches 2 places"), "{err}");
+        // Never loosened for replace_all.
+        assert!(apply_edit("  a  \n", "a\n", "b", true).is_err());
     }
 
     #[test]

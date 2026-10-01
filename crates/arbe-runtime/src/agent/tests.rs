@@ -280,6 +280,7 @@ fn test_parts(
         decisions: Default::default(),
         questions: Default::default(),
         mode: Arc::new(super::modes::ModeState::new(None)),
+        changed: Default::default(),
     }
 }
 
@@ -1493,6 +1494,97 @@ async fn a_failing_guard_hook_blocks_the_call_unless_set_to_skip() {
         assert_eq!(is_error, expect_blocked, "{text}");
         assert_eq!(text.starts_with("blocked: "), expect_blocked, "{text}");
     }
+}
+
+/// A `before_turn_end` hook that always asks for another try, counting
+/// its runs.
+struct KeepGoing(Arc<std::sync::atomic::AtomicU32>);
+
+#[async_trait]
+impl Hook for KeepGoing {
+    fn phase(&self) -> HookPhase {
+        HookPhase::BeforeTurnEnd
+    }
+
+    async fn run(&self, mut payload: Value) -> Result<Value, HookError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        payload["continue"] = json!("the tests still fail");
+        Ok(payload)
+    }
+}
+
+#[tokio::test]
+async fn a_failing_turn_end_check_sends_the_turn_back_to_the_model() {
+    let provider = ScriptedProvider::new(
+        vec![
+            tool_calls(&[("c1", "echo", json!({"x": 1}))]),
+            answer("done"),
+        ],
+        answer("I could not fix it"),
+    );
+    let requests = provider.requests.clone();
+    let (t, _rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.hooks.register(Arc::new(
+            arbe_hooks::CommandHook::new(HookPhase::BeforeTurnEnd, "echo 2 tests failed && exit 1")
+                .blocking_on_failure(true),
+        ));
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    let reply = t.agent.submit_message("go".into()).await.unwrap();
+
+    // The check's output went to the model, which answered again; nothing
+    // changed after that, so the second answer ended the turn unchecked.
+    assert_eq!(reply, "I could not fix it");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let note = requests[2].messages.last().unwrap();
+    assert_eq!(note.role, Role::User);
+    assert!(note.text().starts_with("[harness]"), "{}", note.text());
+    assert!(note.text().contains("2 tests failed"), "{}", note.text());
+    // Kept in the trace, so later turns know why the turn went on.
+    let turns = t.store.list_turns(t.session_id).unwrap();
+    let texts: Vec<String> = turns[0].messages.iter().map(Message::text).collect();
+    assert!(texts.iter().any(|m| m.contains("2 tests failed")));
+    assert_eq!(texts.last().unwrap(), "I could not fix it");
+}
+
+#[tokio::test]
+async fn the_turn_end_check_runs_only_after_changes_and_at_most_three_times() {
+    // Nothing changed: no check.
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let provider = ScriptedProvider::new(
+        vec![tool_calls(&[("c1", "reader", json!({}))])],
+        answer("looked"),
+    );
+    let (t, _rx) = test_agent_with(provider, |parts| {
+        allow(&["reader"])(parts);
+        parts.hooks.register(Arc::new(KeepGoing(runs.clone())));
+    });
+    t.agent.register_tool("reader", Arc::new(ReaderTool));
+    t.agent.submit_message("look".into()).await.unwrap();
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // A model that changes something every time it's sent back is checked
+    // three times; its fourth answer ends the turn.
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let rounds = (0..5)
+        .flat_map(|i| {
+            [
+                tool_calls(&[(&format!("c{i}"), "echo", json!({ "try": i }))]),
+                answer(&format!("attempt {i}")),
+            ]
+        })
+        .collect();
+    let provider = ScriptedProvider::new(rounds, answer("unused"));
+    let (t, _rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.hooks.register(Arc::new(KeepGoing(runs.clone())));
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+    let reply = t.agent.submit_message("go".into()).await.unwrap();
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(reply, "attempt 3");
 }
 
 #[tokio::test]

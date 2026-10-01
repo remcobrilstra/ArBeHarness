@@ -11,7 +11,7 @@
 //! ARBE_LIVE_COMPAT_MODEL=grok-4.7 \
 //!   cargo test -p arbe-runtime --test live_agent -- --ignored --nocapture
 //!
-//! # local Ollama with the default models (qwen2.5-coder:3b, llama3.2:3b):
+//! # local Ollama with the default models (qwen2.5-coder:7b, llama3.2:3b):
 //! ARBE_LIVE_OLLAMA=1 cargo test -p arbe-runtime --test live_agent -- --ignored --nocapture
 //! ```
 //!
@@ -67,7 +67,7 @@ fn target() -> Option<Target> {
     Some(Target {
         settings,
         vision: false,
-        coding_model: env("ARBE_LIVE_CODING_MODEL").unwrap_or_else(|| "qwen2.5-coder:3b".into()),
+        coding_model: env("ARBE_LIVE_CODING_MODEL").unwrap_or_else(|| "qwen2.5-coder:7b".into()),
         general_model: env("ARBE_LIVE_GENERAL_MODEL").unwrap_or_else(|| "llama3.2:3b".into()),
     })
 }

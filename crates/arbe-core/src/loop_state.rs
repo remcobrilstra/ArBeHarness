@@ -28,8 +28,10 @@ impl LoopPhase {
     /// Whether `to` is a legal next phase from `self`. Encodes the branches
     /// in overall design §4.1: `InterpretOutput` may skip straight to
     /// `PersistTurn` when no tool call was produced, tool calls may be
-    /// denied (skipping `ToolExecution`), and follow-up inference loops
-    /// `PostToolReflection` back to `ModelInference`.
+    /// denied (skipping `ToolExecution`), follow-up inference loops
+    /// `PostToolReflection` back to `ModelInference`, and a final answer
+    /// that a turn-end check sends back goes from `InterpretOutput` to
+    /// `PostToolReflection` (and from there back to inference).
     pub fn can_transition_to(self, to: LoopPhase) -> bool {
         use LoopPhase::*;
         matches!(
@@ -41,6 +43,7 @@ impl LoopPhase {
                 | (ModelInference, InterpretOutput)
                 | (InterpretOutput, ToolApproval)
                 | (InterpretOutput, PersistTurn)
+                | (InterpretOutput, PostToolReflection)
                 | (ToolApproval, ToolExecution)
                 | (ToolApproval, PersistTurn)
                 | (ToolExecution, PostToolReflection)
@@ -141,6 +144,25 @@ mod tests {
             m.transition(phase).unwrap();
         }
         assert_eq!(m.current(), Idle);
+    }
+
+    #[test]
+    fn an_answer_sent_back_by_a_check_returns_to_inference() {
+        let mut m = LoopMachine::new();
+        for phase in [
+            ReceiveUserInput,
+            AssembleContext,
+            PlanOrDirectRespond,
+            ModelInference,
+            InterpretOutput,
+            PostToolReflection,
+            ModelInference,
+            InterpretOutput,
+            PersistTurn,
+        ] {
+            m.transition(phase).unwrap();
+        }
+        assert_eq!(m.current(), PersistTurn);
     }
 
     #[test]

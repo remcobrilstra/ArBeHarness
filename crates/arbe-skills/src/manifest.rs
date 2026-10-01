@@ -40,20 +40,14 @@ pub fn parse_manifest(
     let mut name = None;
     let mut description = None;
     let mut tags = Vec::new();
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "name" => name = Some(value.to_string()),
-            "description" => description = Some(value.to_string()),
+    for (key, value) in top_level_fields(frontmatter) {
+        match key {
+            "name" => name = Some(value),
+            "description" => description = Some(value),
             "tags" => {
                 tags = value
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
                     .split(',')
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
@@ -78,12 +72,97 @@ pub fn parse_manifest(
         scope,
         instructions: body.to_string(),
         tags,
+        dir: None,
     })
+}
+
+/// The frontmatter's top-level `key: value` fields, read as the small part
+/// of YAML that skill files use (including files written for other agents'
+/// `SKILL.md` format): quoted values are unquoted, a `|` or `>` block value
+/// is read from the indented lines below it, and indented lines that belong
+/// to a nested field (`metadata:` and the like) are skipped.
+fn top_level_fields(frontmatter: &str) -> Vec<(&str, String)> {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        i += 1;
+        if line.is_empty() || line.starts_with([' ', '\t', '#']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = if let Some(style) = value.chars().next().filter(|c| matches!(c, '|' | '>')) {
+            let mut block = Vec::new();
+            while i < lines.len() {
+                let next = lines[i].trim_end();
+                if !next.is_empty() && !next.starts_with([' ', '\t']) {
+                    break;
+                }
+                block.push(next.trim());
+                i += 1;
+            }
+            let separator = if style == '|' { "\n" } else { " " };
+            block
+                .split(|l| l.is_empty())
+                .map(|paragraph| paragraph.join(separator))
+                .filter(|paragraph| !paragraph.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            unquote(value).to_string()
+        };
+        fields.push((key.trim(), value));
+    }
+    fields
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_yaml_that_other_agents_skill_files_use() {
+        let text = "---\n\
+                    name: \"pdf-tools\"\n\
+                    description: >\n  Extracts text from PDFs\n  and fills forms.\n\n  Use for any .pdf file.\n\
+                    license: Apache-2.0\n\
+                    allowed-tools: [read_file]\n\
+                    metadata:\n  name: not-the-skill-name\n  version: '1.0'\n\
+                    tags: [pdf, forms]\n\
+                    ---\n\
+                    Steps.\n";
+        let manifest = parse_manifest(text, SkillScope::Global, "SKILL.md").unwrap();
+        assert_eq!(manifest.name, "pdf-tools");
+        assert_eq!(
+            manifest.description,
+            "Extracts text from PDFs and fills forms.\nUse for any .pdf file."
+        );
+        assert_eq!(manifest.tags, vec!["pdf", "forms"]);
+        assert_eq!(manifest.instructions, "Steps.\n");
+    }
+
+    #[test]
+    fn a_literal_block_keeps_its_lines() {
+        let text = "---\nname: x\ndescription: |-\n  line one\n  line two\n---\nbody";
+        let manifest = parse_manifest(text, SkillScope::Global, "x.md").unwrap();
+        assert_eq!(manifest.description, "line one\nline two");
+    }
 
     #[test]
     fn parses_a_well_formed_manifest() {

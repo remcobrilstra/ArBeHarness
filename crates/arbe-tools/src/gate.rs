@@ -41,6 +41,11 @@ impl Authorized {
         self.executor.parallel_safe()
     }
 
+    /// Whether this tool only reads (see `ToolExecutor::read_only`).
+    pub fn read_only(&self) -> bool {
+        self.executor.read_only()
+    }
+
     /// Runs the approved call. This is where the [`ToolContext`] every
     /// executor requires is issued — the only place it can be.
     pub async fn execute(self, run: ToolRun) -> Result<ToolResult, ToolError> {

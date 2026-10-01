@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_written_as_text_becomes_a_tool_use() {
-        // What qwen2.5-coder:3b actually streamed for a get_weather request.
+        // What qwen2.5-coder:7b actually streamed for a get_weather request.
         let lines = [
             r#"{"message":{"role":"assistant","content":"{\"name\": \"get_weather\", "},"done":false}"#,
             r#"{"message":{"role":"assistant","content":"\"arguments\": {\"city\": \"Paris\"}}"},"done":false}"#,

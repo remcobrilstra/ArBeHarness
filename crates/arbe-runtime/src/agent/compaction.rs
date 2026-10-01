@@ -4,7 +4,9 @@
 //! summary is saved in `compactions.jsonl` so it's computed once, not every
 //! turn.
 
-use arbe_core::{Compaction, HarnessError, Message, ProviderError, Role, RuntimeEvent};
+use arbe_core::{
+    Compaction, HarnessError, Message, ProviderError, RequestedToolCall, Role, RuntimeEvent,
+};
 use arbe_memory::{HistoryEntry, estimate_message_tokens};
 use arbe_providers::{CancellationToken, ModelRequest, ResponseAccumulator, stream_with_retry};
 use futures_util::StreamExt;
@@ -27,9 +29,11 @@ You are summarizing the earlier part of a conversation between a user and an AI 
 Write a concise summary that preserves:
 - the user's goals, requests and preferences;
 - decisions made and why;
-- important facts learned (file paths, names, values, error messages);
-- what was done (files changed, commands run and their outcomes);
-- anything still pending or promised.
+- important facts learned (names, values, error messages), each with where it is: file path, symbol, line number when known;
+- what was done: each file changed (its path, and the functions or sections touched), commands run and their outcomes;
+- anything still pending or promised, with the files it concerns.
+
+Keep paths, symbols, commands and error text exactly as written; never replace a path with a description.
 
 Omit pleasantries, dead ends and anything superseded. Use short bullet points. Do not address the user.";
 
@@ -94,8 +98,13 @@ pub(super) fn plan(history: &[HistoryEntry], budget: u64, force: bool) -> Option
 }
 
 /// The turns as plain text for the summarizer: who said what, which tools
-/// were called with what, and the start of each result.
-pub(super) fn render_transcript(entries: &[HistoryEntry]) -> String {
+/// were called with what, and the start of each result. `subject` names
+/// what a call acts on (see `ToolExecutor::subject`): shown in full, since
+/// clipping long arguments can cut out the path or command.
+pub(super) fn render_transcript(
+    entries: &[HistoryEntry],
+    subject: impl Fn(&RequestedToolCall) -> Option<String>,
+) -> String {
     let mut out = String::new();
     for entry in entries {
         let message = &entry.message;
@@ -108,7 +117,12 @@ pub(super) fn render_transcript(entries: &[HistoryEntry]) -> String {
                 }
                 for call in message.tool_uses() {
                     let args = truncate_middle(call.arguments.to_string(), 300);
-                    out.push_str(&format!("[called {}({args})]\n", call.name));
+                    match subject(&call) {
+                        Some(on) => {
+                            out.push_str(&format!("[called {} on {on} ({args})]\n", call.name))
+                        }
+                        None => out.push_str(&format!("[called {}({args})]\n", call.name)),
+                    }
                 }
             }
             Role::Tool => {
@@ -169,7 +183,17 @@ pub(super) async fn compact(
     // The transcript must itself fit: clip it to most of the budget.
     let max_chars = (agent.settings.budget_tokens as usize).saturating_mul(3);
     prompt.push_str("Conversation to summarize:\n");
-    prompt.push_str(&truncate_middle(render_transcript(&entries), max_chars));
+    let registry = agent.registry_snapshot();
+    let subject = |call: &RequestedToolCall| {
+        registry
+            .get(&call.name)
+            .ok()
+            .and_then(|tool| tool.subject(&call.arguments))
+    };
+    prompt.push_str(&truncate_middle(
+        render_transcript(&entries, subject),
+        max_chars,
+    ));
 
     let request = ModelRequest {
         model: agent.settings.model.clone(),
@@ -244,7 +268,7 @@ fn summarize_error(err: ProviderError) -> HarnessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbe_core::RequestedToolCall;
+
     use serde_json::json;
 
     fn turn(index: u64, chars: usize) -> Vec<HistoryEntry> {
@@ -329,11 +353,36 @@ mod tests {
             message,
         })
         .collect();
-        let text = render_transcript(&entries);
+        let text = render_transcript(&entries, |_| None);
         assert!(text.contains("User: what's in main?"));
         assert!(text.contains(r#"[called read_file({"path":"src/main.rs"})]"#));
         assert!(text.contains("characters omitted"));
         assert!(text.contains("Assistant: it starts the TUI"));
         assert!(text.len() < 3_000);
+    }
+
+    #[test]
+    fn a_calls_subject_survives_clipped_arguments() {
+        let call = RequestedToolCall {
+            id: "c".into(),
+            name: "edit_file".into(),
+            arguments: json!({
+                "find": "a".repeat(1_000),
+                "path": "crates/deep/src/lib.rs",
+                "replace": "b".repeat(1_000),
+            }),
+        };
+        let entries = vec![HistoryEntry {
+            turn_index: 0,
+            message: Message::assistant_tool_calls(vec![call]),
+        }];
+        assert!(!render_transcript(&entries, |_| None).contains("crates/deep/src/lib.rs"));
+        let text = render_transcript(&entries, |call| {
+            call.arguments["path"].as_str().map(str::to_string)
+        });
+        assert!(
+            text.contains("[called edit_file on crates/deep/src/lib.rs ("),
+            "{text}"
+        );
     }
 }

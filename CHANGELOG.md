@@ -14,7 +14,7 @@ A rebuild of the harness core: a streaming agent loop on typed content blocks, t
 - Retries with backoff for rate limits, overload, timeouts and server errors 500/502/503/529, honoring `Retry-After`.
 - A reply that breaks off partway is an error, never a silently truncated answer.
 - Tool calls some small models write as plain JSON text (e.g. `qwen2.5-coder`) are recognized.
-- Default local models: `qwen2.5-coder:3b` (coding) and `llama3.2:3b` (general).
+- Default local models: `qwen2.5-coder:7b` (coding) and `llama3.2:3b` (general).
 - A per-model catalog (context window, vision, thinking), correctable in config.
 
 ### Agent
