@@ -1,0 +1,9 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\two-tasks\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-two-tasks
+[tool] task {"description":"Read alpha code","prompt":"Read the file alpha/code.txt in the project directory and report back its complete contents exactly. Do not modify anything. Just return the full file contents.","tools":["read_file"]}
+[tool] task {"description":"Read beta code","prompt":"Read the file beta/code.txt in the project directory and report back its complete contents exactly. Do not modify anything. Just return the full file contents.","tools":["read_file"]}
+  [tool] read_file {"path":"alpha/code.txt"}
+  [tool] read_file {"path":"beta/code.txt"}
+**alpha/code.txt:** north-17
+
+**beta/code.txt:** south-84

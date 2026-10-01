@@ -1,0 +1,6 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\long-output\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-long-output
+[tool] execute {"command":"python emit.py | tail -n 1"}
+[tool] execute {"command":"python emit.py | Select-Object -Last 1"}
+[tool] execute {"command":"python -c \"import subprocess; out=subprocess.check_output(['python','emit.py'], text=True); print(out.splitlines()[-1] if out.splitlines() else '')\""}
+ANSWER=kestrel-4821

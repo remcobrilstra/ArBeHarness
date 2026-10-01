@@ -1,0 +1,8 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\ambiguous-edit\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-ambiguous-edit
+[tool] read_file {"path":"test_widget.py"}
+[tool] read_file {"path":"widget.py"}
+[tool] glob {"pattern":"**/*"}
+[tool] edit_file {"find":"def title() -> str:\n    return \"name\"","path":"widget.py","replace":"def title() -> str:\n    return \"title\""}
+[tool] execute {"command":"python test_widget.py"}
+`title()` in `widget.py` was returning `"name"` instead of `"title"`. Both tests pass now.

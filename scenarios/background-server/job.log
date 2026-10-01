@@ -1,0 +1,26 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\background-server\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-background-server
+[tool] execute {"background":true,"command":"python serve.py"}
+[tool] process_output {"handle":"bg-1","wait_secs":5}
+[tool] execute {"command":"python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/').read().decode())\""}
+[tool] process_kill {"handle":"bg-1"}
+The response body from `http://127.0.0.1:8765/` was:
+
+```html
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="styles.css">
+<style>body{padding:16px;max-width:760px;overflow:auto;height:auto}#t{display:flex;flex-direction:column;gap:8px}</style></head>
+<body><div id="t" class="transcript"></div>
+<script src="vendor/marked/marked.umd.js"></script><script src="vendor/dompurify/purify.min.js"></script><script src="turn-format.js"></script>
+<script>
+const t=document.getElementById('t');
+function turn(kind,label,text){const r=document.createElement('div');r.className='turn turn-'+kind;const l=document.createElement('div');l.className='turn-label';l.textContent=label;const b=document.createElement('div');b.className='turn-text';renderMarkdownInto(b,text);r.append(l,b);t.appendChild(r);}
+turn('user','You','Can you fix the `session_id` bug in **terminal.rs**?');
+turn('assistant','Assistant','## Root cause\nThe view reads the log for the id known at *spawn*.\n\n1. Grok starts a new chat\n2. The old log freezes\n   - nested point with `code`\n\n| Runtime | Record |\n|---|---|\n| Claude | `~/.claude/sessions/<pid>.json` |\n| Grok | `active_sessions.json` |\n\n```rust\nfn live_session_id(&self, pid: u32) -> Option<String>\n```\n> Note: see [docs](https://example.com).\n\n<img src=x onerror="document.body.style.background=\'red\'">Safe line');
+const d=document.createElement('details');d.className='tool-call';d.open=true;d.innerHTML='<summary><span class="tool-call-name">Bash</span></summary>';const body=document.createElement('div');body.className='tool-call-body';
+const lab=document.createElement('div');lab.className='turn-label';lab.textContent='Arguments';body.append(lab,renderToolArgs(JSON.stringify({command:"cargo test -p arbecoding-core",description:"Run core tests",timeout:600000,run_in_background:false,env:null,content:"line one\nline two\nline three",options:{a:[1,2],b:"x"}})));
+const lab2=document.createElement('div');lab2.className='turn-label';lab2.textContent='Arguments (not JSON)';body.append(lab2,renderToolArgs('plain text input'));
+d.appendChild(body);t.appendChild(d);
+</script></body></html>
+```
+
+The server process has been stopped.

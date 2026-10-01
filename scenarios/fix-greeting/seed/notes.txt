@@ -1,0 +1,1 @@
+The greeting is the word Hello, a comma, a space, and the name. Capital H.

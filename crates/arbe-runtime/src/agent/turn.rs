@@ -512,8 +512,13 @@ impl TurnRunner<'_> {
         let mut turn_start = messages.len().saturating_sub(1);
         let mut previous_calls: Option<Vec<(String, String)>> = None;
         let mut identical_rounds = 1;
+        let max_rounds = agent.settings.max_tool_rounds;
 
-        for round in 0..agent.settings.max_tool_rounds {
+        // One round past the limit: the wrap-up, where the model is told to
+        // stop calling tools and answer, so a turn cut off by the limit
+        // still tells the user what it did and what's left.
+        for round in 0..=max_rounds {
+            let wrap_up = round == max_rounds;
             // Checked from the second round on: nothing has been spent
             // before the first, and the loop can only stop after a round.
             if round > 0
@@ -544,6 +549,12 @@ impl TurnRunner<'_> {
             let tool_tokens = arbe_memory::estimate_tool_specs(&tool_specs);
             if round > 0 {
                 turn_start -= self.make_room(&mut messages, history_start, turn_start, tool_tokens);
+            }
+            if wrap_up {
+                // Sent, not recorded: it's the harness talking, not the
+                // user. Tools stay on offer because earlier rounds' calls
+                // must refer to them; any call now is dropped below.
+                messages.push(Message::new(Role::User, wrap_up_notice(max_rounds)));
             }
 
             let estimated_prompt_tokens = self.publish_context(
@@ -593,6 +604,20 @@ impl TurnRunner<'_> {
                     self.record(partial);
                 }
                 return Err(HarnessError::Cancelled);
+            }
+
+            if wrap_up {
+                let answer = without_tool_uses(response.message);
+                if !tool_calls.is_empty() {
+                    tracing::debug!(
+                        dropped = tool_calls.len(),
+                        "tool calls in the wrap-up round were not run"
+                    );
+                }
+                if !answer.content.is_empty() {
+                    self.record(answer);
+                }
+                break;
             }
 
             self.record(response.message.clone());
@@ -722,6 +747,15 @@ impl TurnRunner<'_> {
 /// A round's tool calls, reduced to what makes two rounds "the same
 /// request": names and arguments, in order (provider call ids differ every
 /// round).
+/// What the model is told in the wrap-up round after the tool-round limit.
+fn wrap_up_notice(max_rounds: u32) -> String {
+    format!(
+        "[harness] This turn has used its {max_rounds} tool rounds, so no more tool calls will run. \
+         Do not call any tools. Reply to the user now: what you did, what is left undone, \
+         and anything you changed but could not verify."
+    )
+}
+
 fn call_signature(calls: &[RequestedToolCall]) -> Vec<(String, String)> {
     calls
         .iter()

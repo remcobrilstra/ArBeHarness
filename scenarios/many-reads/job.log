@@ -1,0 +1,16 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\many-reads\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-many-reads
+[tool] list_dir {"path":"services"}
+[tool] read_file {"path":"services/ash.py"}
+[tool] read_file {"path":"services/birch.py"}
+[tool] read_file {"path":"services/cedar.py"}
+[tool] read_file {"path":"services/dune.py"}
+[tool] read_file {"path":"services/elm.py"}
+[tool] read_file {"path":"services/fir.py"}
+[tool] read_file {"path":"services/grove.py"}
+[tool] read_file {"path":"services/heath.py"}
+[tool] read_file {"path":"services/iris.py"}
+[tool] read_file {"path":"services/juniper.py"}
+[tool] read_file {"path":"services/kelp.py"}
+[tool] read_file {"path":"services/larch.py"}
+**services/dune.py** contains the live billing endpoint: `https://billing.internal/live`.

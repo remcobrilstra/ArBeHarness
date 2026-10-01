@@ -1,0 +1,2 @@
+Members pay 15 percent less than the catalog price.
+Receipt formatting is display only and is not what the test charges.

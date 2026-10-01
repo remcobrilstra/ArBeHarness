@@ -6,15 +6,16 @@ tags: sessions, review
 
 Review one saved session and the subagent sessions it started. Read only. Do not edit, move, or delete anything under the harness home, and do not write the report back into the session.
 
-The on-disk shape is in `docs/user-guide.md` under File formats (`meta.json`, `turns.jsonl`, `in_flight.jsonl`). Sessions live in `<harness home>/sessions/<id>/`. The home is `~/.arbe` unless that session was recorded with `ARBE_HOME` or `--dev-home`.
+Sessions live in `<harness home>/sessions/<id>/`. The home is `~/.arbe` unless that session was recorded with `ARBE_HOME` or `--dev-home`. The fields you need are named below. Do not open the user guide to re-learn the file format.
 
-`read_file` cannot leave the workdir, and the harness home is outside it. Read the files with `execute` and a read-only command (`Get-Content` on Windows, `cat` elsewhere). Skip image and `opaque` payloads: count that a block was there, and do not pull base64 into the report.
+`read_file` cannot leave the workdir, and the harness home is outside it. Read with `execute`. On Windows the command is already run with `cmd /C`, so the command itself is `dir` or `type` — not `Get-ChildItem`, `Get-Content`, or a command that starts with `cmd /C`. Elsewhere the command is run with `sh -c`, so use `ls` and `cat`. One command per call. Skip image and `opaque` payloads: count that a block was there, and do not pull base64 into the report.
 
 ## What to load
 
-1. The session's `meta.json` and `turns.jsonl`.
-2. If `in_flight.jsonl` exists and is non-empty, the session closed mid-turn. Say so. Those lines are not a finished turn.
-3. Every other session whose `meta.parent` is this id. Review each the same way, nested under its parent. Ignore sessions that are not this one and not its descendants. If a parent chain cycles, stop and say so.
+1. `dir /b` the sessions directory (or `ls` elsewhere).
+2. `type` that session's `meta.json` and `turns.jsonl` (`cat` elsewhere).
+3. If `dir` shows `in_flight.jsonl` with a non-zero size, the session closed mid-turn. Say so. Do not type that file; those lines are not a finished turn.
+4. For every other directory, `type` only its `meta.json`. Review it, nested under this session, only when `parent` is this id. Do not open its turns or in-flight log otherwise. If a parent chain cycles, stop and say so.
 
 ## Facts per turn
 

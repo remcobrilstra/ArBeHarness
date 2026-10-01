@@ -849,6 +849,70 @@ async fn the_tool_round_limit_stops_the_turn() {
 }
 
 #[tokio::test]
+async fn at_the_tool_round_limit_the_model_gets_one_round_to_answer() {
+    let rounds = (0..3)
+        .map(|i| tool_calls(&[("c", "echo", json!({ "i": i }))]))
+        .collect();
+    let provider = ScriptedProvider::new(rounds, answer("did three echoes; nothing left"));
+    let requests = provider.requests.clone();
+    let (t, mut rx) = test_agent_with(provider, |parts| {
+        allow(&["echo"])(parts);
+        parts.settings.max_tool_rounds = 3;
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+
+    let answer = t.agent.submit_message("go".into()).await.unwrap();
+    assert_eq!(answer, "did three echoes; nothing left");
+
+    let turns = t.store.list_turns(t.session_id).unwrap();
+    assert_eq!(turns[0].stop_reason, Some(StopReason::ToolRoundLimit));
+    let last = turns[0].messages.last().unwrap();
+    assert_eq!(last.role, Role::Assistant);
+    assert_eq!(last.text(), "did three echoes; nothing left");
+    // The notice went to the model but isn't part of the saved turn.
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let notice = requests[3].messages.last().unwrap();
+    assert_eq!(notice.role, Role::User);
+    assert!(notice.text().contains("no more tool calls will run"));
+    assert!(
+        !turns[0]
+            .messages
+            .iter()
+            .any(|m| m.text().contains("no more tool calls will run"))
+    );
+    let executed = drain(&mut rx)
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::ToolExecuted { .. }))
+        .count();
+    assert_eq!(executed, 3);
+}
+
+#[tokio::test]
+async fn tool_calls_in_the_wrap_up_round_are_not_run() {
+    let rounds = (0..10)
+        .map(|i| tool_calls(&[("c", "echo", json!({ "i": i }))]))
+        .collect();
+    let (t, mut rx) = test_agent_with(ScriptedProvider::new(rounds, answer("never")), |parts| {
+        allow(&["echo"])(parts);
+        parts.settings.max_tool_rounds = 2;
+    });
+    t.agent.register_tool("echo", Arc::new(EchoExecutor));
+
+    t.agent.submit_message("go".into()).await.unwrap();
+    let turns = t.store.list_turns(t.session_id).unwrap();
+    assert_eq!(turns[0].stop_reason, Some(StopReason::ToolRoundLimit));
+    let executed = drain(&mut rx)
+        .iter()
+        .filter(|e| matches!(e, RuntimeEvent::ToolExecuted { .. }))
+        .count();
+    assert_eq!(executed, 2, "the wrap-up round's call must not run");
+    // Every saved call has its result: the dropped call was never saved.
+    let calls: usize = turns[0].messages.iter().map(|m| m.tool_uses().len()).sum();
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
 async fn the_turn_token_ceiling_stops_the_turn() {
     let rounds = (0..10)
         .map(|i| tool_calls(&[("c", "echo", json!({ "i": i }))]))

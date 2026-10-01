@@ -1,0 +1,7 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\fix-greeting\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-fix-greeting
+[tool] read_file {"path":"test_greet.py"}
+[tool] read_file {"path":"greet.py"}
+[tool] edit_file {"find":"return f\"Helo, {name}\"","path":"greet.py","replace":"return f\"Hello, {name}\""}
+[tool] execute {"command":"python test_greet.py"}
+`greet.py` returned `"Helo, {name}"` instead of `"Hello, {name}"`. The typo is fixed, and `test_greet.py` passes.

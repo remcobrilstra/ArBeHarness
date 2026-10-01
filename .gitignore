@@ -1,2 +1,4 @@
 /target
 /docs/tmp
+/scenarios/*/work/
+/scenarios/**/__pycache__/

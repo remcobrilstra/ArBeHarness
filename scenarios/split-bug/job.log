@@ -1,0 +1,14 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\split-bug\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-split-bug
+[tool] glob {"pattern":"**/*pricing*"}
+[tool] glob {"pattern":"**/*test*"}
+[tool] read_file {"path":"test_pricing.py"}
+[tool] read_file {"path":"pricing.py"}
+[tool] glob {"pattern":"**/*"}
+[tool] grep {"pattern":"catalog_price|mug"}
+[tool] read_file {"path":"notes.txt"}
+[tool] read_file {"path":"receipt.py"}
+[tool] read_file {"path":"catalog.py"}
+[tool] edit_file {"find":"        price = price - price // 10","path":"pricing.py","replace":"        price = price - price * 15 // 100"}
+[tool] execute {"command":"python test_pricing.py"}
+The member discount in `pricing.py` was 10% instead of 15%. A member mug now charges `1000 - 150 = 850` cents, and `test_pricing.py` passes.

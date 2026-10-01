@@ -19,9 +19,11 @@ const MAX_READ_BYTES: u64 = 5 * 1024 * 1024;
 struct Args {
     /// Path relative to the project root.
     path: String,
-    /// Exact text to find.
+    /// Exact text to find. Line endings don't need to match: in a file that
+    /// uses LF or CRLF throughout, `\n` and `\r\n` are converted to the file's.
     find: String,
-    /// Text to put in its place.
+    /// Text to put in its place (line endings converted the same way). Must
+    /// differ from `find`.
     replace: String,
     /// Replace every occurrence. Defaults to false, which fails on more than one match.
     #[serde(default)]
@@ -124,6 +126,21 @@ fn apply_edit(
         return Err(ToolError::Validation("find must not be empty".to_string()));
     }
 
+    // The model's text rarely carries the file's line endings (a ranged
+    // `read_file` returns lines joined with `\n`), so in a file that uses one
+    // style throughout, both sides are converted to it. A file with mixed
+    // endings is matched as given.
+    let (find, replace) = match LineEnding::of(original) {
+        Some(ending) => (ending.apply(find), ending.apply(replace)),
+        None => (find.to_string(), replace.to_string()),
+    };
+    let (find, replace) = (find.as_str(), replace.as_str());
+    if find == replace {
+        return Err(ToolError::Validation(
+            "find and replace are identical, so the edit would change nothing".to_string(),
+        ));
+    }
+
     let occurrences = original.matches(find).count();
     if occurrences == 0 {
         return Err(ToolError::Validation(format!(
@@ -142,6 +159,35 @@ fn apply_edit(
         original.replacen(find, replace, 1)
     };
     Ok((updated, occurrences))
+}
+
+/// A file's line-ending style, when it has exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    /// `None` for mixed endings. A file with no line breaks counts as `Lf`,
+    /// which leaves single-line text unchanged.
+    fn of(text: &str) -> Option<Self> {
+        let crlf = text.matches("\r\n").count();
+        let lf = text.matches('\n').count();
+        match crlf {
+            0 => Some(Self::Lf),
+            n if n == lf => Some(Self::Crlf),
+            _ => None,
+        }
+    }
+
+    fn apply(self, text: &str) -> String {
+        let lf = text.replace("\r\n", "\n");
+        match self {
+            Self::Lf => lf,
+            Self::Crlf => lf.replace('\n', "\r\n"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +236,50 @@ mod tests {
     #[test]
     fn apply_edit_rejects_an_empty_find_string() {
         assert!(apply_edit("hello", "", "x", false).is_err());
+    }
+
+    #[test]
+    fn apply_edit_rejects_an_edit_that_changes_nothing() {
+        let err = apply_edit("hello", "hello", "hello", false).unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+        // Identical once line endings are matched to the file's.
+        assert!(apply_edit("a\r\nb", "a\nb", "a\r\nb", false).is_err());
+    }
+
+    #[test]
+    fn apply_edit_matches_lf_text_in_a_crlf_file_and_keeps_crlf() {
+        let original = "fn main() {\r\n    old();\r\n}\r\n";
+        let (updated, count) = apply_edit(
+            original,
+            "{\n    old();\n}",
+            "{\n    new();\n    more();\n}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(updated, "fn main() {\r\n    new();\r\n    more();\r\n}\r\n");
+    }
+
+    #[test]
+    fn apply_edit_matches_crlf_text_in_an_lf_file_and_keeps_lf() {
+        let (updated, _) = apply_edit("a\nb\nc\n", "a\r\nb", "x\r\ny", false).unwrap();
+        assert_eq!(updated, "x\ny\nc\n");
+    }
+
+    #[test]
+    fn apply_edit_matches_a_mixed_ending_file_as_given() {
+        let original = "a\r\nb\nc";
+        assert!(apply_edit(original, "a\nb", "x", false).is_err());
+        let (updated, _) = apply_edit(original, "b\nc", "y", false).unwrap();
+        assert_eq!(updated, "a\r\ny");
+    }
+
+    #[test]
+    fn line_ending_of_a_file() {
+        assert_eq!(LineEnding::of("one line"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::of("a\nb\n"), Some(LineEnding::Lf));
+        assert_eq!(LineEnding::of("a\r\nb\r\n"), Some(LineEnding::Crlf));
+        assert_eq!(LineEnding::of("a\r\nb\n"), None);
     }
 
     #[tokio::test]

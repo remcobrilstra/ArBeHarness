@@ -1,0 +1,8 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\remember\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-remember
+[tool] write_file {"content":"violet-319","path":"secret.txt"}
+Wrote `violet-319` to `secret.txt`.
+session=11044e84-b9f5-427e-8f83-d5f3fee2d7ec
+[tool] read_file {"path":"filler.txt"}
+400
+violet-319

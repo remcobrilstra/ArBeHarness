@@ -1,0 +1,11 @@
+work=D:\ArBe-Projects\ArBeHarness\scenarios\plan-mode\work
+home=C:\Users\RJBri\AppData\Local\Temp\arbe-scenario-plan-mode
+[tool] glob {"pattern":"**/*marker*"}
+[tool] glob {"pattern":"**/test_marker.py"}
+[tool] list_dir {"path":"."}
+[tool] read_file {"path":"test_marker.py"}
+[tool] read_file {"path":"marker.py"}
+[tool] exit_plan_mode {"plan":"# Make `marker()` return `\"final\"`\n\n## Goal\n`test_marker.py` asserts `marker() == \"final\"`. `marker.py` currently returns `\"draft\"`. Change only the implementation so the test passes. Do not edit the test.\n\n## Steps\n1. In `marker.py`, change the return value of `marker()` from `\"draft\"` to `\"final\"`.\n\n## Verification\nRun `python -m unittest test_marker.py` and confirm `MarkerTests.test_marker` passes."}
+[tool] edit_file {"find":"return \"draft\"","path":"marker.py","replace":"return \"final\""}
+[tool] execute {"command":"python -m unittest test_marker.py"}
+`marker()` now returns `"final"`, and `python -m unittest test_marker.py` passes.
